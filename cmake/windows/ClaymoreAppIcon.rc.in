@@ -1,0 +1,4 @@
+// Resource id must match the Win32 icon loader in Win32Window.cpp.
+#define IDI_CLAYMORE_APP 101
+
+IDI_CLAYMORE_APP ICON "@CLAYMORE_WINDOWS_ICON_ICO_RC_PATH@"

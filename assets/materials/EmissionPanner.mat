@@ -1,0 +1,20 @@
+{
+    "name": "EmissionPanner",
+    "shaderVS": "vs_pbr",
+    "shaderFS": "fs_pbr",
+    "albedo": "assets/debug/white.png",
+    "metallicRoughness": "assets/debug/metallic_roughness.png",
+    "normal": "assets/debug/normal.png",
+    "ao": "assets/debug/white.png",
+    "emission": "assets/debug/white.png",
+    "metallicScalar": 1.0,
+    "roughnessScalar": 1.0,
+    "normalScale": 1.5,
+    "aoScalar": 1.0,
+    "emissionStrength": 2.0,
+    "emissionColor": [0.9, 0.5, 0.2],
+    "uvScale": [2.0, 2.0],
+    "uvOffset": [0.0, 0.0],
+    "uniforms": {}
+}
+

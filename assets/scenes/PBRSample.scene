@@ -1,0 +1,85 @@
+{
+    "version": "1.0",
+    "entities": [
+        {
+            "id": 1,
+            "name": "ScalarSphere",
+            "layer": 0,
+            "tag": "",
+            "parent": -1,
+            "children": [],
+            "transform": {
+                "position": {"x": -2.0, "y": 1.0, "z": 0.0},
+                "rotation": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "scale": {"x": 1.0, "y": 1.0, "z": 1.0},
+                "localMatrix": [1,0,0,0,0,1,0,0,0,0,1,0,-2,1,0,1],
+                "worldMatrix": [1,0,0,0,0,1,0,0,0,0,1,0,-2,1,0,1],
+                "transformDirty": false
+            },
+            "mesh": {
+                "meshName": "Sphere",
+                "meshReference": {
+                    "guid": "00000000000000000000000000000001",
+                    "fileID": 1,
+                    "type": 3
+                },
+                "uniqueMaterial": true,
+                "materials": ["Default PBR"],
+                "slotMaterials": [
+                    {
+                        "albedoPath": "assets/debug/white.png",
+                        "metallicScalar": 0.7,
+                        "roughnessScalar": 0.2,
+                        "aoScalar": 0.85,
+                        "uvScale": [1.0, 1.0],
+                        "uvOffset": [0.0, 0.0]
+                    }
+                ]
+            }
+        },
+        {
+            "id": 2,
+            "name": "TexturedCapsule",
+            "layer": 0,
+            "tag": "",
+            "parent": -1,
+            "children": [],
+            "transform": {
+                "position": {"x": 2.0, "y": 1.0, "z": 0.0},
+                "rotation": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "scale": {"x": 1.0, "y": 1.0, "z": 1.0},
+                "localMatrix": [1,0,0,0,0,1,0,0,0,0,1,0,2,1,0,1],
+                "worldMatrix": [1,0,0,0,0,1,0,0,0,0,1,0,2,1,0,1],
+                "transformDirty": false
+            },
+            "mesh": {
+                "meshName": "Capsule",
+                "meshReference": {
+                    "guid": "00000000000000000000000000000001",
+                    "fileID": 3,
+                    "type": 3
+                },
+                "uniqueMaterial": true,
+                "materials": ["Default PBR"],
+                "slotMaterials": [
+                    {
+                        "albedoPath": "assets/debug/white.png",
+                        "mrPath": "assets/debug/metallic_roughness.png",
+                        "normalPath": "assets/debug/normal.png",
+                        "aoPath": "assets/debug/white.png",
+                        "emissionPath": "assets/debug/white.png",
+                        "metallicScalar": 1.0,
+                        "roughnessScalar": 1.0,
+                        "normalScale": 1.4,
+                        "aoScalar": 1.0,
+                        "emissionStrength": 1.8,
+                        "emissionColor": [0.9, 0.45, 0.15],
+                        "uvScale": [2.0, 2.0],
+                        "uvOffset": [0.0, 0.0]
+                    }
+                ]
+            }
+        }
+    ]
+}
+

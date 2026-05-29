@@ -1,0 +1,355 @@
+{
+  "version": 1,
+  "name": "Simple PBR",
+  "guid": "sample-simple-pbr-001",
+  "surfaceType": "Lit",
+  "nodes": [
+    {
+      "id": 1,
+      "typeCategory": "Input",
+      "typeName": "Texture2D",
+      "displayName": "Albedo Texture",
+      "editorPos": [-400, -100],
+      "inputPins": [100],
+      "outputPins": [101],
+      "properties": {}
+    },
+    {
+      "id": 2,
+      "typeCategory": "Texture",
+      "typeName": "Sample2D",
+      "displayName": "Sample Albedo",
+      "editorPos": [-200, -100],
+      "inputPins": [110, 111],
+      "outputPins": [112, 113, 114, 115, 116, 117],
+      "properties": {}
+    },
+    {
+      "id": 3,
+      "typeCategory": "Input",
+      "typeName": "UV",
+      "displayName": "UV Coords",
+      "editorPos": [-400, 50],
+      "inputPins": [],
+      "outputPins": [120, 121, 122],
+      "properties": {}
+    },
+    {
+      "id": 4,
+      "typeCategory": "Input",
+      "typeName": "WorldNormal",
+      "displayName": "World Normal",
+      "editorPos": [-200, 200],
+      "inputPins": [],
+      "outputPins": [130],
+      "properties": {}
+    },
+    {
+      "id": 5,
+      "typeCategory": "Input",
+      "typeName": "Float",
+      "displayName": "Metallic",
+      "editorPos": [-200, 300],
+      "inputPins": [140],
+      "outputPins": [141],
+      "properties": {}
+    },
+    {
+      "id": 6,
+      "typeCategory": "Input",
+      "typeName": "Float",
+      "displayName": "Roughness",
+      "editorPos": [-200, 400],
+      "inputPins": [150],
+      "outputPins": [151],
+      "properties": {}
+    },
+    {
+      "id": 10,
+      "typeCategory": "Output",
+      "typeName": "PBRMaster",
+      "displayName": "PBR Output",
+      "editorPos": [200, 100],
+      "inputPins": [200, 201, 202, 203, 204, 205, 206],
+      "outputPins": [],
+      "properties": {}
+    }
+  ],
+  "pins": [
+    {
+      "id": 100,
+      "nodeId": 1,
+      "kind": "Input",
+      "type": "Texture2D",
+      "name": "Texture",
+      "defaultValue": [0, 0, 0, 0],
+      "exposed": true,
+      "exposedName": "AlbedoMap"
+    },
+    {
+      "id": 101,
+      "nodeId": 1,
+      "kind": "Output",
+      "type": "Texture2D",
+      "name": "Texture",
+      "defaultValue": [0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 110,
+      "nodeId": 2,
+      "kind": "Input",
+      "type": "Texture2D",
+      "name": "Texture",
+      "defaultValue": [0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 111,
+      "nodeId": 2,
+      "kind": "Input",
+      "type": "Float2",
+      "name": "UV",
+      "defaultValue": [0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 112,
+      "nodeId": 2,
+      "kind": "Output",
+      "type": "Color4",
+      "name": "RGBA",
+      "defaultValue": [0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 113,
+      "nodeId": 2,
+      "kind": "Output",
+      "type": "Color3",
+      "name": "RGB",
+      "defaultValue": [0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 114,
+      "nodeId": 2,
+      "kind": "Output",
+      "type": "Float",
+      "name": "R",
+      "defaultValue": [0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 115,
+      "nodeId": 2,
+      "kind": "Output",
+      "type": "Float",
+      "name": "G",
+      "defaultValue": [0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 116,
+      "nodeId": 2,
+      "kind": "Output",
+      "type": "Float",
+      "name": "B",
+      "defaultValue": [0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 117,
+      "nodeId": 2,
+      "kind": "Output",
+      "type": "Float",
+      "name": "A",
+      "defaultValue": [0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 120,
+      "nodeId": 3,
+      "kind": "Output",
+      "type": "Float2",
+      "name": "UV",
+      "defaultValue": [0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 121,
+      "nodeId": 3,
+      "kind": "Output",
+      "type": "Float",
+      "name": "U",
+      "defaultValue": [0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 122,
+      "nodeId": 3,
+      "kind": "Output",
+      "type": "Float",
+      "name": "V",
+      "defaultValue": [0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 130,
+      "nodeId": 4,
+      "kind": "Output",
+      "type": "Float3",
+      "name": "Normal",
+      "defaultValue": [0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 140,
+      "nodeId": 5,
+      "kind": "Input",
+      "type": "Float",
+      "name": "Value",
+      "defaultValue": [0.0, 0, 0, 0],
+      "exposed": true,
+      "exposedName": "Metallic"
+    },
+    {
+      "id": 141,
+      "nodeId": 5,
+      "kind": "Output",
+      "type": "Float",
+      "name": "Out",
+      "defaultValue": [0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 150,
+      "nodeId": 6,
+      "kind": "Input",
+      "type": "Float",
+      "name": "Value",
+      "defaultValue": [0.5, 0, 0, 0],
+      "exposed": true,
+      "exposedName": "Roughness"
+    },
+    {
+      "id": 151,
+      "nodeId": 6,
+      "kind": "Output",
+      "type": "Float",
+      "name": "Out",
+      "defaultValue": [0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 200,
+      "nodeId": 10,
+      "kind": "Input",
+      "type": "Color3",
+      "name": "BaseColor",
+      "defaultValue": [1.0, 1.0, 1.0, 1.0],
+      "exposed": false
+    },
+    {
+      "id": 201,
+      "nodeId": 10,
+      "kind": "Input",
+      "type": "Float",
+      "name": "Metallic",
+      "defaultValue": [0.0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 202,
+      "nodeId": 10,
+      "kind": "Input",
+      "type": "Float",
+      "name": "Roughness",
+      "defaultValue": [0.5, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 203,
+      "nodeId": 10,
+      "kind": "Input",
+      "type": "Float3",
+      "name": "Normal",
+      "defaultValue": [0.0, 0.0, 1.0, 0],
+      "exposed": false
+    },
+    {
+      "id": 204,
+      "nodeId": 10,
+      "kind": "Input",
+      "type": "Color3",
+      "name": "Emission",
+      "defaultValue": [0.0, 0.0, 0.0, 0],
+      "exposed": false
+    },
+    {
+      "id": 205,
+      "nodeId": 10,
+      "kind": "Input",
+      "type": "Float",
+      "name": "AO",
+      "defaultValue": [1.0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 206,
+      "nodeId": 10,
+      "kind": "Input",
+      "type": "Float",
+      "name": "Alpha",
+      "defaultValue": [1.0, 0, 0, 0],
+      "exposed": false
+    }
+  ],
+  "links": [
+    {
+      "id": 1,
+      "fromPin": 101,
+      "toPin": 110
+    },
+    {
+      "id": 2,
+      "fromPin": 120,
+      "toPin": 111
+    },
+    {
+      "id": 3,
+      "fromPin": 113,
+      "toPin": 200
+    },
+    {
+      "id": 4,
+      "fromPin": 141,
+      "toPin": 201
+    },
+    {
+      "id": 5,
+      "fromPin": 151,
+      "toPin": 202
+    },
+    {
+      "id": 6,
+      "fromPin": 130,
+      "toPin": 203
+    },
+    {
+      "id": 7,
+      "fromPin": 117,
+      "toPin": 206
+    }
+  ],
+  "nextIds": {
+    "node": 20,
+    "pin": 300,
+    "link": 10
+  },
+  "editor": {
+    "pan": [0, 0],
+    "zoom": 1.0
+  }
+}
+

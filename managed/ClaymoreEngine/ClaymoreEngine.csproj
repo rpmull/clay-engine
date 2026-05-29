@@ -1,0 +1,35 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<TargetFramework>net10.0</TargetFramework>
+		<RuntimeFrameworkVersion>10.0.5</RuntimeFrameworkVersion>
+
+		<!-- Required to generate runtimeconfig.json and deps.json -->
+		<GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+
+		<AssemblyName>ClaymoreEngine</AssemblyName>
+		<!-- Required for native interop -->
+		<OutputType>Library</OutputType>
+		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+		<EnablePreviewFeatures>true</EnablePreviewFeatures>
+		<ImplicitUsings>false</ImplicitUsings>
+		<Nullable>enable</Nullable>
+
+		<!-- Prevent trimming or AOT from stripping methods -->
+		<PublishTrimmed>false</PublishTrimmed>
+		<PublishAot>false</PublishAot>
+		<EnableDynamicLoading>true</EnableDynamicLoading>
+		
+		<!-- Self-contained deployment settings -->
+		<RuntimeIdentifier Condition="'$(SelfContained)' == 'true'">win-x64</RuntimeIdentifier>
+		<SelfContained Condition="'$(SelfContained)' == ''">false</SelfContained>
+		
+		<!-- Include all runtime assets when publishing self-contained -->
+		<IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
+	</PropertyGroup>
+
+	<!-- Explicitly preserve native entry point method -->
+	<ItemGroup>
+		<MethodImpl Remove="*" />
+		<MethodImpl Include="Engine.Scripting.EngineEntry.ManagedStart" />
+	</ItemGroup>
+</Project>

@@ -1,0 +1,20 @@
+{
+    "name": "ScalarOnly",
+    "shaderVS": "vs_pbr",
+    "shaderFS": "fs_pbr",
+    "albedo": "assets/debug/white.png",
+    "metallicRoughness": "",
+    "normal": "",
+    "ao": "",
+    "emission": "",
+    "metallicScalar": 0.75,
+    "roughnessScalar": 0.25,
+    "normalScale": 1.0,
+    "aoScalar": 0.9,
+    "emissionStrength": 0.0,
+    "emissionColor": [1.0, 1.0, 1.0],
+    "uvScale": [1.0, 1.0],
+    "uvOffset": [0.0, 0.0],
+    "uniforms": {}
+}
+

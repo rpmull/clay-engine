@@ -1,0 +1,296 @@
+{
+  "_type": "QuestDatabase",
+  "guid": "0000000000000000000000000000Q001",
+  "quests": [
+    {
+      "questId": "Q_ForestWolves",
+      "displayName": "Forest Wolves",
+      "description": "Investigate the noises in the forest, deal with the wolves, and recover the stolen sword.",
+      "category": "Side",
+      "questGiver": "NPC_TAVERN_WENCH_GUID",
+      "recommendedLevel": 3,
+      "flags": {
+        "repeatable": false,
+        "failsOnTimeout": false,
+        "hiddenUntilStarted": false,
+        "trackable": true,
+        "mainQuest": false,
+        "priority": 10
+      },
+      "prerequisiteQuestIds": [],
+      "branches": [
+        {
+          "branchId": "RecoveredSword",
+          "name": "Recovered Sword",
+          "description": "Sword returned and wolves cleared.",
+          "consequenceDescription": "The townsperson is grateful and will offer future quests."
+        },
+        {
+          "branchId": "FailedRescue",
+          "name": "Failed Rescue",
+          "description": "Quest failed before resolving wolves.",
+          "consequenceDescription": "The townsperson is disappointed, affecting future interactions."
+        }
+      ],
+      "stages": [
+        {
+          "stageId": "QS_TalkWench",
+          "name": "Ask the tavern wench",
+          "description": "Talk to the tavern wench about the noises in the forest.",
+          "journalEntry": "I should ask the tavern wench about the strange noises people have been hearing from the forest.",
+          "initialState": "Active",
+          "timeoutSeconds": 0,
+          "onTimeoutStageId": "",
+          "onTimeoutFail": false,
+          "objectives": [
+            {
+              "objectiveId": "QO_TalkWench",
+              "type": "Talk",
+              "displayText": "Speak to the tavern wench",
+              "displayTextComplete": "Spoke to the tavern wench",
+              "targetCount": 1,
+              "targetResourceGuid": "NPC_TAVERN_WENCH_GUID",
+              "dialogueLibraryGuid": "DIALOGUE_TAVERN_WENCH",
+              "dialogueEntryId": "forest_inquiry",
+              "location": {
+                "x": 0,
+                "y": 0,
+                "z": 0,
+                "radius": 5,
+                "locationName": "",
+                "sceneId": ""
+              },
+              "optional": false,
+              "hidden": false,
+              "priority": 0,
+              "hintText": "Visit the tavern in town."
+            }
+          ],
+          "conditions": [],
+          "outcomes": [
+            {
+              "nextStageId": "QS_ForestHunt",
+              "branchId": "",
+              "unlockQuestIds": [],
+              "failQuestIds": [],
+              "rewards": [],
+              "completeQuest": false,
+              "failQuest": false,
+              "gameStateKey": "forest_wolves_started",
+              "gameStateValue": "true"
+            }
+          ],
+          "dialogueTriggers": [
+            {
+              "dialogueLibraryGuid": "DIALOGUE_TAVERN_WENCH",
+              "entryId": "forest_inquiry",
+              "triggerCondition": "on_active",
+              "speakerResourceGuid": "NPC_TAVERN_WENCH_GUID"
+            }
+          ]
+        },
+        {
+          "stageId": "QS_ForestHunt",
+          "name": "Drive off the wolves and recover the sword",
+          "description": "Kill the wolves and retrieve the stolen sword.",
+          "journalEntry": "The tavern wench told me that wolves have been terrorizing the forest and one of them stole a townsperson's sword. I need to kill at least 3 wolves and recover the sword.",
+          "initialState": "Inactive",
+          "timeoutSeconds": 0,
+          "onTimeoutStageId": "",
+          "onTimeoutFail": false,
+          "objectives": [
+            {
+              "objectiveId": "QO_KillWolves",
+              "type": "Kill",
+              "displayText": "Kill wolves (0/3)",
+              "displayTextComplete": "Wolves eliminated",
+              "targetCount": 3,
+              "targetResourceGuid": "ENEMY_WOLF_GUID",
+              "dialogueLibraryGuid": "",
+              "dialogueEntryId": "",
+              "location": {
+                "x": 150,
+                "y": 0,
+                "z": 200,
+                "radius": 50,
+                "locationName": "Forest Clearing",
+                "sceneId": "ForestScene"
+              },
+              "optional": false,
+              "hidden": false,
+              "priority": 1,
+              "hintText": "Search for wolves in the forest clearing."
+            },
+            {
+              "objectiveId": "QO_RecoverSword",
+              "type": "Collect",
+              "displayText": "Recover the stolen sword",
+              "displayTextComplete": "Sword recovered",
+              "targetCount": 1,
+              "targetResourceGuid": "ITEM_STOLEN_SWORD_GUID",
+              "dialogueLibraryGuid": "",
+              "dialogueEntryId": "",
+              "location": {
+                "x": 155,
+                "y": 0,
+                "z": 210,
+                "radius": 10,
+                "locationName": "Wolf Den",
+                "sceneId": "ForestScene"
+              },
+              "optional": false,
+              "hidden": false,
+              "priority": 2,
+              "hintText": "The sword might be near the wolf den."
+            }
+          ],
+          "conditions": [],
+          "outcomes": [
+            {
+              "nextStageId": "QS_TurnIn",
+              "branchId": "RecoveredSword",
+              "unlockQuestIds": [],
+              "failQuestIds": [],
+              "rewards": [
+                {
+                  "rewardId": "QR_WolfPelts",
+                  "resourceGuid": "ITEM_WOLF_PELT_GUID",
+                  "rewardType": "item",
+                  "amount": 3,
+                  "optional": false
+                }
+              ],
+              "completeQuest": false,
+              "failQuest": false,
+              "gameStateKey": "",
+              "gameStateValue": ""
+            },
+            {
+              "nextStageId": "",
+              "branchId": "FailedRescue",
+              "unlockQuestIds": [
+                "Q_FollowupFailure"
+              ],
+              "failQuestIds": [],
+              "rewards": [],
+              "completeQuest": false,
+              "failQuest": true,
+              "gameStateKey": "forest_wolves_failed",
+              "gameStateValue": "true"
+            }
+          ],
+          "dialogueTriggers": [
+            {
+              "dialogueLibraryGuid": "DIALOGUE_TOWNSPERSON",
+              "entryId": "sword_progress_check",
+              "triggerCondition": "on_active",
+              "speakerResourceGuid": "NPC_TOWNSPERSON_GUID"
+            }
+          ]
+        },
+        {
+          "stageId": "QS_TurnIn",
+          "name": "Return the sword",
+          "description": "Bring the sword back to the townsperson.",
+          "journalEntry": "I've dealt with the wolves and recovered the stolen sword. I should return it to the townsperson.",
+          "initialState": "Inactive",
+          "timeoutSeconds": 0,
+          "onTimeoutStageId": "",
+          "onTimeoutFail": false,
+          "objectives": [
+            {
+              "objectiveId": "QO_ReturnSword",
+              "type": "Talk",
+              "displayText": "Return the sword to the townsperson",
+              "displayTextComplete": "Sword returned",
+              "targetCount": 1,
+              "targetResourceGuid": "NPC_TOWNSPERSON_GUID",
+              "dialogueLibraryGuid": "DIALOGUE_TOWNSPERSON",
+              "dialogueEntryId": "sword_return",
+              "location": {
+                "x": 0,
+                "y": 0,
+                "z": 0,
+                "radius": 5,
+                "locationName": "",
+                "sceneId": ""
+              },
+              "optional": false,
+              "hidden": false,
+              "priority": 0,
+              "hintText": "Find the townsperson in town."
+            }
+          ],
+          "conditions": [],
+          "outcomes": [
+            {
+              "nextStageId": "",
+              "branchId": "RecoveredSword",
+              "unlockQuestIds": [
+                "Q_TownspersonGratitude"
+              ],
+              "failQuestIds": [],
+              "rewards": [],
+              "completeQuest": true,
+              "failQuest": false,
+              "gameStateKey": "forest_wolves_completed",
+              "gameStateValue": "true"
+            }
+          ],
+          "dialogueTriggers": [
+            {
+              "dialogueLibraryGuid": "DIALOGUE_TOWNSPERSON",
+              "entryId": "sword_return",
+              "triggerCondition": "on_active",
+              "speakerResourceGuid": "NPC_TOWNSPERSON_GUID"
+            }
+          ]
+        }
+      ],
+      "completionRewards": [
+        {
+          "rewardId": "QR_GoldReward",
+          "resourceGuid": "CURRENCY_GOLD_GUID",
+          "rewardType": "currency",
+          "amount": 50,
+          "optional": false
+        },
+        {
+          "rewardId": "QR_XPReward",
+          "resourceGuid": "",
+          "rewardType": "xp",
+          "amount": 100,
+          "optional": false
+        }
+      ],
+      "globalDialogueTriggers": [
+        {
+          "dialogueLibraryGuid": "DIALOGUE_TOWNSPERSON",
+          "entryId": "quest_active_greeting",
+          "triggerCondition": "on_active",
+          "speakerResourceGuid": "NPC_TOWNSPERSON_GUID"
+        }
+      ],
+      "editorGraphNodes": [
+        {
+          "nodeId": "QS_TalkWench",
+          "x": 100,
+          "y": 100,
+          "nodeType": "stage"
+        },
+        {
+          "nodeId": "QS_ForestHunt",
+          "x": 300,
+          "y": 100,
+          "nodeType": "stage"
+        },
+        {
+          "nodeId": "QS_TurnIn",
+          "x": 500,
+          "y": 100,
+          "nodeType": "stage"
+        }
+      ]
+    }
+  ]
+}

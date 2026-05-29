@@ -1,0 +1,49 @@
+# Build output
+/Builds/
+/build/
+/out/
+/bin/
+/obj/
+
+# Managed build output
+/managed/**/bin/
+/managed/**/obj/
+
+# Locally generated tool drops
+/tools/ScriptCompiler.deps.json
+/tools/ScriptCompiler.exe
+/tools/ScriptCompiler.runtimeconfig.json
+/tools/createdump.exe
+/tools/shaderc.exe
+/src/tools/ScriptCompiler.deps.json
+/src/tools/ScriptCompiler.exe
+/src/tools/ScriptCompiler.runtimeconfig.json
+/src/tools/shaderc.exe
+
+# Engine-generated caches
+/.bin/
+/.library/
+/logs/
+
+# Editor and IDE state
+/.vs/
+/.vscode/
+*.user
+*.suo
+*.sdf
+*.VC.db
+*.db
+*.cache
+*.log
+*.ilk
+*.exp
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+.DS_Store
+Thumbs.db
+
+# Project exports
+/ClayProject/dist/

@@ -1,0 +1,134 @@
+{
+  "version": 1,
+  "name": "Unlit Color",
+  "guid": "sample-unlit-color-001",
+  "surfaceType": "Unlit",
+  "nodes": [
+    {
+      "id": 1,
+      "typeCategory": "Input",
+      "typeName": "Color",
+      "displayName": "Base Color",
+      "editorPos": [-200, 0],
+      "inputPins": [100],
+      "outputPins": [101, 102, 103, 104, 105, 106],
+      "properties": {}
+    },
+    {
+      "id": 2,
+      "typeCategory": "Output",
+      "typeName": "UnlitMaster",
+      "displayName": "Unlit Output",
+      "editorPos": [200, 0],
+      "inputPins": [200, 201],
+      "outputPins": [],
+      "properties": {}
+    }
+  ],
+  "pins": [
+    {
+      "id": 100,
+      "nodeId": 1,
+      "kind": "Input",
+      "type": "Color4",
+      "name": "Color",
+      "defaultValue": [1.0, 0.5, 0.2, 1.0],
+      "exposed": true,
+      "exposedName": "BaseColor"
+    },
+    {
+      "id": 101,
+      "nodeId": 1,
+      "kind": "Output",
+      "type": "Color4",
+      "name": "RGBA",
+      "defaultValue": [0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 102,
+      "nodeId": 1,
+      "kind": "Output",
+      "type": "Color3",
+      "name": "RGB",
+      "defaultValue": [0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 103,
+      "nodeId": 1,
+      "kind": "Output",
+      "type": "Float",
+      "name": "R",
+      "defaultValue": [0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 104,
+      "nodeId": 1,
+      "kind": "Output",
+      "type": "Float",
+      "name": "G",
+      "defaultValue": [0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 105,
+      "nodeId": 1,
+      "kind": "Output",
+      "type": "Float",
+      "name": "B",
+      "defaultValue": [0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 106,
+      "nodeId": 1,
+      "kind": "Output",
+      "type": "Float",
+      "name": "A",
+      "defaultValue": [0, 0, 0, 0],
+      "exposed": false
+    },
+    {
+      "id": 200,
+      "nodeId": 2,
+      "kind": "Input",
+      "type": "Color3",
+      "name": "Color",
+      "defaultValue": [1.0, 1.0, 1.0, 1.0],
+      "exposed": false
+    },
+    {
+      "id": 201,
+      "nodeId": 2,
+      "kind": "Input",
+      "type": "Float",
+      "name": "Alpha",
+      "defaultValue": [1.0, 0, 0, 0],
+      "exposed": false
+    }
+  ],
+  "links": [
+    {
+      "id": 1,
+      "fromPin": 102,
+      "toPin": 200
+    },
+    {
+      "id": 2,
+      "fromPin": 106,
+      "toPin": 201
+    }
+  ],
+  "nextIds": {
+    "node": 3,
+    "pin": 300,
+    "link": 3
+  },
+  "editor": {
+    "pan": [0, 0],
+    "zoom": 1.0
+  }
+}
+
