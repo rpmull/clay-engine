@@ -1,11 +1,6 @@
 param(
-    [Parameter(Mandatory = $true, HelpMessage = "Path to the .prefabb file to inspect.")]
-    [string]$PrefabPath
+    [string]$PrefabPath = "C:\Users\rpmul\projects\alkahest\claymore\.bin\prefabs\assets_prefabs_EqItemSlot_UI.prefabb"
 )
-
-if (-not (Test-Path -LiteralPath $PrefabPath -PathType Leaf)) {
-    throw "Prefab file not found: $PrefabPath"
-}
 
 $bytes = [System.IO.File]::ReadAllBytes($PrefabPath)
 Write-Host "=== Prefab Binary Analysis ===" -ForegroundColor Cyan

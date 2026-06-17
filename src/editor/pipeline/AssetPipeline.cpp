@@ -8,12 +8,14 @@
 #include "editor/import/ModelLoader.h"
 #include "core/rendering/TextureLoader.h"
 #include "core/rendering/MaterialCache.h"
+#include "core/rendering/MaterialAssetCache.h"
 #include "core/vfs/FileSystem.h"
 #include "core/rendering/ShaderManager.h"
 #include "editor/import/AnimationImporter.h"
 #include "editor/pipeline/AnimationImportSettings.h"
 #include "core/animation/AnimationSerializer.h"
 #include "core/animation/AnimationAssetCache.h"
+#include "core/animation/AnimatorControllerIO.h"
 #include "ModelImportCache.h"
 #include "TextureCleanup.h"
 #include "ShaderImporter.h"
@@ -60,6 +62,7 @@
 #include <vector>
 #include "core/navigation/NavSerialization.h"
 #include "core/prefab/PrefabAPI.h"
+#include "core/prefab/RuntimePrefabInstantiator.h"
 #include "editor/prefab/PrefabEditorAPI.h"
 
 // Needed for glm::decompose used when building humanoid bind-relative animation deltas.
@@ -83,7 +86,7 @@ static bool ShouldSkipProjectBuildDirectory(const fs::path& path)
     std::string name = path.filename().string();
     std::transform(name.begin(), name.end(), name.begin(),
         [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    return name == "bin" || name == "obj" || name == ".library" || name == ".git" || name == ".vs";
+    return name == "bin" || name == "obj" || name == ".bin" || name == ".library" || name == ".git" || name == ".vs";
 }
 
 template <typename Fn>
@@ -201,6 +204,105 @@ static bool TryLoadSidecarMeta(const fs::path& metaPath, AssetMetadata& outMeta)
     } catch (const std::exception& e) {
         std::cerr << "[AssetPipeline] Failed to read .meta \"" << metaPath.string() << "\": " << e.what() << std::endl;
         return false;
+    }
+}
+
+static bool IsValidGuid(const ClaymoreGUID& guid)
+{
+    return guid.high != 0 || guid.low != 0;
+}
+
+static std::string LowerExtension(const fs::path& path)
+{
+    std::string ext = path.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return ext;
+}
+
+static bool IsPrefabAuthoringJson(const std::string& path)
+{
+    std::string normalized = path;
+    std::replace(normalized.begin(), normalized.end(), '\\', '/');
+    return normalized.find("assets/prefabs/") != std::string::npos;
+}
+
+static AssetType InferAssetTypeForMetadata(const std::string& path, const AssetMetadata& meta)
+{
+    const std::string ext = LowerExtension(fs::path(path));
+    if (ext == ".fbx" || ext == ".obj" || ext == ".gltf" || ext == ".glb") return AssetType::Mesh;
+    if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga") return AssetType::Texture;
+    if (ext == ".sc" || ext == ".glsl" || ext == ".shader") return AssetType::Shader;
+    if (ext == ".mat") return AssetType::Material;
+    if (ext == ".prefab" || (ext == ".json" && IsPrefabAuthoringJson(path))) return AssetType::Prefab;
+    if (ext == ".anim") return AssetType::Animation;
+    if (ext == ".animctrl" || ext == ".controller") return AssetType::AnimatorController;
+    if (ext == ".ngraph") return AssetType::NodeGraph;
+    if (ext == ".navbin") return AssetType::NavMesh;
+    if (ext == ".ttf" || ext == ".otf") return AssetType::Font;
+    if (ext == ".wav" || ext == ".mp3" || ext == ".ogg" || ext == ".flac") return AssetType::Audio;
+    if (ext == ".asset" || ext == ".clayobj" || ext == ".dlglib") return AssetType::Scriptable;
+    if (ext == ".cs") return AssetType::Script;
+
+    if (meta.type == "model") return AssetType::Mesh;
+    if (meta.type == "texture") return AssetType::Texture;
+    if (meta.type == "shader") return AssetType::Shader;
+    if (meta.type == "material") return AssetType::Material;
+    if (meta.type == "prefab") return AssetType::Prefab;
+    if (meta.type == "animation") return AssetType::Animation;
+    if (meta.type == "animatorcontroller") return AssetType::AnimatorController;
+    if (meta.type == "nodegraph") return AssetType::NodeGraph;
+    if (meta.type == "navmesh") return AssetType::NavMesh;
+    if (meta.type == "font") return AssetType::Font;
+    if (meta.type == "audio") return AssetType::Audio;
+    if (meta.type == "scriptable" || meta.type == "dialogue") return AssetType::Scriptable;
+    if (meta.type == "script") return AssetType::Script;
+    return AssetType::Unknown;
+}
+
+static void RegisterMetadataForLookup(const std::string& path, const AssetMetadata& meta)
+{
+    AssetRegistry::Instance().SetMetadata(path, meta);
+
+    AssetReference ref = meta.reference;
+    if (!ref.IsValid() && IsValidGuid(meta.guid)) {
+        ref.guid = meta.guid;
+    }
+    if (!ref.IsValid()) {
+        return;
+    }
+
+    const AssetType type = InferAssetTypeForMetadata(path, meta);
+    if (type == AssetType::Unknown) {
+        return;
+    }
+    if (ref.type == 0) {
+        ref.type = static_cast<int32_t>(type);
+    }
+
+    const std::string name = fs::path(path).stem().string();
+    AssetLibrary::Instance().RegisterAsset(ref, type, path, name);
+
+    const std::string projectRelative = MakeProjectRelativeVPath(path);
+    if (!projectRelative.empty() && projectRelative != path) {
+        AssetLibrary::Instance().RegisterPathAlias(ref.guid, projectRelative);
+    }
+
+    std::string normalized = path;
+    std::replace(normalized.begin(), normalized.end(), '\\', '/');
+    const size_t assetsPos = normalized.find("assets/");
+    if (assetsPos != std::string::npos) {
+        AssetLibrary::Instance().RegisterPathAlias(ref.guid, normalized.substr(assetsPos));
+    }
+}
+
+static void EnsurePreparedBinaryIfNeeded(const std::string& path)
+{
+    if (BinaryAssetCache::GetAssetType(path) == BinaryAssetCache::AssetType::Unknown) {
+        return;
+    }
+    if (!BinaryAssetCache::Instance().IsCurrent(path)) {
+        (void)BinaryAssetCache::Instance().EnsureBinary(path);
     }
 }
 
@@ -361,15 +463,24 @@ void AssetPipeline::ScanProject(const std::string& rootPath) {
     ForEachProjectEntry(rootPath, [&](const fs::directory_entry& entry) {
         std::error_code ec;
         if (!entry.is_regular_file(ec)) return;
-        std::string ext = entry.path().extension().string();
+        std::string ext = LowerExtension(entry.path());
         if (!IsSupportedAsset(ext)) return;
 
         std::string filePath = entry.path().string();
         m_LastScanList.push_back(filePath);
-        std::string hash = ComputeHash(filePath);
 
-        const auto* meta = GetMetadata(filePath);
-        if (!meta || meta->hash != hash) {
+        AssetMetadata sidecarMeta;
+        const bool hasSidecarMeta = TryLoadSidecarMeta(filePath + ".meta", sidecarMeta);
+        const std::string hash = ComputeFileHash(filePath);
+        if (hasSidecarMeta && sidecarMeta.hash == hash) {
+            RegisterMetadataForLookup(filePath, sidecarMeta);
+        }
+
+        const bool needsPreparedBinary =
+            BinaryAssetCache::GetAssetType(filePath) != BinaryAssetCache::AssetType::Unknown &&
+            !BinaryAssetCache::Instance().IsCurrent(filePath);
+
+        if (!hasSidecarMeta || sidecarMeta.hash != hash || needsPreparedBinary) {
             EnqueueAssetImport(filePath);
         }
     });
@@ -528,6 +639,10 @@ void AssetPipeline::EnqueueGPUUpload(PendingGPUUpload&& task) {
 // ---------------------------------------
 void AssetPipeline::ImportAsset(const std::string& path, bool force) {
     std::string ext = fs::path(path).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::string normalizedImportPath = path;
+    std::replace(normalizedImportPath.begin(), normalizedImportPath.end(), '\\', '/');
     std::string metaPath = path + ".meta";
 
     std::string hash = ComputeFileHash(path);
@@ -539,7 +654,11 @@ void AssetPipeline::ImportAsset(const std::string& path, bool force) {
         hasMeta = TryLoadSidecarMeta(metaPath, meta);
     }
 
-    if (!force && hasMeta && meta.hash == hash) return;
+    if (!force && hasMeta && meta.hash == hash && (IsValidGuid(meta.guid) || meta.reference.IsValid())) {
+        RegisterMetadataForLookup(path, meta);
+        EnsurePreparedBinaryIfNeeded(path);
+        return;
+    }
 
     // Dispatch
     if (ext == ".fbx" || ext == ".obj" || ext == ".gltf" || ext == ".glb") {
@@ -552,14 +671,39 @@ void AssetPipeline::ImportAsset(const std::string& path, bool force) {
         meta.type = "model";
     }
     else if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga") {
-        ImportTextureCPU(path); // Optimized async texture
+        // Texture source remains authoritative; GPU handles are invalidated and
+        // reacquired lazily by users of the texture cache.
         meta.type = "texture";
+        std::string name = fs::path(path).stem().string();
+        meta.sourcePath = path;
+        meta.processedPath = path;
+        meta.hash = hash;
+        if (meta.guid.high == 0 && meta.guid.low == 0) meta.guid = ClaymoreGUID::Generate();
+        meta.reference = AssetReference(meta.guid, 0, static_cast<int32_t>(AssetType::Texture));
+        AssetRegistry::Instance().SetMetadata(path, meta);
+        AssetLibrary::Instance().RegisterAsset(meta.reference, AssetType::Texture, path, name);
+        std::ofstream out(metaPath); if (out) { json j = meta; out << j.dump(2); }
+        ImportTextureCPU(path);
+        AssetEventBus::Instance().Emit(AssetEvent::Reimported, AssetType::Texture, path, meta.guid);
+        return;
     }
     else if (ext == ".sc" || ext == ".glsl" || ext == ".shader") {
         ImportShader(path);
         meta.type = "shader";
+        std::string name = fs::path(path).stem().string();
+        meta.sourcePath = path;
+        meta.processedPath = path;
+        meta.hash = hash;
+        if (meta.guid.high == 0 && meta.guid.low == 0) meta.guid = ClaymoreGUID::Generate();
+        meta.reference = AssetReference(meta.guid, 0, static_cast<int32_t>(AssetType::Shader));
+        AssetRegistry::Instance().SetMetadata(path, meta);
+        AssetLibrary::Instance().RegisterAsset(meta.reference, AssetType::Shader, path, name);
+        std::ofstream out(metaPath); if (out) { json j = meta; out << j.dump(2); }
+        AssetEventBus::Instance().Emit(AssetEvent::Reimported, AssetType::Shader, path, meta.guid);
+        return;
     }
-    else if (ext == ".prefab" || (ext == ".json" && path.find("/assets/prefabs/") != std::string::npos)) {
+    else if (ext == ".prefab" ||
+             (ext == ".json" && normalizedImportPath.find("assets/prefabs/") != std::string::npos)) {
         // Prefab save/update: ensure metadata GUID matches author prefab GUID, register, and hot-swap
         meta.type = "prefab";
         std::string name = fs::path(path).stem().string();
@@ -568,7 +712,7 @@ void AssetPipeline::ImportAsset(const std::string& path, bool force) {
         meta.hash = hash;
         // Align meta GUID with prefab authoring GUID for stable instance tracking
         try {
-            PrefabAsset author; if (PrefabIO::LoadPrefab(path, author)) { meta.guid = author.Guid; }
+            PrefabAsset author; if (PrefabIO::LoadPrefabSource(path, author)) { meta.guid = author.Guid; }
         } catch(...) {}
         if (meta.guid.high == 0 && meta.guid.low == 0) meta.guid = ClaymoreGUID::Generate();
         meta.reference = AssetReference(meta.guid, 0, static_cast<int32_t>(AssetType::Prefab));
@@ -576,6 +720,7 @@ void AssetPipeline::ImportAsset(const std::string& path, bool force) {
         AssetLibrary::Instance().RegisterAsset(meta.reference, AssetType::Prefab, path, name);
         // Save sidecar meta for portability
         std::ofstream out(metaPath); if (out) { json j = meta; out << j.dump(2); }
+        BinaryAssetCache::Instance().EnsureBinary(path);
         // Live hot-swap any instances in the active scene
         HotSwapPrefabInScene(path);
         // Emit event so other systems (like PrefabEditor) can react
@@ -634,6 +779,53 @@ void AssetPipeline::ImportAsset(const std::string& path, bool force) {
     else if (ext == ".mat") {
         ImportMaterial(path);
         meta.type = "material";
+        std::string name = fs::path(path).stem().string();
+        meta.sourcePath = path;
+        meta.processedPath = path;
+        meta.hash = hash;
+        if (meta.guid.high == 0 && meta.guid.low == 0) meta.guid = ClaymoreGUID::Generate();
+        meta.reference = AssetReference(meta.guid, 0, static_cast<int32_t>(AssetType::Material));
+        AssetRegistry::Instance().SetMetadata(path, meta);
+        AssetLibrary::Instance().RegisterAsset(meta.reference, AssetType::Material, path, name);
+        BinaryAssetCache::Instance().EnsureBinary(path);
+        MaterialAssetCache::Invalidate(path);
+        std::ofstream out(metaPath); if (out) { json j = meta; out << j.dump(2); }
+        AssetEventBus::Instance().Emit(AssetEvent::Reimported, AssetType::Material, path, meta.guid);
+        return;
+    }
+    else if (ext == ".anim") {
+        meta.type = "animation";
+        std::string name = fs::path(path).stem().string();
+        meta.sourcePath = path;
+        meta.processedPath = path;
+        meta.hash = hash;
+        if (meta.guid.high == 0 && meta.guid.low == 0) meta.guid = ClaymoreGUID::Generate();
+        meta.reference = AssetReference(meta.guid, 0, static_cast<int32_t>(AssetType::Animation));
+        AssetRegistry::Instance().SetMetadata(path, meta);
+        AssetLibrary::Instance().RegisterAsset(meta.reference, AssetType::Animation, path, name);
+        std::ofstream out(metaPath); if (out) { json j = meta; out << j.dump(2); }
+        cm::animation::InvalidateAnimationAssetCache(path);
+        Scene::Get().InvalidateAllAnimatorAssetCaches();
+        BinaryAssetCache::Instance().EnsureBinary(path);
+        AssetEventBus::Instance().Emit(AssetEvent::Reimported, AssetType::Animation, path, meta.guid);
+        return;
+    }
+    else if (ext == ".animctrl" || ext == ".controller") {
+        meta.type = "animatorcontroller";
+        std::string name = fs::path(path).stem().string();
+        meta.sourcePath = path;
+        meta.processedPath = path;
+        meta.hash = hash;
+        if (meta.guid.high == 0 && meta.guid.low == 0) meta.guid = ClaymoreGUID::Generate();
+        meta.reference = AssetReference(meta.guid, 0, static_cast<int32_t>(AssetType::AnimatorController));
+        AssetRegistry::Instance().SetMetadata(path, meta);
+        AssetLibrary::Instance().RegisterAsset(meta.reference, AssetType::AnimatorController, path, name);
+        std::ofstream out(metaPath); if (out) { json j = meta; out << j.dump(2); }
+        cm::animation::InvalidateAnimatorControllerCache(path);
+        Scene::Get().InvalidateAllAnimatorAssetCaches();
+        BinaryAssetCache::Instance().EnsureBinary(path);
+        AssetEventBus::Instance().Emit(AssetEvent::Reimported, AssetType::AnimatorController, path, meta.guid);
+        return;
     }
     else if (ext == ".asset") {
         // ScriptableObject data file: just register GUID and file as-is
@@ -831,7 +1023,7 @@ void AssetPipeline::HotSwapPrefabInScene(const std::string& prefabPath) {
     if (prefabGuid.high == 0 && prefabGuid.low == 0) {
         // Try parse authoring prefab JSON
         try {
-            PrefabAsset author; if (PrefabIO::LoadPrefab(prefabPath, author)) prefabGuid = author.Guid;
+            PrefabAsset author; if (PrefabIO::LoadPrefabSource(prefabPath, author)) prefabGuid = author.Guid;
         } catch(...) {}
     }
 
@@ -877,7 +1069,7 @@ void AssetPipeline::HotSwapPrefabInScene(const std::string& prefabPath) {
         PrefabAsset base; 
         std::vector<prefab::PropertyOverride> ov;
         bool haveBase = false;
-        try { if (PrefabIO::LoadPrefab(prefabPath, base)) haveBase = true; } catch(...) {}
+        try { if (PrefabIO::LoadPrefabSource(prefabPath, base)) haveBase = true; } catch(...) {}
         // Build set of GUIDs present in the live instance prior to swap
         std::unordered_set<uint64_t> liveGuids;
         auto pack = [](const ClaymoreGUID& g)->uint64_t { return PackGuidHash(g); };
@@ -898,9 +1090,17 @@ void AssetPipeline::HotSwapPrefabInScene(const std::string& prefabPath) {
         EntityID nid = (EntityID)-1;
         std::string ext = fs::path(prefabPath).extension().string();
         std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-        // Treat .prefab as authoring JSON
-        if (ext == ".prefab") nid = InstantiatePrefabFromPath(prefabPath, scene);
-        else if (ext == ".json") nid = InstantiatePrefabFromPath(prefabPath, scene);
+        if (BinaryAssetCache::GetAssetType(prefabPath) == BinaryAssetCache::AssetType::Prefab &&
+            BinaryAssetCache::Instance().EnsureBinary(prefabPath)) {
+            const std::string binaryPath = BinaryAssetCache::Instance().GetBinaryPath(prefabPath);
+            if (!binaryPath.empty()) {
+                runtime::RuntimePrefabInstantiator::Preload(binaryPath);
+                nid = runtime::RuntimePrefabInstantiator::InstantiateBlocking(binaryPath, scene);
+            }
+        }
+        if ((nid == (EntityID)-1 || nid == (EntityID)0) && (ext == ".prefab" || ext == ".json")) {
+            nid = InstantiatePrefabFromPath(prefabPath, scene);
+        }
         if (nid == (EntityID)-1 || nid == (EntityID)0) continue;
         if (auto* nd = scene.GetEntityData(nid)) {
             nd->Name = name;
@@ -1738,7 +1938,7 @@ void AssetPipeline::RebuildAllPrefabBinaries() {
 
 /// @brief Rebuild texture handles in a property block from stored paths
 /// Uses the global texture cache to ensure handles are properly managed
-static void RebuildPropertyBlockTexturesFromPaths(
+static void RebuildPropertyBlockTexturesFromPathsLocal(
     MaterialPropertyBlock& block,
     const std::unordered_map<std::string, std::string>& texturePaths)
 {
@@ -2536,9 +2736,9 @@ void AssetPipeline::HotSwapModelInScene(const std::string& modelPath) {
                 // New slots (beyond override count) keep default-constructed empty property blocks
                 
                 // Rebuild fresh texture handles from stored paths
-                RebuildPropertyBlockTexturesFromPaths(td->Mesh->PropertyBlock, td->Mesh->PropertyBlockTexturePaths);
+                RebuildPropertyBlockTexturesFromPathsLocal(td->Mesh->PropertyBlock, td->Mesh->PropertyBlockTexturePaths);
                 for (size_t i = 0; i < td->Mesh->SlotPropertyBlocks.size() && i < td->Mesh->SlotPropertyBlockTexturePaths.size(); ++i) {
-                    RebuildPropertyBlockTexturesFromPaths(td->Mesh->SlotPropertyBlocks[i], td->Mesh->SlotPropertyBlockTexturePaths[i]);
+                    RebuildPropertyBlockTexturesFromPathsLocal(td->Mesh->SlotPropertyBlocks[i], td->Mesh->SlotPropertyBlockTexturePaths[i]);
                 }
                 
                 // Material asset paths: apply overrides for existing slots
@@ -3008,6 +3208,7 @@ bool AssetPipeline::IsSupportedAsset(const std::string& ext) const {
         ".navbin",
         ".ttf", ".otf",                       // Fonts
         ".wav", ".mp3", ".ogg", ".flac",   // Audio
+        ".anim", ".animctrl", ".controller", // Animation assets/controllers
         ".asset",                              // Scriptable objects
         ".clayobj",                            // ClayScriptableObject files
         ".ngraph",                            // Node graphs
@@ -3015,19 +3216,30 @@ bool AssetPipeline::IsSupportedAsset(const std::string& ext) const {
         ".json",                               // Authoring prefabs (and other json)
         ".dlglib"                              // Dialogue library files
     };
-    return supported.find(ext) != supported.end();
+    std::string normalizedExt = ext;
+    std::transform(normalizedExt.begin(), normalizedExt.end(), normalizedExt.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return supported.find(normalizedExt) != supported.end();
 }
 
 std::string AssetPipeline::DetermineType(const std::string& ext) {
-    if (ext == ".obj" || ext == ".fbx" || ext == ".gltf" || ext == ".glb") return "model";
-    if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga") return "texture";
-    if (ext == ".sc" || ext == ".shader" || ext == ".glsl") return "shader";
-    if (ext == ".mat") return "material";
-    if (ext == ".cs") return "script";
-    if (ext == ".navbin") return "navmesh";
-    if (ext == ".ttf" || ext == ".otf") return "font";
-    if (ext == ".wav" || ext == ".mp3" || ext == ".ogg" || ext == ".flac") return "audio";
-    if (ext == ".asset") return "scriptable";
+    std::string normalizedExt = ext;
+    std::transform(normalizedExt.begin(), normalizedExt.end(), normalizedExt.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    if (normalizedExt == ".obj" || normalizedExt == ".fbx" || normalizedExt == ".gltf" || normalizedExt == ".glb") return "model";
+    if (normalizedExt == ".png" || normalizedExt == ".jpg" || normalizedExt == ".jpeg" || normalizedExt == ".tga") return "texture";
+    if (normalizedExt == ".sc" || normalizedExt == ".shader" || normalizedExt == ".glsl") return "shader";
+    if (normalizedExt == ".mat") return "material";
+    if (normalizedExt == ".cs") return "script";
+    if (normalizedExt == ".navbin") return "navmesh";
+    if (normalizedExt == ".ttf" || normalizedExt == ".otf") return "font";
+    if (normalizedExt == ".wav" || normalizedExt == ".mp3" || normalizedExt == ".ogg" || normalizedExt == ".flac") return "audio";
+    if (normalizedExt == ".anim") return "animation";
+    if (normalizedExt == ".animctrl" || normalizedExt == ".controller") return "animatorcontroller";
+    if (normalizedExt == ".asset" || normalizedExt == ".clayobj" || normalizedExt == ".dlglib") return "scriptable";
+    if (normalizedExt == ".ngraph") return "nodegraph";
+    if (normalizedExt == ".prefab") return "prefab";
 
     return "unknown";
 }

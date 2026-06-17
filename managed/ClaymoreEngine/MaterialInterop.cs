@@ -259,6 +259,7 @@ namespace ClaymoreEngine
         public const string Displacement = "s_displacement";
 
         public const string ColorTint = "u_ColorTint";
+        public const string TintParams = "u_TintParams";
         public const string TextureUsage = "u_TextureUsage";
         public const string UVTransform = "u_UVTransform";
         public const string UVScaleOffset = UVTransform;
@@ -270,6 +271,9 @@ namespace ClaymoreEngine
         public const string PSXParams = "u_psxParams";
         public const string PSXWorld = "u_psxWorld";
         public const string ToonParams = "u_toonParams";
+        public const string Posterize = "u_posterize";
+        public const string PSXShadowParams = "u_psxShadowParams";
+        public const string PSXEmission = "u_psxEmission";
     }
 
     public sealed class MaterialComponent : ComponentBase

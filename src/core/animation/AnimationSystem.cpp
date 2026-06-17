@@ -27,6 +27,7 @@
 #include "core/managed/ScriptInterop.h"
 #ifndef CLAYMORE_RUNTIME
 #include "managed/interop/AnimationEventInterop.h"
+#include "managed/interop/AnimationStateInterop.h"
 #endif
 // Parallel processing
 #include "core/jobs/ParallelFor.h"
@@ -82,19 +83,24 @@ float LookupOrLoadAnimationDuration(AnimationPlayerComponent& player,
         return durationIt->second;
     }
 
-    float duration = 0.0f;
-    if (!binding.AssetPath.empty()) {
-        std::shared_ptr<AnimationAsset> asset;
-        auto assetIt = player.CachedAssets.find(cacheKey);
-        if (assetIt != player.CachedAssets.end()) {
-            asset = assetIt->second;
-        } else {
-            asset = LoadAnimationAssetCached(binding.AssetPath, true);
-            if (asset && asset->Duration() > 0.0f) {
-                player.CachedAssets[cacheKey] = asset;
-            }
+    auto getOrLoadAsset = [&](const std::string& path) -> std::shared_ptr<AnimationAsset> {
+        if (path.empty()) {
+            return nullptr;
         }
-        duration = asset ? asset->Duration() : 0.0f;
+        auto assetIt = player.CachedAssets.find(cacheKey);
+        if (assetIt != player.CachedAssets.end() && assetIt->second) {
+            return assetIt->second;
+        }
+        auto asset = LoadAnimationAssetCached(path, true);
+        if (asset) {
+            player.CachedAssets[cacheKey] = asset;
+        }
+        return asset;
+    };
+
+    float duration = 0.0f;
+    if (auto asset = getOrLoadAsset(binding.EffectivePath())) {
+        duration = asset->Duration();
     } else if (!binding.ClipPath.empty()) {
         std::shared_ptr<AnimationClip> clip;
         auto clipIt = player.CachedClips.find(cacheKey);
@@ -111,6 +117,28 @@ float LookupOrLoadAnimationDuration(AnimationPlayerComponent& player,
 
     player.CachedDurations[cacheKey] = duration;
     return duration;
+}
+
+std::shared_ptr<AnimationAsset> GetOrLoadAnimationAssetForBinding(
+    AnimationPlayerComponent& player,
+    int cacheKey,
+    const ResolvedAnimationBinding& binding)
+{
+    const std::string& path = binding.EffectivePath();
+    if (path.empty()) {
+        return nullptr;
+    }
+
+    auto it = player.CachedAssets.find(cacheKey);
+    if (it != player.CachedAssets.end() && it->second) {
+        return it->second;
+    }
+
+    auto asset = LoadAnimationAssetCached(path, true);
+    if (asset) {
+        player.CachedAssets[cacheKey] = asset;
+    }
+    return asset;
 }
 
 ResolvedAnimationBinding ResolveAnimationBinding(const AnimationPlayerComponent& player,
@@ -1608,15 +1636,9 @@ void AnimationSystem::Update(::Scene& scene, float deltaTime) {
             const auto* st = player.Controller->FindStateInLayer(0, player.CurrentStateId);
             if (!st) return; // Lambda: use return instead of continue
             const ResolvedAnimationBinding stateBinding = ResolveAnimationBinding(player, *st);
-            // Load or get cached unified asset (prefer) or legacy clip (fallback)
-            std::shared_ptr<cm::animation::AnimationAsset> asset;
-            if (!stateBinding.AssetPath.empty()) {
-                auto ita = player.CachedAssets.find(st->Id);
-                if (ita != player.CachedAssets.end()) asset = ita->second; else {
-                    asset = std::make_shared<cm::animation::AnimationAsset>(cm::animation::LoadAnimationAsset(stateBinding.AssetPath));
-                    player.CachedAssets[st->Id] = asset;
-                }
-            }
+            // Load or get cached unified asset for both asset and clip-authored states.
+            std::shared_ptr<cm::animation::AnimationAsset> asset =
+                GetOrLoadAnimationAssetForBinding(player, st->Id, stateBinding);
             std::shared_ptr<cm::animation::AnimationClip> clip;
             if (!asset && !stateBinding.ClipPath.empty()) {
                 auto itc = player.CachedClips.find(st->Id);
@@ -1736,10 +1758,8 @@ void AnimationSystem::Update(::Scene& scene, float deltaTime) {
                     // Resolve assets for a and b (prefer AssetPath, fallback to ClipPath loaded as AnimationAsset)
                     const ResolvedAnimationBinding bindingA = ResolveAnimationBinding(player, a);
                     const ResolvedAnimationBinding bindingB = ResolveAnimationBinding(player, b);
-                    const std::string& pathA = bindingA.EffectivePath();
-                    const std::string& pathB = bindingB.EffectivePath();
-                    if (!pathA.empty()) { auto ita = player.CachedAssets.find(stNowForEval->Id * 1000 + i1); if (ita != player.CachedAssets.end()) assetB0 = ita->second; else { assetB0 = std::make_shared<cm::animation::AnimationAsset>(cm::animation::LoadAnimationAsset(pathA)); player.CachedAssets[stNowForEval->Id * 1000 + i1] = assetB0; } }
-                    if (!pathB.empty()) { auto ita = player.CachedAssets.find(stNowForEval->Id * 1000 + i2); if (ita != player.CachedAssets.end()) assetB1 = ita->second; else { assetB1 = std::make_shared<cm::animation::AnimationAsset>(cm::animation::LoadAnimationAsset(pathB)); player.CachedAssets[stNowForEval->Id * 1000 + i2] = assetB1; } }
+                    assetB0 = GetOrLoadAnimationAssetForBinding(player, stNowForEval->Id * 1000 + i1, bindingA);
+                    assetB1 = GetOrLoadAnimationAssetForBinding(player, stNowForEval->Id * 1000 + i2, bindingB);
                     useBlend1D = true;
                     collapseBlend1DContributors(assetB0, assetB1, blend1DIndexA, blend1DIndexB, blendT, durationNow);
                 } else if (stNowForEval->Kind == cm::animation::AnimatorStateKind::Blend2D && !stNowForEval->Blend2DEntries.empty()) {
@@ -1777,14 +1797,7 @@ void AnimationSystem::Update(::Scene& scene, float deltaTime) {
                     // Prefer AnimationAssetPath, but also support ClipPath loaded as AnimationAsset
                     // This ensures humanoid retargeting works for both path types
                     const ResolvedAnimationBinding binding = ResolveAnimationBinding(player, *stNowForEval);
-                    const std::string& assetPath = binding.EffectivePath();
-                    if (!assetPath.empty()) {
-                        auto ita = player.CachedAssets.find(stNowForEval->Id);
-                        if (ita != player.CachedAssets.end()) assetNow = ita->second; else {
-                            assetNow = std::make_shared<cm::animation::AnimationAsset>(cm::animation::LoadAnimationAsset(assetPath));
-                            player.CachedAssets[stNowForEval->Id] = assetNow;
-                        }
-                    }
+                    assetNow = GetOrLoadAnimationAssetForBinding(player, stNowForEval->Id, binding);
                     durationNow = assetNow ? assetNow->Duration() : 0.0f;
                 }
             }
@@ -1794,9 +1807,15 @@ void AnimationSystem::Update(::Scene& scene, float deltaTime) {
             s0.Asset = assetNow.get();
             s0.LegacyClip = nullptr; // Legacy path removed
             s0.Loop = stNowForEval ? stNowForEval->Loop : true;
-            // Derive time from absolute state time so parameter changes (which alter duration) don't cause jumps
+            // Derive time from absolute state time so parameter changes (which alter duration) don't cause jumps.
+            // A looping state wraps; a non-looping state must hold on its final frame instead of restarting.
             float baseT = player.AnimatorInstance.Playback().StateTime;
-            float time = (durationNow > 0.0f) ? fmod(baseT, durationNow) : 0.0f;
+            const bool stateLoopsForTime = stNowForEval ? stNowForEval->Loop : true;
+            float time = 0.0f;
+            if (durationNow > 0.0f) {
+                time = stateLoopsForTime ? fmod(baseT, durationNow)
+                                         : std::min(baseT, durationNow);
+            }
             if (!std::isfinite(time) || time < 0.0f) time = 0.0f;
             s0.Time = time;
 
@@ -1811,6 +1830,35 @@ void AnimationSystem::Update(::Scene& scene, float deltaTime) {
                 player.Debug_CurrentControllerStateName = stNowForEval->Name;
             }
             player.Debug_CurrentAnimationName = assetNow ? assetNow->name : std::string();
+
+            // --- Base-layer state enter/exit callbacks ---
+            // Detect committed base-layer state transitions (using the canonical
+            // CurrentStateId, not the crossfade-target debug name) and notify managed
+            // listeners. Fires in both editor play mode and exported runtime; the
+            // dispatch is a cheap atomic check when no listener is registered.
+            {
+                const int committedStateId = player.CurrentStateId;
+                if (committedStateId != player._StateCallbackPrevStateId) {
+                    const auto* prevState = (player._StateCallbackPrevStateId >= 0)
+                        ? player.Controller->FindStateInLayer(0, player._StateCallbackPrevStateId) : nullptr;
+                    const auto* curState = (committedStateId >= 0)
+                        ? player.Controller->FindStateInLayer(0, committedStateId) : nullptr;
+                    const std::string prevName = prevState ? prevState->Name : std::string();
+                    const std::string curName = curState ? curState->Name : std::string();
+                    player.Debug_PreviousControllerStateName = prevName;
+                    if (!prevName.empty()) {
+                        cm::animation::DispatchAnimationStateEvent(
+                            static_cast<int>(rootId), prevName.c_str(), curName.c_str(),
+                            static_cast<int>(cm::animation::AnimationStatePhase::Exited));
+                    }
+                    if (!curName.empty()) {
+                        cm::animation::DispatchAnimationStateEvent(
+                            static_cast<int>(rootId), curName.c_str(), prevName.c_str(),
+                            static_cast<int>(cm::animation::AnimationStatePhase::Entered));
+                    }
+                    player._StateCallbackPrevStateId = committedStateId;
+                }
+            }
         }
 
         if (player.ActiveStates.empty()) return; // Lambda: use return instead of continue
@@ -1842,11 +1890,14 @@ void AnimationSystem::Update(::Scene& scene, float deltaTime) {
                 if (loopCount < 0) loopCount = 0;
                 mutableState.Time = fmod(mutableState.Time, clipDuration);
             }
-        } else if (clipDuration > 0.0f && player._AutoControllerGenerated) {
-            // For auto-generated single-clip controllers, stop at end if not looping
+        } else if (clipDuration > 0.0f) {
+            // Non-looping state: hold on the final frame once the clip completes.
             if (shouldAdvance && mutableState.Time >= clipDuration) {
                 mutableState.Time = clipDuration;
-                player.IsPlaying = false;
+                // Auto-generated single-clip preview controllers also stop playback entirely.
+                if (player._AutoControllerGenerated) {
+                    player.IsPlaying = false;
+                }
             }
         }
         if (player.AnimatorInstance.IsCrossfading()) {
@@ -1892,10 +1943,8 @@ void AnimationSystem::Update(::Scene& scene, float deltaTime) {
                         // Load as AnimationAsset (prefer AssetPath, fallback to ClipPath)
                         const ResolvedAnimationBinding bindingA = ResolveAnimationBinding(player, a);
                         const ResolvedAnimationBinding bindingB = ResolveAnimationBinding(player, b);
-                        std::string pathA = bindingA.EffectivePath();
-                        std::string pathB = bindingB.EffectivePath();
-                        if (!pathA.empty()) { auto ita = player.CachedAssets.find(stNowForEval->Id * 1000 + i1); if (ita != player.CachedAssets.end()) assetB0 = ita->second; else { assetB0 = std::make_shared<cm::animation::AnimationAsset>(cm::animation::LoadAnimationAsset(pathA)); player.CachedAssets[stNowForEval->Id * 1000 + i1] = assetB0; } }
-                        if (!pathB.empty()) { auto ita = player.CachedAssets.find(stNowForEval->Id * 1000 + i2); if (ita != player.CachedAssets.end()) assetB1 = ita->second; else { assetB1 = std::make_shared<cm::animation::AnimationAsset>(cm::animation::LoadAnimationAsset(pathB)); player.CachedAssets[stNowForEval->Id * 1000 + i2] = assetB1; } }
+                        assetB0 = GetOrLoadAnimationAssetForBinding(player, stNowForEval->Id * 1000 + i1, bindingA);
+                        assetB1 = GetOrLoadAnimationAssetForBinding(player, stNowForEval->Id * 1000 + i2, bindingB);
                         useBlend1D = true;
                         collapseBlend1DContributors(assetB0, assetB1, blend1DIndexA, blend1DIndexB, blendT, durationNow);
                     } else if (stNowForEval->Kind == cm::animation::AnimatorStateKind::Blend2D && !stNowForEval->Blend2DEntries.empty()) {
@@ -1931,14 +1980,10 @@ void AnimationSystem::Update(::Scene& scene, float deltaTime) {
 
                     } else {
                         // Simple state - load as AnimationAsset for proper humanoid retargeting
-                        std::string assetPath = ResolveAnimationBinding(player, *stNowForEval).EffectivePath();
-                        if (!assetPath.empty()) {
-                            auto ita = player.CachedAssets.find(stNowForEval->Id);
-                            if (ita != player.CachedAssets.end()) assetNow = ita->second; else {
-                                assetNow = std::make_shared<cm::animation::AnimationAsset>(cm::animation::LoadAnimationAsset(assetPath));
-                                player.CachedAssets[stNowForEval->Id] = assetNow;
-                            }
-                        }
+                        assetNow = GetOrLoadAnimationAssetForBinding(
+                            player,
+                            stNowForEval->Id,
+                            ResolveAnimationBinding(player, *stNowForEval));
                         durationNow = assetNow ? assetNow->Duration() : 0.0f;
                     }
                     
@@ -2408,15 +2453,8 @@ void AnimationSystem::Update(::Scene& scene, float deltaTime) {
                 std::shared_ptr<AnimationAsset> nextAssetPtr;
                 // Load as AnimationAsset for proper humanoid retargeting (prefer AssetPath, fallback to ClipPath)
                 const ResolvedAnimationBinding nextBinding = ResolveAnimationBinding(player, *nextSt);
-                const std::string& nextAssetPath = nextBinding.EffectivePath();
-                if (!nextAssetPath.empty()) { 
-                    auto it = player.CachedAssets.find(nextSt->Id);
-                    if (it != player.CachedAssets.end()) nextAssetPtr = it->second; else {
-                        nextAssetPtr = std::make_shared<AnimationAsset>(LoadAnimationAsset(nextAssetPath));
-                        player.CachedAssets[nextSt->Id] = nextAssetPtr;
-                    }
-                    nextAsset = nextAssetPtr.get();
-                }
+                nextAssetPtr = GetOrLoadAnimationAssetForBinding(player, nextSt->Id, nextBinding);
+                nextAsset = nextAssetPtr.get();
                 thread_local PoseTRSBuffer nextPose;
                 thread_local PoseTRSBuffer nextPoseA;
                 thread_local PoseTRSBuffer nextPoseB;
@@ -2441,10 +2479,8 @@ void AnimationSystem::Update(::Scene& scene, float deltaTime) {
                     std::shared_ptr<AnimationAsset> nextAssetB0, nextAssetB1;
                     const ResolvedAnimationBinding bindingA = ResolveAnimationBinding(player, a);
                     const ResolvedAnimationBinding bindingB = ResolveAnimationBinding(player, b);
-                    const std::string& pathA = bindingA.EffectivePath();
-                    const std::string& pathB = bindingB.EffectivePath();
-                    if (!pathA.empty()) { auto ita = player.CachedAssets.find(nextSt->Id * 1000 + i1); if (ita != player.CachedAssets.end()) nextAssetB0 = ita->second; else { nextAssetB0 = std::make_shared<AnimationAsset>(LoadAnimationAsset(pathA)); player.CachedAssets[nextSt->Id * 1000 + i1] = nextAssetB0; } }
-                    if (!pathB.empty()) { auto ita = player.CachedAssets.find(nextSt->Id * 1000 + i2); if (ita != player.CachedAssets.end()) nextAssetB1 = ita->second; else { nextAssetB1 = std::make_shared<AnimationAsset>(LoadAnimationAsset(pathB)); player.CachedAssets[nextSt->Id * 1000 + i2] = nextAssetB1; } }
+                    nextAssetB0 = GetOrLoadAnimationAssetForBinding(player, nextSt->Id * 1000 + i1, bindingA);
+                    nextAssetB1 = GetOrLoadAnimationAssetForBinding(player, nextSt->Id * 1000 + i2, bindingB);
                     float nextBlendDuration = 0.0f;
                     collapseBlend1DContributors(nextAssetB0, nextAssetB1, i1, i2, nextBlendT, nextBlendDuration);
                     float d0 = nextAssetB0 ? nextAssetB0->Duration() : 0.0f;
@@ -3539,6 +3575,9 @@ void AnimationSystem::Update(::Scene& scene, float deltaTime) {
                             glm::vec3 posDelta = curPos - player._PrevRootModelPos;
                             glm::quat rotDelta = curRot * glm::inverse(player._PrevRootModelRot);
                             
+                            const bool transferHipsVerticalToEntity =
+                                usingHipsAsRootSource && rmSettings.OverrideGravity;
+
                             // Apply settings filters
                             glm::vec3 filteredPosDelta(0.0f);
                             if (rmSettings.IncludeXZ) {
@@ -3546,9 +3585,12 @@ void AnimationSystem::Update(::Scene& scene, float deltaTime) {
                                 filteredPosDelta.z = posDelta.z;
                             }
                             // Always preserve authored vertical motion.
-                            // When hips is the fallback source (no explicit root), keep Y in pose
-                            // and avoid double-applying it to entity motion.
-                            filteredPosDelta.y = usingHipsAsRootSource ? 0.0f : posDelta.y;
+                            // Most hips-driven clips keep Y in pose space to preserve crouch/stance
+                            // compression. Climbing-style clips opt into controller-driven Y by
+                            // enabling OverrideGravity, which transfers the hips delta to entity motion.
+                            filteredPosDelta.y = (usingHipsAsRootSource && !transferHipsVerticalToEntity)
+                                ? 0.0f
+                                : posDelta.y;
                             if (bypassYCurrentState || (isCrossfading && bypassYDuringTransition)) {
                                 filteredPosDelta.y = 0.0f;
                             }
@@ -3596,13 +3638,18 @@ void AnimationSystem::Update(::Scene& scene, float deltaTime) {
                         player._PrevAnimTime = curAnimTime;
                         player._PrevRootValid = true;
                         
-                        // Keep authored vertical pose when hips is the motion source
-                        // so crouches/squats do not hover when entity movement is constrained.
+                        // Keep authored vertical pose when hips is the motion source unless this
+                        // clip explicitly opted into controller-driven Y root motion.
                         if (usingHipsAsRootSource) {
-                            // For hips-driven ApplyToEntity clips (e.g., stand->crouch),
-                            // preserve authored local Y directly. Baseline normalization here
-                            // can erase lowered crouch poses when the clip starts from a lower hips height.
-                            zeroXZTranslationKeepY(rootMotionBoneIdx, false, true);
+                            if (rmSettings.OverrideGravity &&
+                                !(bypassYCurrentState || (isCrossfading && bypassYDuringTransition))) {
+                                zeroLocalTranslationToBind(rootMotionBoneIdx);
+                            } else {
+                                // For hips-driven ApplyToEntity clips (e.g., stand->crouch),
+                                // preserve authored local Y directly. Baseline normalization here
+                                // can erase lowered crouch poses when the clip starts from a lower hips height.
+                                zeroXZTranslationKeepY(rootMotionBoneIdx, false, true);
+                            }
                         } else {
                             zeroLocalTranslationToBind(rootMotionBoneIdx);
                         }
@@ -3750,21 +3797,12 @@ void AnimationSystem::Update(::Scene& scene, float deltaTime) {
                     layerBlendT = glm::clamp((x - a.Key) / denom, 0.0f, 1.0f);
                     
                     // Load blend entry assets
-                    std::string pathA = ResolveAnimationBinding(player, a).EffectivePath();
-                    std::string pathB = ResolveAnimationBinding(player, b).EffectivePath();
+                    const ResolvedAnimationBinding bindingA = ResolveAnimationBinding(player, a);
+                    const ResolvedAnimationBinding bindingB = ResolveAnimationBinding(player, b);
                     int cacheKeyA = (layerIdx * 10000) + layerAnimState->Id * 100 + i1;
                     int cacheKeyB = (layerIdx * 10000) + layerAnimState->Id * 100 + i2;
-                    
-                    if (!pathA.empty()) {
-                        auto ita = player.CachedAssets.find(cacheKeyA);
-                        if (ita != player.CachedAssets.end()) layerAssetB0 = ita->second;
-                        else { layerAssetB0 = std::make_shared<AnimationAsset>(LoadAnimationAsset(pathA)); player.CachedAssets[cacheKeyA] = layerAssetB0; }
-                    }
-                    if (!pathB.empty()) {
-                        auto ita = player.CachedAssets.find(cacheKeyB);
-                        if (ita != player.CachedAssets.end()) layerAssetB1 = ita->second;
-                        else { layerAssetB1 = std::make_shared<AnimationAsset>(LoadAnimationAsset(pathB)); player.CachedAssets[cacheKeyB] = layerAssetB1; }
-                    }
+                    layerAssetB0 = GetOrLoadAnimationAssetForBinding(player, cacheKeyA, bindingA);
+                    layerAssetB1 = GetOrLoadAnimationAssetForBinding(player, cacheKeyB, bindingB);
                     
                     collapseBlend1DContributors(layerAssetB0, layerAssetB1, i1, i2, layerBlendT, layerDuration);
                     layerUseBlend1D = true;
@@ -3793,18 +3831,12 @@ void AnimationSystem::Update(::Scene& scene, float deltaTime) {
                     layerUseBlend2D = true;
                 } else {
                     // Single animation state
-                    std::string assetPath = ResolveAnimationBinding(player, *layerAnimState).EffectivePath();
-                    if (assetPath.empty()) continue;
-                    
                     // Cache key: encode layer index and state id to avoid collisions with base layer
                     int cacheKey = (layerIdx * 10000) + layerAnimState->Id;
-                    auto ita = player.CachedAssets.find(cacheKey);
-                    if (ita != player.CachedAssets.end()) {
-                        layerAsset = ita->second;
-                    } else {
-                        layerAsset = std::make_shared<AnimationAsset>(LoadAnimationAsset(assetPath));
-                        player.CachedAssets[cacheKey] = layerAsset;
-                    }
+                    layerAsset = GetOrLoadAnimationAssetForBinding(
+                        player,
+                        cacheKey,
+                        ResolveAnimationBinding(player, *layerAnimState));
                     if (!layerAsset) continue;
                     
                     layerDuration = layerAsset->Duration();
@@ -3837,15 +3869,11 @@ void AnimationSystem::Update(::Scene& scene, float deltaTime) {
                             // Reload state for new current state
                             layerAnimState = controllerLayer->FindState(layerState->CurrentStateId);
                             if (!layerAnimState) continue;
-                            std::string newAssetPath = ResolveAnimationBinding(player, *layerAnimState).EffectivePath();
                             int newCacheKey = (layerIdx * 10000) + layerAnimState->Id;
-                            auto newIta = player.CachedAssets.find(newCacheKey);
-                            if (newIta != player.CachedAssets.end()) {
-                                layerAsset = newIta->second;
-                            } else {
-                                layerAsset = std::make_shared<AnimationAsset>(LoadAnimationAsset(newAssetPath));
-                                player.CachedAssets[newCacheKey] = layerAsset;
-                            }
+                            layerAsset = GetOrLoadAnimationAssetForBinding(
+                                player,
+                                newCacheKey,
+                                ResolveAnimationBinding(player, *layerAnimState));
                             layerDuration = layerAsset ? layerAsset->Duration() : 0.0f;
                         }
                     }
@@ -3859,20 +3887,18 @@ void AnimationSystem::Update(::Scene& scene, float deltaTime) {
                     layerState->CurrentStateId != layerState->NextStateId) {
                     float preservedTime = layerState->NextStateTime;
                     layerState->SetCurrentState(layerState->NextStateId, false);
-                    layerState->StateTime = preservedTime;
                     // Reload for new state
                     layerAnimState = controllerLayer->FindState(layerState->CurrentStateId);
                     if (!layerAnimState) continue;
-                    std::string newAssetPath = ResolveAnimationBinding(player, *layerAnimState).EffectivePath();
                     int newCacheKey = (layerIdx * 10000) + layerAnimState->Id;
-                    auto newIta = player.CachedAssets.find(newCacheKey);
-                    if (newIta != player.CachedAssets.end()) {
-                        layerAsset = newIta->second;
-                    } else {
-                        layerAsset = std::make_shared<AnimationAsset>(LoadAnimationAsset(newAssetPath));
-                        player.CachedAssets[newCacheKey] = layerAsset;
-                    }
+                    layerAsset = GetOrLoadAnimationAssetForBinding(
+                        player,
+                        newCacheKey,
+                        ResolveAnimationBinding(player, *layerAnimState));
                     layerDuration = layerAsset ? layerAsset->Duration() : 0.0f;
+                    // Mirror base-layer handoff: preserve elapsed next-state time,
+                    // but recompute normalized/cycle bookkeeping for the new state.
+                    layerState->SetStateTime(preservedTime, layerDuration);
                 }
                 
                 // NOTE: StateTime is already advanced by UpdateLayer() above
@@ -4051,6 +4077,29 @@ void AnimationSystem::Update(::Scene& scene, float deltaTime) {
                 }
                 layerState->_PrevEventStateId = currentLayerStateId;
                 layerState->_PrevEventStateTime = currentLayerTime;
+
+                // --- Overlay-layer state enter/exit callbacks ---
+                // Same routing as the base layer: dispatch by state name so managed
+                // AnimatorState handles fire regardless of which layer drives the state.
+                if (currentLayerStateId != layerState->_StateCallbackPrevStateId) {
+                    const auto* prevLayerSt = (layerState->_StateCallbackPrevStateId >= 0 && controllerLayer)
+                        ? controllerLayer->FindState(layerState->_StateCallbackPrevStateId) : nullptr;
+                    const auto* curLayerSt = (currentLayerStateId >= 0 && controllerLayer)
+                        ? controllerLayer->FindState(currentLayerStateId) : nullptr;
+                    const std::string prevLayerName = prevLayerSt ? prevLayerSt->Name : std::string();
+                    const std::string curLayerName = curLayerSt ? curLayerSt->Name : std::string();
+                    if (!prevLayerName.empty()) {
+                        cm::animation::DispatchAnimationStateEvent(
+                            static_cast<int>(rootId), prevLayerName.c_str(), curLayerName.c_str(),
+                            static_cast<int>(cm::animation::AnimationStatePhase::Exited));
+                    }
+                    if (!curLayerName.empty()) {
+                        cm::animation::DispatchAnimationStateEvent(
+                            static_cast<int>(rootId), curLayerName.c_str(), prevLayerName.c_str(),
+                            static_cast<int>(cm::animation::AnimationStatePhase::Entered));
+                    }
+                    layerState->_StateCallbackPrevStateId = currentLayerStateId;
+                }
 
                 // Dispatch script events from this layer to managed scripts
                 if (!layerFiredEvents.empty()) {

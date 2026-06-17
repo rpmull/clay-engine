@@ -2,11 +2,13 @@
 #include "core/platform/win32/Win32Window.h"
 #include "core/ecs/Scene.h"
 #include "core/jobs/JobSystem.h"
+#include "core/physics/PhysicsLayerManager.h"
 #include "core/jobs/Jobs.h"
 #include "core/vfs/VirtualFS.h"
 #include "core/vfs/PakReader.h"
 #include "core/vfs/FileSystem.h"
 #include "core/rendering/Renderer.h"
+#include "core/rendering/MaterialCache.h"
 #include "core/rendering/TextureLoader.h"
 #include "core/rendering/ShaderManager.h"
 #include "core/rendering/StandardMeshManager.h"
@@ -30,6 +32,7 @@
 #include "core/managed/ManagedScriptComponent.h"
 #include "core/animation/AnimationSystem.h"
 #include "core/rendering/Environment.h"
+#include "core/prefab/PrefabPrewarm.h"
 #include "core/prefab/RuntimePrefabInstantiator.h"
 #include "editor/Project.h"
 #include "managed/interop/DialogueInterop.h"
@@ -127,6 +130,56 @@ static bool FinalizeInitialPrefabLoads(Scene& scene) {
                   << " prefab root(s) failed during initial scene load." << std::endl;
     }
     return pending == 0;
+}
+
+static bool FinalizeInitialAssetWarmup(Scene& scene)
+{
+    TextureLoadSettings textureSettings{};
+    textureSettings.MaxDimension = scene.GetEnvironment().TextureMaxDimension;
+    if (SetPersistentTextureLoadSettings(textureSettings)) {
+        RefreshSceneTextureOverrides(scene);
+    }
+
+    prefab::Clear();
+    prefab::QueueScenePrefabs(scene);
+    if (!prefab::HasPendingWork()) {
+        prefab::Clear();
+        return true;
+    }
+
+    constexpr auto kMaxWait = std::chrono::seconds(15);
+    constexpr int kMaxIterations = 8192;
+    const auto start = std::chrono::steady_clock::now();
+    float lastProgress = -1.0f;
+
+    std::cout << "[Runtime] Prewarming scene dependencies before entering play..." << std::endl;
+
+    for (int iteration = 0; iteration < kMaxIterations; ++iteration) {
+        prefab::Update(8.0);
+
+        const float progress = prefab::GetProgress();
+        if (progress >= 0.0f && progress != lastProgress) {
+            std::cout << "[Runtime] Prewarm progress: " << static_cast<int>(progress * 100.0f) << "%" << std::endl;
+            lastProgress = progress;
+        }
+
+        if (!prefab::HasPendingWork()) {
+            prefab::Clear();
+            return true;
+        }
+
+        if (std::chrono::steady_clock::now() - start > kMaxWait) {
+            std::cerr << "[Runtime] WARNING: Timed out while prewarming scene dependencies." << std::endl;
+            prefab::Clear();
+            return false;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    std::cerr << "[Runtime] WARNING: Prewarm iteration budget exhausted." << std::endl;
+    prefab::Clear();
+    return false;
 }
 
 RuntimeApplication::RuntimeApplication(const RuntimeLaunchOptions& options)
@@ -343,8 +396,10 @@ void RuntimeApplication::InitBgfx() {
     // Match editor's initialization flow exactly
     Renderer::Get().Init(m_Width, m_Height, m_Window);
     
-    // Runtime renders directly to backbuffer (no offscreen framebuffer)
-    Renderer::Get().SetRenderToOffscreen(false);
+    // Runtime uses the same offscreen scene path as the editor, then presents to the backbuffer.
+    // This keeps internal render resolution behavior aligned between editor play mode and exports.
+    Renderer::Get().SetRenderToOffscreen(true);
+    Renderer::Get().SetPresentOffscreenToBackbuffer(true);
     
     std::cout << "[Runtime] bgfx initialized." << std::endl;
 }
@@ -450,7 +505,20 @@ void RuntimeApplication::LoadEntryScene() {
     
     try {
         nlohmann::json j = nlohmann::json::parse(manifestText);
-        
+
+        // Register the project's physics layers BEFORE loading any scene, so that
+        // PhysicsLayerName -> index resolution in the scene binary matches what the
+        // project authored. Without this the runtime would only have the built-in
+        // defaults and custom layers would resolve to the fallback layer.
+        if (j.contains("physicsLayers") && j["physicsLayers"].is_array()) {
+            std::vector<std::string> physicsLayers;
+            for (const auto& t : j["physicsLayers"]) {
+                if (t.is_string()) physicsLayers.push_back(t.get<std::string>());
+            }
+            PhysicsLayers::PhysicsLayerManager::Get().SetLayers(physicsLayers);
+            std::cout << "[Runtime] Registered " << physicsLayers.size() << " physics layers from manifest." << std::endl;
+        }
+
         // Load asset map into resolver
         if (m_AssetResolver) {
             m_AssetResolver->LoadManifest(manifestText);
@@ -584,6 +652,11 @@ void RuntimeApplication::LoadEntryScene() {
         
         // Report what we loaded
         if (loaded) {
+            if (!FinalizeInitialAssetWarmup(*m_Scene)) {
+                std::cerr << "[Runtime] WARNING: Scene entered startup with incomplete dependency warmup."
+                          << std::endl;
+            }
+
             if (!FinalizeInitialPrefabLoads(*m_Scene)) {
                 std::cerr << "[Runtime] WARNING: Scene entered startup with unresolved prefab work."
                           << std::endl;
@@ -756,12 +829,21 @@ void RuntimeApplication::Run() {
     scene->UpdateTransforms();
     
     // Sync all cameras with their entity transforms
+    const float initialCameraWidth = scene->GetEnvironment().HasFixedRenderResolution()
+        ? static_cast<float>(scene->GetEnvironment().RenderResolutionWidth)
+        : static_cast<float>(m_Width);
+    float initialCameraHeight = scene->GetEnvironment().HasFixedRenderResolution()
+        ? static_cast<float>(scene->GetEnvironment().RenderResolutionHeight)
+        : static_cast<float>(m_Height);
+    if (initialCameraHeight <= 0.0f) {
+        initialCameraHeight = 1.0f;
+    }
+    const float initialAspectRatio = initialCameraWidth / initialCameraHeight;
     for (const auto& entity : scene->GetEntities()) {
         auto* data = scene->GetEntityData(entity.GetID());
         if (data && data->Camera) {
             data->Camera->SyncWithTransform(data->Transform);
-            float aspectRatio = static_cast<float>(m_Width) / static_cast<float>(m_Height);
-            data->Camera->UpdateProjection(aspectRatio);
+            data->Camera->UpdateProjection(initialAspectRatio);
         }
     }
     

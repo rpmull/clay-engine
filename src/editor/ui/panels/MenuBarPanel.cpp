@@ -384,16 +384,17 @@ void MenuBarPanel::OnImGuiRender() {
     if (ImGui::BeginMenu("Scene")) {
         if (ImGui::BeginMenu("Environment")) {
             Environment& env = m_Context->GetEnvironment();
+            bool envChanged = false;
             if (ImGui::BeginTabBar("##envtabs")) {
                 if (ImGui::BeginTabItem("Fog & Ambient")) {
-                    ImGui::Checkbox("Enable Fog", &env.EnableFog);
-                    ImGui::ColorEdit3("Fog Color", (float*)&env.FogColor);
-                    ImGui::SliderFloat("Fog Density", &env.FogDensity, 0.0f, 0.2f, "%.3f");
+                    envChanged |= ImGui::Checkbox("Enable Fog", &env.EnableFog);
+                    envChanged |= ImGui::ColorEdit3("Fog Color", (float*)&env.FogColor);
+                    envChanged |= ImGui::SliderFloat("Fog Density", &env.FogDensity, 0.0f, 0.2f, "%.3f");
                     ImGui::Separator();
-                    ImGui::ColorEdit3("Ambient Color", (float*)&env.AmbientColor);
-                    ImGui::SliderFloat("Ambient Intensity", &env.AmbientIntensity, 0.0f, 5.0f, "%.2f");
+                    envChanged |= ImGui::ColorEdit3("Ambient Color", (float*)&env.AmbientColor);
+                    envChanged |= ImGui::SliderFloat("Ambient Intensity", &env.AmbientIntensity, 0.0f, 5.0f, "%.2f");
                     ImGui::Separator();
-                    ImGui::SliderFloat("Exposure", &env.Exposure, 0.1f, 5.0f, "%.2f");
+                    envChanged |= ImGui::SliderFloat("Exposure", &env.Exposure, 0.1f, 5.0f, "%.2f");
                     ImGui::EndTabItem();
                 }
                 if (ImGui::BeginTabItem("Global Shader Properties")) {
@@ -401,13 +402,37 @@ void MenuBarPanel::OnImGuiRender() {
 
                     // Texture Filter (scene default for materials)
                     {
-                        int cur = (env.TextureFilter == Environment::TextureFilterMode::Linear) ? 0 : 1;
-                        const char* items[] = { "Linear", "Point" };
-                        if (ImGui::Combo("Texture Filter", &cur, items, IM_ARRAYSIZE(items))) {
-                            env.TextureFilter = (cur == 0)
-                                ? Environment::TextureFilterMode::Linear
-                                : Environment::TextureFilterMode::Point;
+                        int cur = 0;
+                        if (env.TextureFilter == Environment::TextureFilterMode::Point) {
+                            cur = 1;
+                        } else if (env.TextureFilter == Environment::TextureFilterMode::Anisotropic) {
+                            cur = 2;
                         }
+                        const char* items[] = { "Linear", "Point", "Anisotropic" };
+                        if (ImGui::Combo("Texture Filter", &cur, items, IM_ARRAYSIZE(items))) {
+                            env.TextureFilter = (cur == 1)
+                                ? Environment::TextureFilterMode::Point
+                                : (cur == 2)
+                                    ? Environment::TextureFilterMode::Anisotropic
+                                    : Environment::TextureFilterMode::Linear;
+                            envChanged = true;
+                        }
+                    }
+                    {
+                        static const uint16_t kTextureCaps[] = { 0, 256, 512, 1024, 2048, 4096 };
+                        const char* labels[] = { "Full", "256", "512", "1024", "2048", "4096" };
+                        int currentCap = 0;
+                        for (int i = 0; i < IM_ARRAYSIZE(kTextureCaps); ++i) {
+                            if (env.TextureMaxDimension == kTextureCaps[i]) {
+                                currentCap = i;
+                                break;
+                            }
+                        }
+                        if (ImGui::Combo("Texture Max Size", &currentCap, labels, IM_ARRAYSIZE(labels))) {
+                            env.TextureMaxDimension = kTextureCaps[currentCap];
+                            envChanged = true;
+                        }
+                        ImGui::TextDisabled("Caps scene texture loads, including skybox cubemap generation, without recompiling assets.");
                         ImGui::Separator();
                     }
 
@@ -423,6 +448,7 @@ void MenuBarPanel::OnImGuiRender() {
                         GlobalShaderProperties::Instance().TryGetVec4("u_ColorTint", tint);
                         if (ImGui::ColorEdit4("Global Tint (Project)", &tint.x)) {
                             GlobalShaderProperties::Instance().SetVec4("u_ColorTint", tint);
+                            envChanged = true;
                         }
                     } else if (s_selectedShader == 1) {
                         // PSX globals: u_psxParams(x=jitter px, y=affine 0..1, z=light influence 0..1, w=unused)
@@ -439,6 +465,7 @@ void MenuBarPanel::OnImGuiRender() {
                         if (changed) {
                             psx.x = jitter; psx.y = affine; psx.z = lightInf;
                             GlobalShaderProperties::Instance().SetVec4("u_psxParams", psx);
+                            envChanged = true;
                         }
 
                         glm::vec4 toon(3.0f, 1.0f, 0.0f, 0.0f);
@@ -451,6 +478,7 @@ void MenuBarPanel::OnImGuiRender() {
                         if (changedToon) {
                             toon.x = bands; toon.y = soft;
                             GlobalShaderProperties::Instance().SetVec4("u_toonParams", toon);
+                            envChanged = true;
                         }
 
                         // Posterization for albedo: u_posterize.x = levels (0=off)
@@ -460,19 +488,41 @@ void MenuBarPanel::OnImGuiRender() {
                         if (ImGui::SliderFloat("Albedo Posterize Levels", &posterLevels, 0.0f, 16.0f, "%.0f")) {
                             poster.x = posterLevels;
                             GlobalShaderProperties::Instance().SetVec4("u_posterize", poster);
+                            envChanged = true;
                         }
+
+                        // Shadows for PSX: u_psxShadowParams.x = enable, y = strength.
+                        // Lets PSX surfaces cast/receive directional shadows like PBR,
+                        // even when unlit. Requires Shadows to be enabled (Shadows tab).
+                        ImGui::Separator();
+                        glm::vec4 psxShadow(0.0f, 1.0f, 0.0f, 0.0f);
+                        GlobalShaderProperties::Instance().TryGetVec4("u_psxShadowParams", psxShadow);
+                        bool psxShadowEnable = psxShadow.x > 0.5f;
+                        float psxShadowStrength = psxShadow.y;
+                        bool changedPsxShadow = false;
+                        changedPsxShadow |= ImGui::Checkbox("Cast/Receive Shadows", &psxShadowEnable);
+                        if (psxShadowEnable) {
+                            changedPsxShadow |= ImGui::SliderFloat("Shadow Strength##psx", &psxShadowStrength, 0.0f, 1.0f, "%.2f");
+                        }
+                        if (changedPsxShadow) {
+                            psxShadow.x = psxShadowEnable ? 1.0f : 0.0f;
+                            psxShadow.y = psxShadowStrength;
+                            GlobalShaderProperties::Instance().SetVec4("u_psxShadowParams", psxShadow);
+                            envChanged = true;
+                        }
+                        ImGui::TextDisabled("Requires Shadows enabled (Shadows tab).");
                     }
 
                     ImGui::EndTabItem();
                 }
                 if (ImGui::BeginTabItem("Sky")) {
-                    ImGui::Checkbox("Use Skybox (Texture)", &env.UseSkybox);
+                    envChanged |= ImGui::Checkbox("Use Skybox (Texture)", &env.UseSkybox);
                     if (!env.UseSkybox) {
                         env.UseSkyboxEquirectangular = false;
                     }
                     if (env.UseSkybox) {
                         ImGui::Indent();
-                        ImGui::Checkbox("Use Single Image (Equirectangular)", &env.UseSkyboxEquirectangular);
+                        envChanged |= ImGui::Checkbox("Use Single Image (Equirectangular)", &env.UseSkyboxEquirectangular);
                         if (env.UseSkyboxEquirectangular) {
                             char buffer[512];
                             std::strncpy(buffer, env.SkyboxEquirectangularPath.c_str(), sizeof(buffer));
@@ -480,17 +530,20 @@ void MenuBarPanel::OnImGuiRender() {
                             ImGui::InputText("Image Path", buffer, sizeof(buffer));
                             if (std::string(buffer) != env.SkyboxEquirectangularPath) {
                                 env.SkyboxEquirectangularPath = buffer;
+                                envChanged = true;
                             }
                             ImGui::SameLine();
                             if (ImGui::Button("Pick##SkyEq")) {
                                 std::string picked = ShowOpenFileDialogExt(L"Skybox Image", L"*");
                                 if (!picked.empty()) {
                                     env.SkyboxEquirectangularPath = picked;
+                                    envChanged = true;
                                 }
                             }
                             int cubeRes = static_cast<int>(env.SkyboxEquirectangularResolution);
                             if (ImGui::SliderInt("Cubemap Resolution", &cubeRes, 32, 2048, "%d")) {
                                 env.SkyboxEquirectangularResolution = static_cast<uint16_t>(std::clamp(cubeRes, 32, 2048));
+                                envChanged = true;
                             }
                         } else {
                             static const char* kFaceLabels[6] = { "+X (Right)", "-X (Left)", "+Y (Top)", "-Y (Bottom)", "+Z (Front)", "-Z (Back)" };
@@ -502,12 +555,14 @@ void MenuBarPanel::OnImGuiRender() {
                                 ImGui::InputText(kFaceLabels[i], buffer, sizeof(buffer));
                                 if (std::string(buffer) != env.SkyboxFacePaths[i]) {
                                     env.SkyboxFacePaths[i] = buffer;
+                                    envChanged = true;
                                 }
                                 ImGui::SameLine();
                                 if (ImGui::Button("Pick")) {
                                     std::string picked = ShowOpenFileDialogExt(L"Texture File", L"*");
                                     if (!picked.empty()) {
                                         env.SkyboxFacePaths[i] = picked;
+                                        envChanged = true;
                                     }
                                 }
                                 ImGui::PopID();
@@ -518,63 +573,65 @@ void MenuBarPanel::OnImGuiRender() {
                         ImGui::Separator();
                     }
                     
-                    ImGui::Checkbox("Procedural Sky", &env.ProceduralSky);
+                    envChanged |= ImGui::Checkbox("Procedural Sky", &env.ProceduralSky);
                     if (env.ProceduralSky) {
                         ImGui::Indent();
                         
                         ImGui::Text("Sky Colors");
-                        ImGui::ColorEdit3("Top Color", (float*)&env.SkyTopColor);
-                        ImGui::ColorEdit3("Horizon Color", (float*)&env.SkyHorizonColor);
-                        ImGui::ColorEdit3("Ground Color", (float*)&env.SkyGroundColor);
+                        envChanged |= ImGui::ColorEdit3("Top Color", (float*)&env.SkyTopColor);
+                        envChanged |= ImGui::ColorEdit3("Horizon Color", (float*)&env.SkyHorizonColor);
+                        envChanged |= ImGui::ColorEdit3("Ground Color", (float*)&env.SkyGroundColor);
                         
                         ImGui::Separator();
                         
                         ImGui::Text("Sun");
-                        ImGui::SliderFloat("Sun Size", &env.SunSize, 0.0f, 1.0f, "%.3f");
-                        ImGui::SliderFloat("Sun Size Convergence", &env.SunSizeConvergence, 1.0f, 20.0f, "%.1f");
-                        ImGui::SliderFloat("Sun Intensity", &env.SunIntensity, 0.0f, 5.0f, "%.2f");
+                        envChanged |= ImGui::SliderFloat("Sun Size", &env.SunSize, 0.0f, 1.0f, "%.3f");
+                        envChanged |= ImGui::SliderFloat("Sun Size Convergence", &env.SunSizeConvergence, 1.0f, 20.0f, "%.1f");
+                        envChanged |= ImGui::SliderFloat("Sun Intensity", &env.SunIntensity, 0.0f, 5.0f, "%.2f");
                         
                         ImGui::Separator();
                         
                         ImGui::Text("Atmosphere");
-                        ImGui::SliderFloat("Atmosphere Thickness", &env.AtmosphereThickness, 0.0f, 2.0f, "%.2f");
-                        ImGui::SliderFloat("Horizon Fade", &env.HorizonFade, 0.0f, 1.0f, "%.2f");
+                        envChanged |= ImGui::SliderFloat("Atmosphere Thickness", &env.AtmosphereThickness, 0.0f, 2.0f, "%.2f");
+                        envChanged |= ImGui::SliderFloat("Horizon Fade", &env.HorizonFade, 0.0f, 1.0f, "%.2f");
                         
                         ImGui::Separator();
                         
                         ImGui::Text("Exposure");
-                        ImGui::SliderFloat("Sky Exposure", &env.SkyExposure, 0.0f, 5.0f, "%.2f");
+                        envChanged |= ImGui::SliderFloat("Sky Exposure", &env.SkyExposure, 0.0f, 5.0f, "%.2f");
                         
                         ImGui::Unindent();
                     }
                     ImGui::EndTabItem();
                 }
                 if (ImGui::BeginTabItem("Outline")) {
-                    ImGui::Checkbox("Enable Outline", &env.OutlineEnabled);
-                    ImGui::ColorEdit3("Outline Color", (float*)&env.OutlineColor);
-                    ImGui::SliderFloat("Thickness (px)", &env.OutlineThickness, 1.0f, 8.0f, "%.0f");
+                    envChanged |= ImGui::Checkbox("Enable Outline", &env.OutlineEnabled);
+                    envChanged |= ImGui::ColorEdit3("Outline Color", (float*)&env.OutlineColor);
+                    envChanged |= ImGui::SliderFloat("Thickness (px)", &env.OutlineThickness, 1.0f, 8.0f, "%.0f");
                     ImGui::TextDisabled("Screen-space outline applied to all visible meshes.");
                     ImGui::EndTabItem();
                 }
                 if (ImGui::BeginTabItem("Shadows")) {
-                    ImGui::Checkbox("Enable Shadows", &env.ShadowsEnabled);
+                    envChanged |= ImGui::Checkbox("Enable Shadows", &env.ShadowsEnabled);
                     ImGui::Separator();
                     static const int kResOptions[] = { 512, 1024, 2048, 4096 };
                     int curr = 1; // default to 1024 index
                     for (int i = 0; i < 4; ++i) if (env.ShadowMapResolution == kResOptions[i]) curr = i;
                     if (ImGui::SliderInt("Resolution", &curr, 0, 3, "%d")) {
                         env.ShadowMapResolution = kResOptions[curr];
+                        envChanged = true;
                     }
-                    ImGui::SliderFloat("Distance/Size", &env.ShadowDistance, 5.0f, 200.0f, "%.1f");
-                    ImGui::SliderFloat("Bias", &env.ShadowBias, 0.0001f, 0.01f, "%.4f");
-                    ImGui::SliderFloat("Normal Bias", &env.ShadowNormalBias, 0.0f, 3.0f, "%.2f");
-                    ImGui::SliderFloat("Softness (radius)", &env.ShadowSoftness, 0.0f, 3.0f, "%.2f");
+                    envChanged |= ImGui::SliderFloat("Distance/Size", &env.ShadowDistance, 5.0f, 200.0f, "%.1f");
+                    envChanged |= ImGui::SliderFloat("Bias", &env.ShadowBias, 0.0001f, 0.01f, "%.4f");
+                    envChanged |= ImGui::SliderFloat("Normal Bias", &env.ShadowNormalBias, 0.0f, 3.0f, "%.2f");
+                    envChanged |= ImGui::SliderFloat("Softness (radius)", &env.ShadowSoftness, 0.0f, 3.0f, "%.2f");
                     int samplesIdx = 2; // 9
                     if (env.ShadowSamples == 1) samplesIdx = 0; else if (env.ShadowSamples == 4) samplesIdx = 1; else if (env.ShadowSamples == 16) samplesIdx = 3;
                     if (ImGui::SliderInt("Samples", &samplesIdx, 0, 3, "%d")) {
                         env.ShadowSamples = (samplesIdx==0)?1:(samplesIdx==1)?4:(samplesIdx==2)?9:16;
+                        envChanged = true;
                     }
-                    ImGui::SliderFloat("Strength", &env.ShadowStrength, 0.0f, 1.0f, "%.2f");
+                    envChanged |= ImGui::SliderFloat("Strength", &env.ShadowStrength, 0.0f, 1.0f, "%.2f");
                     ImGui::EndTabItem();
                 }
                 ImGui::EndTabBar();
@@ -582,6 +639,9 @@ void MenuBarPanel::OnImGuiRender() {
             // If we're in play mode (runtime scene active), mirror environment to the runtime scene so changes apply immediately
             if (m_Context && m_Context->m_RuntimeScene) {
                 m_Context->m_RuntimeScene->GetEnvironment() = env;
+            }
+            if (envChanged && m_Context) {
+                m_Context->MarkDirty();
             }
             ImGui::EndMenu();
         }

@@ -14,12 +14,14 @@ SAMPLER2D(s_emission, 5);
 
 // Light uniforms - support up to 5 lights
 uniform vec4 u_lightColors[5];     // rgb = color, a = intensity
-uniform vec4 u_lightPositions[5];  // xyz = position/direction, w = light type (0=directional, 1=point)
-uniform vec4 u_lightParams[5];     // x = range (for point lights), y = constant, z = linear, w = quadratic
+uniform vec4 u_lightPositions[5];  // xyz = position, w = light type (0=directional, 1=point, 2=spot)
+uniform vec4 u_lightDirections[5]; // xyz = forward/light direction
+uniform vec4 u_lightParams[5];     // x = range, y = constant, z = linear, w = quadratic
+uniform vec4 u_lightSpotParams[5]; // x = inner cone cos, y = outer cone cos
 uniform vec4 u_cameraPos;          // camera position in world space
 uniform vec4 u_ambientFog;         // xyz = ambient color * intensity, w = flags (bit0: fog enabled)
 uniform vec4 u_fogParams;          // x = fogDensity, yzw = fog color
-uniform vec4 u_skyParams;          // x = proceduralSky flag, y = skybox available
+uniform vec4 u_skyParams;          // x = proceduralSky flag, y = skybox available, z = max skybox mip
 uniform vec4 u_skyTopColor;        // rgb = zenith sky color
 uniform vec4 u_skyHorizonColor;    // rgb = horizon color
 uniform vec4 u_groundColor;        // rgb = ground/underside color
@@ -112,6 +114,17 @@ float SamplePointShadow(vec3 worldPos, int shadowIdx) {
     return ((currentDepth - shadowMeta.w) <= storedDepth) ? 1.0 : 0.0;
 }
 
+float ComputeSpotAttenuation(int lightIndex, vec3 L) {
+    if (u_lightPositions[lightIndex].w < 1.5) {
+        return 1.0;
+    }
+    float innerCos = u_lightSpotParams[lightIndex].x;
+    float outerCos = u_lightSpotParams[lightIndex].y;
+    float theta = dot(normalize(u_lightDirections[lightIndex].xyz), -L);
+    float denom = max(innerCos - outerCos, 1e-4);
+    return clamp((theta - outerCos) / denom, 0.0, 1.0);
+}
+
 vec3 ComputePointLightReflectionFallback(vec3 worldPos, vec3 N, float roughness) {
     vec3 fallbackRadiance = vec3(0.0, 0.0, 0.0);
     float roughWeight = mix(0.15, 1.0, 1.0 - roughness);
@@ -130,6 +143,7 @@ vec3 ComputePointLightReflectionFallback(vec3 worldPos, vec3 N, float roughness)
         float linearTerm = u_lightParams[i].z;
         float quadratic = u_lightParams[i].w;
         float attenuation = 1.0 / (constant + linearTerm * distance + quadratic * distance * distance + 0.0001);
+        attenuation *= ComputeSpotAttenuation(i, L);
         float grazing = 1.0 - max(dot(N, L), 0.0);
         float scatter = mix(0.25, 1.0, grazing);
         fallbackRadiance += u_lightColors[i].rgb * u_lightColors[i].a * attenuation * scatter * roughWeight;
@@ -138,19 +152,9 @@ vec3 ComputePointLightReflectionFallback(vec3 worldPos, vec3 N, float roughness)
 }
 
 vec3 SampleSkyboxPrefiltered(vec3 envDir, float roughness) {
-    vec3 dir = normalize(envDir);
-    vec3 up = abs(dir.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
-    vec3 tangent = normalize(cross(up, dir));
-    vec3 bitangent = normalize(cross(dir, tangent));
-    float cone = roughness * roughness * 0.55;
-
-    vec3 c0 = textureCube(s_skybox, dir).rgb;
-    vec3 c1 = textureCube(s_skybox, normalize(dir + tangent * cone)).rgb;
-    vec3 c2 = textureCube(s_skybox, normalize(dir - tangent * cone)).rgb;
-    vec3 c3 = textureCube(s_skybox, normalize(dir + bitangent * cone)).rgb;
-    vec3 c4 = textureCube(s_skybox, normalize(dir - bitangent * cone)).rgb;
-
-    return c0 * 0.40 + (c1 + c2 + c3 + c4) * 0.15;
+    float maxMipLevel = max(u_skyParams.z, 0.0);
+    float lod = clamp(roughness * roughness * maxMipLevel, 0.0, maxMipLevel);
+    return textureCubeLod(s_skybox, normalize(envDir), lod).rgb;
 }
 
 void main()
@@ -310,9 +314,8 @@ void main()
         
         if (lightType < 0.5) {
             // Directional light
-            L = normalize(-u_lightPositions[i].xyz);
+            L = normalize(-u_lightDirections[i].xyz);
         } else {
-            // Point light
             vec3 lightPos = u_lightPositions[i].xyz;
             vec3 lightDir = lightPos - v_worldPos;
             float distance = length(lightDir);
@@ -329,13 +332,17 @@ void main()
             float linearTerm = u_lightParams[i].z;
             float quadratic = u_lightParams[i].w;
             attenuation = 1.0 / (constant + linearTerm * distance + quadratic * distance * distance);
+            attenuation *= ComputeSpotAttenuation(i, L);
+            if (attenuation <= 0.0) {
+                continue;
+            }
         }
         
         float shadowWeight = u_shadowParams.w * clamp(u_shadowReceive.x, 0.0, 1.0);
         float sf = 1.0;
         if (lightType < 0.5) {
             sf = mix(1.0, shadowFactor, shadowWeight);
-        } else {
+        } else if (lightType < 1.5) {
             for (int shadowIdx = 0; shadowIdx < 4; ++shadowIdx) {
                 if (u_pointShadowMeta[shadowIdx].x > 0.5 && abs(float(i) - u_pointShadowMeta[shadowIdx].y) < 0.25) {
                     float pointShadowFactor = SamplePointShadow(v_worldPos, shadowIdx);

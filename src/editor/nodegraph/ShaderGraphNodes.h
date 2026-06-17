@@ -131,6 +131,11 @@ void RegisterSwizzleNode(NodeRegistry& reg);
 // --- Texture Nodes ---
 void RegisterSampleTexture2DNode(NodeRegistry& reg);
 
+// --- Utility / Color Nodes ---
+void RegisterFresnelNode(NodeRegistry& reg);
+void RegisterColorRampNode(NodeRegistry& reg);
+void RegisterHueSaturationValueNode(NodeRegistry& reg);
+
 // --- Output/Master Nodes ---
 void RegisterUnlitMasterNode(NodeRegistry& reg);
 void RegisterPBRMasterNode(NodeRegistry& reg);

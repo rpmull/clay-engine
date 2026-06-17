@@ -565,14 +565,11 @@ void EntityBinaryWriter::WriteEntities(WriteContext& ctx, const Scene& scene, Sc
         ctx.Write(guidLow);
         ctx.Write(flags);
         
-        // v5+: Write layer and tag for full parity with JSON serializer
+        // v31+: Write layer and interned tag for parity with prefab entity metadata.
         int32_t layer = data->Layer;
         ctx.Write(layer);
-        uint32_t tagLen = static_cast<uint32_t>(data->Tag.size());
-        ctx.Write(tagLen);
-        if (tagLen > 0) {
-            ctx.Write(data->Tag.data(), tagLen);
-        }
+        uint32_t tagIndex = ctx.AddString(data->Tag);
+        ctx.Write(tagIndex);
         
         // v4+: Write ModelAssetGuid if present (flag 0x04)
         if (flags & 0x04) {
@@ -991,6 +988,9 @@ void EntityBinaryWriter::WriteComponent(WriteContext& ctx, const EntityData* dat
             ctx.Write(type);
             ctx.Write(color, 12);
             ctx.Write(l.Intensity);
+            ctx.Write(l.Range);
+            ctx.Write(l.SpotInnerAngleDegrees);
+            ctx.Write(l.SpotOuterAngleDegrees);
             ctx.Write(static_cast<uint8_t>(l.PointShadowsEnabled ? 1 : 0));
             break;
         }
@@ -1252,9 +1252,10 @@ void EntityBinaryWriter::WriteComponent(WriteContext& ctx, const EntityData* dat
             ctx.Write(cc.EnableWalkStairs ? uint8_t(1) : uint8_t(0));
             uint32_t layerNameIdx = ctx.AddString(cc.PhysicsLayerName);
             ctx.Write(layerNameIdx);
+            ctx.Write(cc.CollisionMask);
             break;
         }
-        
+
         case ComponentTypeId::Terrain: {
             const auto& t = *data->Terrain;
             uint32_t assetPathIdx = ctx.AddString(t.AssetPath);
@@ -2606,7 +2607,18 @@ void EntityBinaryWriter::WriteEnvironment(WriteContext& ctx, const Scene& scene,
     ctx.Write(env.OutlineColor.y);
     ctx.Write(env.OutlineColor.z);
     ctx.Write(env.OutlineThickness);
-    
+    ctx.Write(static_cast<uint32_t>(env.TextureFilter));
+    ctx.Write(static_cast<uint32_t>(env.TextureMaxDimension));
+    ctx.Write(static_cast<uint32_t>(env.RenderResolutionWidth));
+    ctx.Write(static_cast<uint32_t>(env.RenderResolutionHeight));
+    ctx.Write(env.UseSkybox ? uint8_t(1) : uint8_t(0));
+    ctx.Write(env.UseSkyboxEquirectangular ? uint8_t(1) : uint8_t(0));
+    ctx.Write(ctx.AddString(env.SkyboxEquirectangularPath));
+    ctx.Write(static_cast<uint32_t>(env.SkyboxEquirectangularResolution));
+    for (const std::string& facePath : env.SkyboxFacePaths) {
+        ctx.Write(ctx.AddString(facePath));
+    }
+
     header.environmentSize = static_cast<uint32_t>(ctx.Position() - startPos);
     
     std::cout << "[EntityBinaryWriter] Wrote environment data: " << header.environmentSize << " bytes" << std::endl;
@@ -2860,25 +2872,16 @@ bool EntityBinaryWriter::WritePrefabToMemory(Scene& scene, EntityID rootId, std:
             
             uint32_t dataOffset = static_cast<uint32_t>(componentData.size());
             
-            // Create a temporary WriteContext for this single component
-            // WriteComponent writes: [ComponentEntry header] + [component data]
-            // But we already allocated space for the entry, so we need just the data portion
-            WriteContext compCtx;
-            compCtx.strings = ctx.strings;
-            compCtx.stringLookup = ctx.stringLookup;
-            compCtx.scene = ctx.scene;
-            compCtx.currentEntityId = id;
-            compCtx.sanitizeDerivedPrefabRefs = ctx.sanitizeDerivedPrefabRefs;
-            compCtx.prefabEntityIndexMap = ctx.prefabEntityIndexMap;
-            
-            // WriteComponent writes the full component including its entry header
-            WriteComponent(compCtx, data, typeId);
-            
-            // WriteComponent writes: ComponentEntry (12 bytes) + component data
+            // Reuse the unified component writer without cloning the string table for
+            // every component. ctx.data is only scratch storage in prefab writing.
+            ctx.data.clear();
+            WriteComponent(ctx, data, typeId);
+
+            // WriteComponent writes: ComponentEntry (12 bytes) + component data.
             // Extract just the component data (skip the ComponentEntry it wrote)
-            if (compCtx.data.size() > sizeof(ComponentEntry)) {
+            if (ctx.data.size() > sizeof(ComponentEntry)) {
                 ComponentEntry entry;
-                std::memcpy(&entry, compCtx.data.data(), sizeof(ComponentEntry));
+                std::memcpy(&entry, ctx.data.data(), sizeof(ComponentEntry));
                 
                 // Update entry with correct offset into componentData
                 entry.dataOffset = dataOffset;
@@ -2886,7 +2889,7 @@ bool EntityBinaryWriter::WritePrefabToMemory(Scene& scene, EntityID rootId, std:
                 // Copy just the component data (after ComponentEntry)
                 // Use entry.dataSize from WriteComponent (already calculated correctly)
                 // Don't recalculate - WriteComponent already set it correctly
-                size_t extractedDataSize = compCtx.data.size() - sizeof(ComponentEntry);
+                size_t extractedDataSize = ctx.data.size() - sizeof(ComponentEntry);
                 
                 // Copy exactly entry.dataSize bytes to ensure we don't copy extra data
                 // This is critical - we must copy exactly what WriteComponent calculated
@@ -2900,24 +2903,20 @@ bool EntityBinaryWriter::WritePrefabToMemory(Scene& scene, EntityID rootId, std:
                 // Copy exactly entry.dataSize bytes (not extractedDataSize, in case they differ)
                 size_t dataStartOffset = sizeof(ComponentEntry);
                 size_t dataEndOffset = dataStartOffset + entry.dataSize;
-                if (dataEndOffset > compCtx.data.size()) {
-                    std::cerr << "[EntityBinaryWriter] ERROR: Component data truncated! entry.dataSize=" << entry.dataSize 
-                              << " but compCtx.data.size()=" << compCtx.data.size() 
-                              << ", available=" << (compCtx.data.size() - dataStartOffset) << std::endl;
+                if (dataEndOffset > ctx.data.size()) {
+                    std::cerr << "[EntityBinaryWriter] ERROR: Component data truncated! entry.dataSize=" << entry.dataSize
+                              << " but scratch size=" << ctx.data.size()
+                              << ", available=" << (ctx.data.size() - dataStartOffset) << std::endl;
                     return false;
                 }
                 
                 componentData.insert(componentData.end(), 
-                    compCtx.data.begin() + dataStartOffset, 
-                    compCtx.data.begin() + dataEndOffset);
+                    ctx.data.begin() + dataStartOffset,
+                    ctx.data.begin() + dataEndOffset);
                 
                 // Write the entry header at reserved position
                 std::memcpy(componentData.data() + entryPos, &entry, sizeof(ComponentEntry));
             }
-            
-            // Update string table from component write
-            ctx.strings = compCtx.strings;
-            ctx.stringLookup = compCtx.stringLookup;
         }
         
         entityHeaders.push_back(header);

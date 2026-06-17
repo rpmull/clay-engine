@@ -301,6 +301,7 @@ bool AnimationGraphPanel::SaveController(const std::string& path) {
     if (success) {
         m_OpenPath = path;
         m_Modified = false;
+        Scene::Get().InvalidateAllAnimatorAssetCaches();
         std::cout << "[AnimationGraphPanel] Saved controller: " << path << "\n";
     } else {
         std::cerr << "[AnimationGraphPanel] Failed to save controller: " << path << "\n";
@@ -1631,19 +1632,22 @@ void AnimationGraphPanel::DrawStateProperties(AnimatorState* state) {
                     float innerWidth = ImGui::GetContentRegionAvail().x;
                     
                     // Exit Time - use table for cleaner layout
-                    if (ImGui::Checkbox("Has Exit Time", &t.HasExitTime)) {
+                    if (ImGui::Checkbox("Wait for clip (Exit Time)", &t.HasExitTime)) {
                         MarkModified();
                     }
                     if (ImGui::IsItemHovered()) {
-                        ImGui::SetTooltip("Wait until animation reaches Exit Time %% before transitioning");
+                        ImGui::SetTooltip("Play the source clip to the 'Play to' point before this transition can fire.\n"
+                                          "Best for letting one-shots finish first.\n\n"
+                                          "WARNING: do NOT pair Exit Time with a Trigger condition - the one-frame\n"
+                                          "trigger rarely lands in the exit window, so the transition fires unreliably.");
                     }
                     if (t.HasExitTime) {
-                        ImGui::Text("Exit at:");
+                        ImGui::Text("Play to:");
                         ImGui::SameLine();
                         ImGui::SetNextItemWidth(innerWidth - 100);
                         // Use 0-100 range for display, convert back to 0-1 for storage
                         float exitPercent = t.ExitTime * 100.0f;
-                        if (ImGui::SliderFloat("##exitTime", &exitPercent, 0.0f, 100.0f, "%.0f%%", ImGuiSliderFlags_AlwaysClamp)) {
+                        if (ImGui::SliderFloat("##exitTime", &exitPercent, 0.0f, 100.0f, "%.0f%% of clip", ImGuiSliderFlags_AlwaysClamp)) {
                             t.ExitTime = exitPercent / 100.0f;
                             MarkModified();
                         }
@@ -1653,7 +1657,7 @@ void AnimationGraphPanel::DrawStateProperties(AnimatorState* state) {
                     ImGui::Text("Blend:");
                     ImGui::SameLine();
                     ImGui::SetNextItemWidth(innerWidth - 100);
-                    if (ImGui::DragFloat("##duration", &t.Duration, 0.01f, 0.0f, 5.0f, "%.2f s")) {
+                    if (ImGui::DragFloat("##duration", &t.Duration, 0.01f, 0.0f, 5.0f, t.DurationNormalized ? "%.2f x clip" : "%.2f sec")) {
                         MarkModified();
                     }
                     
@@ -1854,19 +1858,22 @@ void AnimationGraphPanel::DrawStateProperties(AnimatorState* state) {
                     float innerWidth = ImGui::GetContentRegionAvail().x;
                     
                     // Exit Time - use table for cleaner layout
-                    if (ImGui::Checkbox("Has Exit Time", &t.HasExitTime)) {
+                    if (ImGui::Checkbox("Wait for clip (Exit Time)", &t.HasExitTime)) {
                         MarkModified();
                     }
                     if (ImGui::IsItemHovered()) {
-                        ImGui::SetTooltip("Wait until animation reaches Exit Time %% before transitioning");
+                        ImGui::SetTooltip("Play the source clip to the 'Play to' point before this transition can fire.\n"
+                                          "Best for letting one-shots finish first.\n\n"
+                                          "WARNING: do NOT pair Exit Time with a Trigger condition - the one-frame\n"
+                                          "trigger rarely lands in the exit window, so the transition fires unreliably.");
                     }
                     if (t.HasExitTime) {
-                        ImGui::Text("Exit at:");
+                        ImGui::Text("Play to:");
                         ImGui::SameLine();
                         ImGui::SetNextItemWidth(innerWidth - 100);
                         // Use 0-100 range for display, convert back to 0-1 for storage
                         float exitPercent = t.ExitTime * 100.0f;
-                        if (ImGui::SliderFloat("##exitTime", &exitPercent, 0.0f, 100.0f, "%.0f%%", ImGuiSliderFlags_AlwaysClamp)) {
+                        if (ImGui::SliderFloat("##exitTime", &exitPercent, 0.0f, 100.0f, "%.0f%% of clip", ImGuiSliderFlags_AlwaysClamp)) {
                             t.ExitTime = exitPercent / 100.0f;
                             MarkModified();
                         }
@@ -1876,7 +1883,7 @@ void AnimationGraphPanel::DrawStateProperties(AnimatorState* state) {
                     ImGui::Text("Blend:");
                     ImGui::SameLine();
                     ImGui::SetNextItemWidth(innerWidth - 100);
-                    if (ImGui::DragFloat("##duration", &t.Duration, 0.01f, 0.0f, 5.0f, "%.2f s")) {
+                    if (ImGui::DragFloat("##duration", &t.Duration, 0.01f, 0.0f, 5.0f, t.DurationNormalized ? "%.2f x clip" : "%.2f sec")) {
                         MarkModified();
                     }
                     
@@ -2256,19 +2263,22 @@ void AnimationGraphPanel::DrawAnyStateProperties() {
                 float innerWidth = ImGui::GetContentRegionAvail().x;
                 
                 // Exit Time - use table for cleaner layout
-                if (ImGui::Checkbox("Has Exit Time", &t.HasExitTime)) {
+                if (ImGui::Checkbox("Wait for clip (Exit Time)", &t.HasExitTime)) {
                     MarkModified();
                 }
                 if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Wait until animation reaches Exit Time %% before transitioning");
+                    ImGui::SetTooltip("Play the source clip to the 'Play to' point before this transition can fire.\n"
+                                      "Best for letting one-shots finish first.\n\n"
+                                      "WARNING: do NOT pair Exit Time with a Trigger condition - the one-frame\n"
+                                      "trigger rarely lands in the exit window, so the transition fires unreliably.");
                 }
                 if (t.HasExitTime) {
-                    ImGui::Text("Exit at:");
+                    ImGui::Text("Play to:");
                     ImGui::SameLine();
                     ImGui::SetNextItemWidth(innerWidth - 100);
                     // Use 0-100 range for display, convert back to 0-1 for storage
                     float exitPercent = t.ExitTime * 100.0f;
-                    if (ImGui::SliderFloat("##exitTime", &exitPercent, 0.0f, 100.0f, "%.0f%%", ImGuiSliderFlags_AlwaysClamp)) {
+                    if (ImGui::SliderFloat("##exitTime", &exitPercent, 0.0f, 100.0f, "%.0f%% of clip", ImGuiSliderFlags_AlwaysClamp)) {
                         t.ExitTime = exitPercent / 100.0f;
                         MarkModified();
                     }
@@ -2278,7 +2288,7 @@ void AnimationGraphPanel::DrawAnyStateProperties() {
                 ImGui::Text("Blend:");
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(innerWidth - 100);
-                if (ImGui::DragFloat("##duration", &t.Duration, 0.01f, 0.0f, 5.0f, "%.2f s")) {
+                if (ImGui::DragFloat("##duration", &t.Duration, 0.01f, 0.0f, 5.0f, t.DurationNormalized ? "%.2f x clip" : "%.2f sec")) {
                     MarkModified();
                 }
                 
@@ -2470,37 +2480,50 @@ void AnimationGraphPanel::DrawTransitionProperties(AnimatorTransition* trans) {
     // Settings
     ImGui::Text("Settings");
     
-    if (ImGui::Checkbox("Has Exit Time", &trans->HasExitTime)) {
+    if (ImGui::Checkbox("Wait for clip (Exit Time)", &trans->HasExitTime)) {
         MarkModified();
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Wait until source animation reaches Exit Time %% before transitioning");
+        ImGui::SetTooltip("Play the source clip up to the 'Play to' point before this transition can fire.\n"
+                          "Best for letting one-shots (attack, equip, reload) finish before moving on.\n\n"
+                          "WARNING: do NOT combine this with a Trigger condition. Triggers last a single\n"
+                          "frame and almost never line up with the exit window, so the trigger gets dropped\n"
+                          "and the transition fires unreliably. Use Exit Time OR a Trigger, not both.");
     }
-    
+
     if (trans->HasExitTime) {
-        ImGui::Text("Exit at:");
+        ImGui::Text("Play to:");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(contentWidth - 80);
-        // Use 0-100 range for display, convert back to 0-1 for storage
+        // Stored as 0-1 (fraction of the source clip); shown to the user as a percentage.
         float exitPercent = trans->ExitTime * 100.0f;
-        if (ImGui::SliderFloat("##exitTime", &exitPercent, 0.0f, 100.0f, "%.0f%%", ImGuiSliderFlags_AlwaysClamp)) {
+        if (ImGui::SliderFloat("##exitTime", &exitPercent, 0.0f, 100.0f, "%.0f%% of clip", ImGuiSliderFlags_AlwaysClamp)) {
             trans->ExitTime = exitPercent / 100.0f;
             MarkModified();
         }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("How far the source clip plays before the transition starts.\n100%% = wait for the clip to finish.");
+        }
     }
-    
+
+    // Blend (crossfade) length. The unit depends on the 'clip-fractions' toggle below.
     ImGui::Text("Blend:");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(contentWidth - 80);
-    if (ImGui::DragFloat("##duration", &trans->Duration, 0.01f, 0.0f, 5.0f, "%.2f s")) {
-        MarkModified();
-    }
-    
-    if (ImGui::Checkbox("Fixed Duration", &trans->DurationNormalized)) {
+    if (ImGui::DragFloat("##duration", &trans->Duration, 0.01f, 0.0f, 5.0f,
+                         trans->DurationNormalized ? "%.2f x clip" : "%.2f sec")) {
         MarkModified();
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("If enabled, duration is in seconds. Otherwise, it's normalized (0-1).");
+        ImGui::SetTooltip("Crossfade length when blending OUT of the source state.\n0 = instant cut (no blend).");
+    }
+
+    // NOTE: this flag is DurationNormalized. true => Blend is a fraction of the clip; false => seconds.
+    if (ImGui::Checkbox("Blend in clip-fractions (not seconds)", &trans->DurationNormalized)) {
+        MarkModified();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Off: Blend is measured in seconds.\nOn: Blend is a fraction (0-1) of the source clip's length.");
     }
     
     ImGui::Separator();

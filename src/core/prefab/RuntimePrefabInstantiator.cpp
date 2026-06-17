@@ -34,15 +34,14 @@
 #include "core/rendering/VertexTypes.h"
 #include "core/rendering/Terrain.h"
 #include "core/serialization/MeshBinaryLoader.h"
+#include "core/serialization/MeshCache.h"
 #include "core/serialization/MaterialCache.h"  // Material caching for performance
 #include "core/rendering/DeferredGPUBuffers.h"  // Deferred GPU buffer creation
 #include "core/serialization/MaterialBinaryLoader.h"  // For loading materials from paths
 #include "core/serialization/EntityBinaryLoader.h"  // For shared LoadComponentBinary
 #include "core/debug/PrefabLog.h"
 #include "core/utils/PrefabPerfDiagnostics.h"
-#if defined(CLAYMORE_EDITOR)
-#include "editor/pipeline/BinaryAssetCache.h"
-#endif
+#include "core/utils/Profiler.h"
 #include "core/jobs/ParallelFor.h"
 #include "core/jobs/Jobs.h"
 #include "managed/interop/ScriptComponent.h"
@@ -67,6 +66,7 @@
 #include <atomic>
 #include <mutex>
 #include <cstring>
+#include <cfloat>
 #include <filesystem>
 #include <algorithm>
 #include <cctype>
@@ -188,17 +188,15 @@ std::shared_ptr<Material> AcquireSharedDefaultMaterial(Scene& scene, bool skinne
 std::mutex s_inlineMaterialCacheMutex;
 std::unordered_map<std::string, std::weak_ptr<Material>> s_inlineMaterialCache;
 
-std::shared_ptr<Material> CloneOwnedInlineMaterial(const std::shared_ptr<Material>& material)
+std::shared_ptr<Material> ShareEquivalentMaterial(const std::shared_ptr<Material>& material)
 {
-    if (!material) {
-        return nullptr;
-    }
+    return AcquireEquivalentMaterial(material);
+}
 
-    if (auto clone = material->Clone()) {
-        return clone;
-    }
-
-    return material;
+bool IsEquivalentMaterialShared(const std::shared_ptr<Material>& material)
+{
+    return material &&
+        GetMaterialEquivalenceKey(material.get()).EquivalentSafe;
 }
 
 cm::debug::PrefabPerfLabel BuildPrefabPerfLabel(Scene& scene,
@@ -287,15 +285,6 @@ private:
 static std::mutex s_prefabJsonCacheMutex;
 static std::unordered_map<ClaymoreGUID, nlohmann::json, ClaymoreGUIDHasher> s_prefabJsonCache;
 
-#if defined(CLAYMORE_EDITOR)
-bool TryEnsureBinaryForPlayMode(const std::string& sourcePath) {
-    if (sourcePath.empty()) return false;
-    if (Assets::GetLoadMode() != AssetLoadMode::PlayMode) return false;
-    if (FileSystem::Instance().IsPakMounted()) return false;
-    return BinaryAssetCache::Instance().EnsureBinary(sourcePath);
-}
-#endif
-
 struct PrefabBinaryCacheEntry {
     std::shared_ptr<std::vector<uint8_t>> data;
     size_t size = 0;
@@ -363,7 +352,10 @@ static bool HasEntityRefHints(const ScriptEntityRefMetadata* meta) {
 }
 
 static bool ShouldUsePrefabBinaryCache() {
-    return Assets::GetLoadMode() == AssetLoadMode::Runtime;
+    // RuntimePrefabInstantiator only consumes compiled prefab payloads. Cache them
+    // in editor too so drag-in, hot-swap, and previews instantiate from prepared
+    // state instead of re-reading/parsing the same .prefabb repeatedly.
+    return true;
 }
 
 static std::string NormalizePrefabCacheKey(const std::string& path) {
@@ -375,6 +367,16 @@ static std::string NormalizePrefabCacheKey(const std::string& path) {
         std::replace(normalized.begin(), normalized.end(), '\\', '/');
         return normalized;
     }
+}
+
+static bool IsPreparedBinaryReady(const std::string& sourcePath, const std::string& binaryPath) {
+    if (binaryPath.empty() || !FileSystem::Instance().Exists(binaryPath)) {
+        return false;
+    }
+    if (auto* resolver = Assets::GetResolver()) {
+        return resolver->IsBinaryCurrent(sourcePath);
+    }
+    return true;
 }
 
 static std::shared_ptr<std::vector<uint8_t>> TryGetPrefabBinaryCache(const std::string& key) {
@@ -440,6 +442,87 @@ static void ClearPrefabRuntimeCachesLocked() {
     s_prefabModelDeltaCache.clear();
 }
 
+static void AppendUniqueKey(std::vector<std::string>& keys, const std::string& raw)
+{
+    if (raw.empty()) {
+        return;
+    }
+    std::string key = NormalizePrefabCacheKey(raw);
+    if (key.empty()) {
+        return;
+    }
+    if (std::find(keys.begin(), keys.end(), key) == keys.end()) {
+        keys.push_back(std::move(key));
+    }
+}
+
+static std::vector<std::string> BuildPrefabCacheInvalidationKeys(const std::string& prefabPath)
+{
+    std::vector<std::string> keys;
+    AppendUniqueKey(keys, prefabPath);
+    try {
+        std::filesystem::path path(prefabPath);
+        std::string ext = path.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        if (ext == ".prefab" || ext == ".json") {
+            path.replace_extension(".prefabb");
+            AppendUniqueKey(keys, path.string());
+        } else if (ext == ".prefabb") {
+            path.replace_extension(".prefab");
+            AppendUniqueKey(keys, path.string());
+            path.replace_extension(".json");
+            AppendUniqueKey(keys, path.string());
+        }
+    } catch (...) {
+    }
+    return keys;
+}
+
+static ClaymoreGUID TryReadPrefabSourceGuidForCacheKey(const std::string& key)
+{
+    ClaymoreGUID guid{};
+    try {
+        std::filesystem::path path(key);
+        std::string ext = path.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        if (ext != ".prefab" && ext != ".json") {
+            return guid;
+        }
+
+        std::string jsonText;
+        if (!FileSystem::Instance().ReadTextFile(key, jsonText)) {
+            std::ifstream file(key);
+            if (!file.is_open()) {
+                return guid;
+            }
+            std::ostringstream buffer;
+            buffer << file.rdbuf();
+            jsonText = buffer.str();
+        }
+
+        nlohmann::json json = nlohmann::json::parse(jsonText, nullptr, false);
+        if (json.is_discarded() || !json.contains("guid")) {
+            return guid;
+        }
+        json.at("guid").get_to(guid);
+    } catch (...) {
+    }
+    return guid;
+}
+
+static void ErasePrefabJsonCacheForGuid(const ClaymoreGUID& guid)
+{
+    if (guid.high == 0 && guid.low == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(s_prefabJsonCacheMutex);
+    s_prefabJsonCache.erase(guid);
+}
+
 } // namespace
 
 // Forward declaration of global remap function (defined at end of file)
@@ -462,6 +545,7 @@ struct ReadContext {
     const uint8_t* stringTableData;
     size_t stringTableOffset;
     std::vector<std::string> strings;
+    const std::vector<std::string>* stringView = nullptr;
     
     bool Read(void* dst, size_t count) {
         if (offset + count > dataSize) return false;
@@ -476,8 +560,9 @@ struct ReadContext {
     }
     
     std::string ReadString(uint32_t index) {
-        if (!strings.empty() && index < strings.size()) {
-            return strings[index];
+        const std::vector<std::string>* table = stringView ? stringView : &strings;
+        if (table && !table->empty() && index < table->size()) {
+            return (*table)[index];
         }
         // Fallback: navigate to string by counting null terminators
         size_t pos = stringTableOffset;
@@ -495,6 +580,7 @@ struct ReadContext {
     }
 
     void BuildStringTable(size_t endOffset) {
+        stringView = nullptr;
         strings.clear();
         if (stringTableOffset >= dataSize) return;
         size_t end = std::min(endOffset, dataSize);
@@ -753,6 +839,35 @@ static void StoreParsedPrefabLayoutCache(const std::string& key, std::shared_ptr
     s_prefabParsedLayoutCache[key] = std::move(layout);
 }
 
+static void ErasePrefabRuntimeCacheForKey(const std::string& key)
+{
+    ClaymoreGUID prefabGuid{};
+    {
+        std::lock_guard<std::mutex> lock(s_prefabParsedLayoutCacheMutex);
+        auto it = s_prefabParsedLayoutCache.find(key);
+        if (it != s_prefabParsedLayoutCache.end()) {
+            if (it->second) {
+                prefabGuid = it->second->prefabAssetGuid;
+            }
+            s_prefabParsedLayoutCache.erase(it);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(s_prefabBinaryCacheMutex);
+        auto it = s_prefabBinaryCache.find(key);
+        if (it != s_prefabBinaryCache.end()) {
+            s_prefabBinaryCacheBytes -= it->second.size;
+            s_prefabBinaryCacheLru.erase(it->second.lruIt);
+            s_prefabBinaryCache.erase(it);
+        }
+        s_prefabModelDeltaCache.erase(key);
+    }
+    if (prefabGuid.high != 0 || prefabGuid.low != 0) {
+        std::lock_guard<std::mutex> lock(s_prefabJsonCacheMutex);
+        s_prefabJsonCache.erase(prefabGuid);
+    }
+}
+
 static bool BuildParsedPrefabLayout(const std::vector<uint8_t>& data,
                                     const PrefabBinaryHeader& header,
                                     ParsedPrefabLayout& out,
@@ -888,7 +1003,8 @@ struct AsyncPrefabRequest {
     size_t entityHeaderSize = 0;
     size_t entityHeaderOffset = 0;
     ReadContext ctx{};
-    std::vector<EntityHeader> entityHeaders;
+    std::shared_ptr<ParsedPrefabLayout> parsedLayout;
+    const std::vector<EntityHeader>* entityHeaders = nullptr;
     size_t entityIndex = 0;
     size_t parentIndex = 0;
 
@@ -934,6 +1050,108 @@ static bool IsDefaultTransform(const TransformComponent& t) {
            nearEq(t.Scale.x, 1.0f) && nearEq(t.Scale.y, 1.0f) && nearEq(t.Scale.z, 1.0f) &&
            nearEq(t.RotationQ.x, 0.0f) && nearEq(t.RotationQ.y, 0.0f) && nearEq(t.RotationQ.z, 0.0f) &&
            nearEq(t.RotationQ.w, 1.0f);
+}
+
+struct PrefabNavMeshCandidate {
+    EntityID Entity = INVALID_ENTITY_ID;
+    glm::vec3 Center{0.0f};
+};
+
+static std::vector<PrefabNavMeshCandidate> BuildPrefabNavMeshCandidates(Scene& scene) {
+    std::vector<PrefabNavMeshCandidate> candidates;
+    candidates.reserve(scene.GetEntities().size());
+
+    const auto& allSceneEntities = scene.GetEntities();
+    for (const Entity& entity : allSceneEntities) {
+        EntityData* data = scene.GetEntityData(entity.GetID());
+        if (!data || !data->Navigation || !data->Navigation->Runtime) {
+            continue;
+        }
+
+        const glm::vec3 center =
+            (data->Navigation->AABB.min + data->Navigation->AABB.max) * 0.5f;
+        candidates.push_back({entity.GetID(), center});
+    }
+
+    return candidates;
+}
+
+static EntityID FindNearestPrefabNavMeshCandidate(
+    const std::vector<PrefabNavMeshCandidate>& candidates,
+    const glm::vec3& position) {
+    float bestDistSq = FLT_MAX;
+    EntityID best = 0;
+
+    for (const PrefabNavMeshCandidate& candidate : candidates) {
+        const float distSq = glm::distance2(position, candidate.Center);
+        if (distSq < bestDistSq) {
+            bestDistSq = distSq;
+            best = candidate.Entity;
+        }
+    }
+
+    return best;
+}
+
+static void AutoBindPrefabNavAgents(
+    Scene& scene,
+    const std::vector<EntityID>& prefabEntities,
+    bool logBindings) {
+    std::vector<EntityID> agentsToBind;
+    agentsToBind.reserve(prefabEntities.size());
+
+    for (EntityID id : prefabEntities) {
+        EntityData* data = scene.GetEntityData(id);
+        if (!data || !data->NavAgent || !data->NavAgent->Enabled ||
+            (data->NavAgent->NavMeshEntity != 0 &&
+             data->NavAgent->NavMeshEntity != INVALID_ENTITY_ID)) {
+            continue;
+        }
+
+        agentsToBind.push_back(id);
+    }
+
+    if (agentsToBind.empty()) {
+        return;
+    }
+
+    const std::vector<PrefabNavMeshCandidate> navMeshes =
+        BuildPrefabNavMeshCandidates(scene);
+
+    uint64_t agentsVisited = static_cast<uint64_t>(agentsToBind.size());
+    uint64_t agentsBound = 0;
+    uint64_t agentsUnbound = 0;
+
+    for (EntityID id : agentsToBind) {
+        EntityData* data = scene.GetEntityData(id);
+        if (!data || !data->NavAgent) {
+            continue;
+        }
+
+        const glm::vec3 position = glm::vec3(data->Transform.WorldMatrix[3]);
+        const EntityID best = FindNearestPrefabNavMeshCandidate(navMeshes, position);
+        if (best != 0) {
+            data->NavAgent->NavMeshEntity = best;
+            ++agentsBound;
+            if (logBindings) {
+                PREFAB_LOG("Auto-bound NavAgent on '" << data->Name
+                    << "' to NavMeshEntity=" << best);
+            }
+        } else {
+            ++agentsUnbound;
+            if (logBindings) {
+                PREFAB_LOG("NavAgent on '" << data->Name
+                    << "' has no navmesh binding after instantiation (no navmesh found in scene)");
+            }
+        }
+    }
+
+    auto& profiler = Profiler::Get();
+    profiler.AddCounter("Prefab/AutoBindNavMeshSceneScans", 1);
+    profiler.AddCounter("Prefab/AutoBindNavMeshCandidates", static_cast<uint64_t>(navMeshes.size()));
+    profiler.AddCounter("Prefab/AutoBindNavAgentsVisited", agentsVisited);
+    profiler.AddCounter("Prefab/AutoBindNavAgentsBound", agentsBound);
+    profiler.AddCounter("Prefab/AutoBindNavAgentsUnbound", agentsUnbound);
 }
 
 // Keep binary-instantiated entities in parity with authored entities by moving the
@@ -1061,6 +1279,26 @@ static void CreatePrefabPhysicsBodies(Scene& scene, const std::vector<EntityID>&
     }
 }
 
+static bool PrefabMeshNeedsUniqueInstance(Scene& scene, const EntityData& data) {
+    if (data.BlendShapes && !data.BlendShapes->Shapes.empty()) {
+        return true;
+    }
+
+    EntityID parentId = data.Parent;
+    while (parentId != INVALID_ENTITY_ID) {
+        EntityData* parentData = scene.GetEntityData(parentId);
+        if (!parentData) {
+            break;
+        }
+        if (parentData->UnifiedMorph && !parentData->UnifiedMorph->Names.empty()) {
+            return true;
+        }
+        parentId = parentData->Parent;
+    }
+
+    return false;
+}
+
 // Resolve mesh references for prefab entities
 static void ResolvePrefabMeshes(Scene& scene, const std::vector<EntityID>& entityIds) {
     PrefabScopedTimer timer("Prefab::ResolveMeshes");
@@ -1074,6 +1312,7 @@ static void ResolvePrefabMeshes(Scene& scene, const std::vector<EntityID>& entit
         uint32_t submeshIndex;
         bool isPrimitive;
         AssetReference::PrimitiveType primType;
+        bool canShareCachedMesh = false;
     };
     struct MeshLoadResult {
         std::shared_ptr<Mesh> mesh;
@@ -1104,6 +1343,7 @@ static void ResolvePrefabMeshes(Scene& scene, const std::vector<EntityID>& entit
             req.primType = AssetReference::PrimitiveTypeFromGuid(guid);
         } else {
             req.isPrimitive = false;
+            req.canShareCachedMesh = !PrefabMeshNeedsUniqueInstance(scene, *data);
             auto it = meshPathCache.find(guid);
             if (it == meshPathCache.end()) {
                 std::string resolved = ResolveGuidToMeshPath(guid);
@@ -1117,7 +1357,7 @@ static void ResolvePrefabMeshes(Scene& scene, const std::vector<EntityID>& entit
     }
     
     // Parallelize mesh loading (I/O + parsing) but keep component mutation sequential.
-    // Mesh caching remains disabled because shared meshes get mutated during dynamic upgrades.
+    // Immutable meshes can share the cache; blendshape/unified-morph cases keep unique instances.
     const bool useParallel = cm::g_JobSystem != nullptr && loadRequests.size() > 1;
     std::vector<MeshLoadResult> loadResults;
     if (useParallel) {
@@ -1128,6 +1368,11 @@ static void ResolvePrefabMeshes(Scene& scene, const std::vector<EntityID>& entit
                 for (size_t i = start; i < start + count; ++i) {
                     const auto& req = loadRequests[i];
                     if (req.isPrimitive) {
+                        continue;
+                    }
+                    if (req.canShareCachedMesh) {
+                        auto& dst = loadResults[i];
+                        dst.mesh = MeshCache::GetOrLoadMesh(req.meshBinPath, req.submeshIndex, &dst.skinned);
                         continue;
                     }
                     bool skinned = false;
@@ -1178,10 +1423,8 @@ static void ResolvePrefabMeshes(Scene& scene, const std::vector<EntityID>& entit
             continue;
         }
         
-        // Non-primitive mesh - load directly (can't safely share meshes due to dynamic buffer upgrades)
-        // NOTE: Mesh caching was disabled because shared meshes get modified during dynamic upgrade
-        // for blend shapes, which corrupts all other instances sharing that mesh.
-        // The deferred GPU buffer creation still provides batching benefits.
+        // Non-primitive mesh. Immutable meshes can use the shared cache; mutable morph targets
+        // keep per-instance mesh objects so later dynamic upgrades do not leak across instances.
         bool skinned = false;
         std::shared_ptr<Mesh> mesh;
         std::unique_ptr<BlendShapeComponent> meshBlendShapes;
@@ -1192,6 +1435,8 @@ static void ResolvePrefabMeshes(Scene& scene, const std::vector<EntityID>& entit
                 mesh = loaded.mesh;
                 meshBlendShapes = std::move(loaded.blendShapes);
                 skinned = loaded.skinned;
+            } else if (req.canShareCachedMesh) {
+                mesh = MeshCache::GetOrLoadMesh(req.meshBinPath, req.submeshIndex, &skinned);
             } else {
                 mesh = MeshBinaryLoader::LoadMesh(req.meshBinPath, req.submeshIndex, &skinned);
                 if (mesh) {
@@ -1236,13 +1481,23 @@ static void ResolvePrefabMeshes(Scene& scene, const std::vector<EntityID>& entit
                         data->Skinning = std::make_unique<SkinningComponent>();
                     }
                     // Create skinned material if current material isn't skinned
-                    if (!std::dynamic_pointer_cast<SkinnedPBRMaterial>(mc.material)) {
-                        mc.material = mc.material
-                            ? MaterialManager::Instance().CreateSceneSkinnedDefaultMaterial(&scene)
-                            : AcquireSharedDefaultMaterial(scene, true);
-                        if (!mc.materials.empty()) {
+                    if (MaterialNeedsSkinnedVariant(mc.material)) {
+                        mc.material = AcquireSkinnedMaterialVariant(scene, mc.material);
+                        if (mc.materials.empty()) {
+                            mc.materials.push_back(mc.material);
+                        } else {
                             mc.materials[0] = mc.material;
                         }
+                        if (mc.OwnedMaterialSlots.empty()) {
+                            mc.OwnedMaterialSlots.resize(mc.materials.size(), false);
+                        } else if (mc.material) {
+                            mc.OwnedMaterialSlots[0] =
+                                !GetMaterialEquivalenceKey(mc.material.get()).EquivalentSafe;
+                        }
+                        mc.UniqueMaterial = std::any_of(
+                            mc.OwnedMaterialSlots.begin(),
+                            mc.OwnedMaterialSlots.end(),
+                            [](bool owned) { return owned; });
                     }
                 }
             }
@@ -1364,21 +1619,23 @@ static void ResolvePrefabMeshes(Scene& scene, const std::vector<EntityID>& entit
                 // Blendshapes require SkinnedPBRMaterial to work correctly
                 if (mesh->HasSkinning() && data->Mesh) {
                     MeshComponent& mc = *data->Mesh;
-                    if (mc.material && !std::dynamic_pointer_cast<SkinnedPBRMaterial>(mc.material)) {
-                        auto skinnedMat = MaterialManager::Instance().CreateSceneSkinnedDefaultMaterial(&scene);
-                        // Copy properties from old material
-                        auto oldMat = mc.material;
-                        if (oldMat) {
-                            skinnedMat->m_StateFlags = oldMat->GetStateFlags();
-                            glm::vec4 tint(1.0f);
-                            if (oldMat->TryGetUniform("u_ColorTint", tint)) {
-                                skinnedMat->SetUniform("u_ColorTint", tint);
-                            }
+                    if (MaterialNeedsSkinnedVariant(mc.material)) {
+                        mc.material = AcquireSkinnedMaterialVariant(scene, mc.material);
+                        if (mc.materials.empty()) {
+                            mc.materials.push_back(mc.material);
+                        } else {
+                            mc.materials[0] = mc.material;
                         }
-                        mc.material = skinnedMat;
-                        if (!mc.materials.empty()) {
-                            mc.materials[0] = skinnedMat;
+                        if (mc.OwnedMaterialSlots.empty()) {
+                            mc.OwnedMaterialSlots.resize(mc.materials.size(), false);
+                        } else if (mc.material) {
+                            mc.OwnedMaterialSlots[0] =
+                                !GetMaterialEquivalenceKey(mc.material.get()).EquivalentSafe;
                         }
+                        mc.UniqueMaterial = std::any_of(
+                            mc.OwnedMaterialSlots.begin(),
+                            mc.OwnedMaterialSlots.end(),
+                            [](bool owned) { return owned; });
                     }
                 }
             }
@@ -1439,7 +1696,7 @@ static std::shared_ptr<Material> CreateMaterialFromInlineData(const InlineMateri
         auto it = s_inlineMaterialCache.find(cacheKey);
         if (it != s_inlineMaterialCache.end()) {
             if (auto existing = it->second.lock()) {
-                return CloneOwnedInlineMaterial(existing);
+                return ShareEquivalentMaterial(existing);
             }
             s_inlineMaterialCache.erase(it);
         }
@@ -1483,6 +1740,9 @@ static std::shared_ptr<Material> CreateMaterialFromInlineData(const InlineMateri
     }
     
     if (inl.materialType == InlineMaterialType::PSX) {
+        // Seed the full PSX uniform set first (posterize, shadow params,
+        // emission) so per-entity property-block overrides can bind to them.
+        MaterialManager::InitializePSXUniformDefaults(*mat, skinned);
         mat->SetUniform("u_psxParams", inl.psxParams);
         mat->SetUniform("u_psxWorld", inl.psxWorld);
         mat->SetUniform("u_toonParams", inl.toonParams);
@@ -1519,11 +1779,12 @@ static std::shared_ptr<Material> CreateMaterialFromInlineData(const InlineMateri
         mat->SetReceiveShadows(inl.receiveShadows);
     }
     
+    std::shared_ptr<Material> shared = ShareEquivalentMaterial(mat);
     {
         std::lock_guard<std::mutex> lock(s_inlineMaterialCacheMutex);
-        s_inlineMaterialCache[cacheKey] = mat;
+        s_inlineMaterialCache[cacheKey] = shared;
     }
-    return CloneOwnedInlineMaterial(mat);
+    return shared;
 }
 
 static std::shared_ptr<Material> CreateShaderGraphMaterial(const ShaderGraphMaterialData& sg) {
@@ -1620,23 +1881,6 @@ static void ResolvePrefabMaterials(Scene& scene, const std::vector<EntityID>& en
                     
                     materialsLoaded++;
                 } else {
-#if defined(CLAYMORE_EDITOR)
-                    if (TryEnsureBinaryForPlayMode(matPath)) {
-                        std::string compiledPath = BinaryAssetCache::Instance().GetBinaryPath(matPath);
-                        if (!compiledPath.empty()) {
-                            auto compiledMaterial = RuntimeMaterialCache::GetOrLoad(compiledPath, needsSkinned);
-                            if (compiledMaterial) {
-                                mc.materials[i] = compiledMaterial;
-                                mc.OwnedMaterialSlots[i] = false;
-                                if (i == 0) {
-                                    mc.material = compiledMaterial;
-                                }
-                                materialsLoaded++;
-                                continue;
-                            }
-                        }
-                    }
-#endif
                     materialsFailed++;
                     PREFAB_LOG_ERROR("Failed to load material from path: " << matBinPath << " (entity: " << data->Name << ", slot: " << i << ")");
                 }
@@ -1656,7 +1900,7 @@ static void ResolvePrefabMaterials(Scene& scene, const std::vector<EntityID>& en
             }
             
             for (const auto& sg : mc.ShaderGraphMaterials) {
-                auto mat = CreateShaderGraphMaterial(sg);
+                auto mat = ShareEquivalentMaterial(CreateShaderGraphMaterial(sg));
                 if (mat) {
                     if (sg.slotIndex >= mc.materials.size()) {
                         mc.materials.resize(sg.slotIndex + 1);
@@ -1665,7 +1909,7 @@ static void ResolvePrefabMaterials(Scene& scene, const std::vector<EntityID>& en
                         mc.OwnedMaterialSlots.resize(sg.slotIndex + 1, false);
                     }
                     mc.materials[sg.slotIndex] = mat;
-                    mc.OwnedMaterialSlots[sg.slotIndex] = true;
+                    mc.OwnedMaterialSlots[sg.slotIndex] = !IsEquivalentMaterialShared(mat);
                     
                     if (sg.slotIndex == 0 || !mc.material) {
                         mc.material = mat;
@@ -1698,7 +1942,7 @@ static void ResolvePrefabMaterials(Scene& scene, const std::vector<EntityID>& en
                         mc.OwnedMaterialSlots.resize(inl.slotIndex + 1, false);
                     }
                     mc.materials[inl.slotIndex] = mat;
-                    mc.OwnedMaterialSlots[inl.slotIndex] = true;
+                    mc.OwnedMaterialSlots[inl.slotIndex] = !IsEquivalentMaterialShared(mat);
                     
                     if (inl.slotIndex == 0 || !mc.material) {
                         mc.material = mat;
@@ -2232,10 +2476,10 @@ static EntityID InstantiateBinaryV2(const std::vector<uint8_t>& data, const Pref
     ctx.stringTableOffset = header.stringTableOffset;
     bool isV4 = false;
     bool isV3 = false;
-    std::vector<EntityHeader> entityHeaders;
+    std::shared_ptr<ParsedPrefabLayout> parsedLayout;
     ClaymoreGUID prefabAssetGuid{};
     {
-        std::shared_ptr<ParsedPrefabLayout> parsedLayout =
+        parsedLayout =
             (allowDeltaCache && !cacheKey.empty()) ? TryGetParsedPrefabLayoutCache(cacheKey) : nullptr;
 
         if (!parsedLayout || !IsParsedPrefabLayoutCompatible(*parsedLayout, header)) {
@@ -2256,9 +2500,9 @@ static EntityID InstantiateBinaryV2(const std::vector<uint8_t>& data, const Pref
         isV4 = parsedLayout->isV4;
         isV3 = parsedLayout->isV3;
         prefabAssetGuid = parsedLayout->prefabAssetGuid;
-        entityHeaders = parsedLayout->entityHeaders;
-        ctx.strings = parsedLayout->strings;
+        ctx.stringView = &parsedLayout->strings;
     }
+    const std::vector<EntityHeader>& entityHeaders = parsedLayout->entityHeaders;
 
     std::string prefabPath;
     if ((prefabAssetGuid.high != 0 || prefabAssetGuid.low != 0) && Assets::GetResolver()) {
@@ -2284,7 +2528,7 @@ static EntityID InstantiateBinaryV2(const std::vector<uint8_t>& data, const Pref
                 PrefabAsset prefabAsset;
                 {
                     PrefabScopedTimer timer("Prefab::LoadPrefabJson");
-                    if (PrefabIO::LoadPrefab(prefabSourcePath, prefabAsset)) {
+                    if (PrefabIO::LoadPrefabSource(prefabSourcePath, prefabAsset)) {
                         prefabEntitiesJson = prefabAsset.Entities;
                         std::lock_guard<std::mutex> lock(s_prefabJsonCacheMutex);
                         s_prefabJsonCache[prefabAssetGuid] = prefabAsset.Entities;
@@ -2852,41 +3096,7 @@ static EntityID InstantiateBinaryV2(const std::vector<uint8_t>& data, const Pref
             allPrefabEntities.size(),
             "PrefabSetup/AutoBindNavAgents",
             "AutoBindNavAgents");
-        for (EntityID id : allPrefabEntities) {
-            EntityData* d = scene.GetEntityData(id);
-            if (d && d->NavAgent && d->NavAgent->Enabled && 
-                (d->NavAgent->NavMeshEntity == 0 || d->NavAgent->NavMeshEntity == INVALID_ENTITY_ID)) {
-                // Find nearest navmesh in the ENTIRE SCENE (same logic as Navigation::Update auto-binding)
-                glm::vec3 pos = glm::vec3(d->Transform.WorldMatrix[3]);
-                float bestDist2 = FLT_MAX;
-                EntityID best = 0;
-                
-                // Search all entities in the scene, not just prefab entities
-                const auto& allSceneEntities = scene.GetEntities();
-                for (const Entity& entity : allSceneEntities) {
-                    EntityID otherId = entity.GetID();
-                    EntityData* d2 = scene.GetEntityData(otherId);
-                    if (!d2 || !d2->Navigation || !d2->Navigation->Runtime) continue;
-                    
-                    // Use navmesh AABB center for distance calculation
-                    glm::vec3 aabbMin = d2->Navigation->AABB.min;
-                    glm::vec3 aabbMax = d2->Navigation->AABB.max;
-                    glm::vec3 c = (aabbMin + aabbMax) * 0.5f;
-                    float dsq = glm::distance2(pos, c);
-                    if (dsq < bestDist2) {
-                        bestDist2 = dsq;
-                        best = otherId;
-                    }
-                }
-                
-                if (best != 0) {
-                    d->NavAgent->NavMeshEntity = best;
-                    PREFAB_LOG("Auto-bound NavAgent on '" << d->Name << "' to NavMeshEntity=" << best);
-                } else {
-                    PREFAB_LOG("NavAgent on '" << d->Name << "' has no navmesh binding after instantiation (no navmesh found in scene)");
-                }
-            }
-        }
+        AutoBindPrefabNavAgents(scene, allPrefabEntities, true);
     }
 
     // FIX: Upgrade meshes to dynamic for blendshapes AFTER all components loaded
@@ -3004,43 +3214,59 @@ static EntityID InstantiateBinaryV2(const std::vector<uint8_t>& data, const Pref
                     } else {
                         mc.materials[0] = mc.material;
                     }
+                    if (mc.OwnedMaterialSlots.empty()) {
+                        mc.OwnedMaterialSlots.resize(mc.materials.size(), false);
+                    } else if (!mc.OwnedMaterialSlots.empty()) {
+                        mc.OwnedMaterialSlots[0] = false;
+                    }
+                    mc.UniqueMaterial = std::any_of(
+                        mc.OwnedMaterialSlots.begin(),
+                        mc.OwnedMaterialSlots.end(),
+                        [](bool owned) { return owned; });
                     PREFAB_LOG("Created SkinnedPBRMaterial for entity '" << data->Name << "' (skinned mesh with blendshapes)");
-                } else if (!std::dynamic_pointer_cast<SkinnedPBRMaterial>(mc.material)) {
+                } else if (MaterialNeedsSkinnedVariant(mc.material)) {
                     // Wrong material type - upgrade to SkinnedPBRMaterial
-                    auto skinnedMat = MaterialManager::Instance().CreateSceneSkinnedDefaultMaterial(&scene);
-                    // Copy properties from old material
                     auto oldMat = mc.material;
-                    if (oldMat) {
-                        skinnedMat->m_StateFlags = oldMat->GetStateFlags();
-                        glm::vec4 tint(1.0f);
-                        if (oldMat->TryGetUniform("u_ColorTint", tint)) {
-                            skinnedMat->SetUniform("u_ColorTint", tint);
-                        }
+                    mc.material = AcquireSkinnedMaterialVariant(scene, mc.material);
+                    if (mc.materials.empty()) {
+                        mc.materials.push_back(mc.material);
+                    } else {
+                        mc.materials[0] = mc.material;
                     }
-                    mc.material = skinnedMat;
-                    if (!mc.materials.empty()) {
-                        mc.materials[0] = skinnedMat;
+                    if (mc.OwnedMaterialSlots.empty()) {
+                        mc.OwnedMaterialSlots.resize(mc.materials.size(), false);
+                    } else if (mc.material) {
+                        mc.OwnedMaterialSlots[0] =
+                            !GetMaterialEquivalenceKey(mc.material.get()).EquivalentSafe;
                     }
+                    mc.UniqueMaterial = std::any_of(
+                        mc.OwnedMaterialSlots.begin(),
+                        mc.OwnedMaterialSlots.end(),
+                        [](bool owned) { return owned; });
                     PREFAB_LOG("Upgraded material to SkinnedPBRMaterial for entity '" << data->Name << "' (was: " << oldMat->GetName() << ")");
                 }
             }
          } else if (needsDynamic && mesh->Dynamic) {
             // Mesh already dynamic - just verify material is correct
             if (mesh->HasSkinning() && mc.material && 
-                !std::dynamic_pointer_cast<SkinnedPBRMaterial>(mc.material)) {
-                auto skinnedMat = MaterialManager::Instance().CreateSceneSkinnedDefaultMaterial(&scene);
+                MaterialNeedsSkinnedVariant(mc.material)) {
                 auto oldMat = mc.material;
-                if (oldMat) {
-                    skinnedMat->m_StateFlags = oldMat->GetStateFlags();
-                    glm::vec4 tint(1.0f);
-                    if (oldMat->TryGetUniform("u_ColorTint", tint)) {
-                        skinnedMat->SetUniform("u_ColorTint", tint);
-                    }
+                mc.material = AcquireSkinnedMaterialVariant(scene, mc.material);
+                if (mc.materials.empty()) {
+                    mc.materials.push_back(mc.material);
+                } else {
+                    mc.materials[0] = mc.material;
                 }
-                mc.material = skinnedMat;
-                if (!mc.materials.empty()) {
-                    mc.materials[0] = skinnedMat;
+                if (mc.OwnedMaterialSlots.empty()) {
+                    mc.OwnedMaterialSlots.resize(mc.materials.size(), false);
+                } else if (mc.material) {
+                    mc.OwnedMaterialSlots[0] =
+                        !GetMaterialEquivalenceKey(mc.material.get()).EquivalentSafe;
                 }
+                mc.UniqueMaterial = std::any_of(
+                    mc.OwnedMaterialSlots.begin(),
+                    mc.OwnedMaterialSlots.end(),
+                    [](bool owned) { return owned; });
                 PREFAB_LOG("Fixed material type for entity '" << data->Name << "' (dynamic skinned mesh needs SkinnedPBRMaterial)");
             }
          }
@@ -3323,7 +3549,7 @@ static void EnsurePrefabJsonLoaded(AsyncPrefabRequest& req) {
     }
     
     PrefabAsset prefabAsset;
-    if (PrefabIO::LoadPrefab(prefabSourcePath, prefabAsset)) {
+    if (PrefabIO::LoadPrefabSource(prefabSourcePath, prefabAsset)) {
         req.prefabEntitiesJson = prefabAsset.Entities;
         std::lock_guard<std::mutex> lock(s_prefabJsonCacheMutex);
         s_prefabJsonCache[req.prefabAssetGuid] = prefabAsset.Entities;
@@ -3424,15 +3650,17 @@ static bool StepAsyncPrefab(AsyncPrefabRequest& req, double budgetMs) {
                 req.isV4 = parsedLayout->isV4;
                 req.isV3 = parsedLayout->isV3;
                 req.entityHeaderSize = req.isV4 ? sizeof(EntityHeader) : (req.isV3 ? sizeof(EntityHeaderV3) : sizeof(EntityHeaderV2));
-                req.ctx.strings = parsedLayout->strings;
-                req.entityHeaders = parsedLayout->entityHeaders;
-                req.prefabAssetGuid = parsedLayout->prefabAssetGuid;
-                
-                req.prefabToInstanceGuid.reserve(req.entityHeaders.size());
-                req.instanceToPrefabGuid.reserve(req.entityHeaders.size());
-                req.guidToEntityId.reserve(req.entityHeaders.size());
-                req.createdEntityIds.reserve(req.entityHeaders.size());
-                req.oldToNewIdMap.reserve(req.entityHeaders.size());
+                req.parsedLayout = std::move(parsedLayout);
+                req.ctx.stringView = &req.parsedLayout->strings;
+                req.entityHeaders = &req.parsedLayout->entityHeaders;
+                req.prefabAssetGuid = req.parsedLayout->prefabAssetGuid;
+
+                const size_t entityCount = req.entityHeaders ? req.entityHeaders->size() : 0;
+                req.prefabToInstanceGuid.reserve(entityCount);
+                req.instanceToPrefabGuid.reserve(entityCount);
+                req.guidToEntityId.reserve(entityCount);
+                req.createdEntityIds.reserve(entityCount);
+                req.oldToNewIdMap.reserve(entityCount);
                 
                 req.phase = AsyncPrefabPhase::CreateEntities;
                 break;
@@ -3440,11 +3668,16 @@ static bool StepAsyncPrefab(AsyncPrefabRequest& req, double budgetMs) {
             case AsyncPrefabPhase::CreateEntities: {
                 const bool fastHierarchy = true;
                 const auto& data = *req.data;
-                for (; req.entityIndex < req.entityHeaders.size(); ++req.entityIndex) {
+                if (!req.entityHeaders) {
+                    req.loadError = "Async prefab request missing parsed entity headers";
+                    req.phase = AsyncPrefabPhase::Failed;
+                    return true;
+                }
+                for (; req.entityIndex < req.entityHeaders->size(); ++req.entityIndex) {
                     if (TimeExceeded(start, budgetMs)) {
                         return false;
                     }
-                    const auto& eh = req.entityHeaders[req.entityIndex];
+                    const auto& eh = (*req.entityHeaders)[req.entityIndex];
                     if (eh.componentOffset > data.size()) {
                         req.loadError = "Entity component offset out of bounds";
                         req.phase = AsyncPrefabPhase::Failed;
@@ -3552,11 +3785,16 @@ static bool StepAsyncPrefab(AsyncPrefabRequest& req, double budgetMs) {
             }
             case AsyncPrefabPhase::ResolveParents: {
                 const bool fastHierarchy = true;
-                for (; req.parentIndex < req.entityHeaders.size(); ++req.parentIndex) {
+                if (!req.entityHeaders) {
+                    req.loadError = "Async prefab request missing parsed entity headers";
+                    req.phase = AsyncPrefabPhase::Failed;
+                    return true;
+                }
+                for (; req.parentIndex < req.entityHeaders->size(); ++req.parentIndex) {
                     if (TimeExceeded(start, budgetMs)) {
                         return false;
                     }
-                    const auto& eh = req.entityHeaders[req.parentIndex];
+                    const auto& eh = (*req.entityHeaders)[req.parentIndex];
                     if (eh.parentGuidHigh == 0 && eh.parentGuidLow == 0) continue;
                     ClaymoreGUID parentGuid{eh.parentGuidHigh, eh.parentGuidLow};
                     auto it = req.guidToEntityId.find(PackGuidHash(parentGuid));
@@ -3872,33 +4110,7 @@ static bool StepAsyncPrefab(AsyncPrefabRequest& req, double budgetMs) {
                         req.allPrefabEntities.size(),
                         "PrefabSetup/AutoBindNavAgents",
                         "AutoBindNavAgents");
-                    for (EntityID id : req.allPrefabEntities) {
-                        EntityData* d = req.scene->GetEntityData(id);
-                        if (d && d->NavAgent && d->NavAgent->Enabled &&
-                            (d->NavAgent->NavMeshEntity == 0 || d->NavAgent->NavMeshEntity == INVALID_ENTITY_ID)) {
-                            glm::vec3 pos = glm::vec3(d->Transform.WorldMatrix[3]);
-                            float bestDist2 = FLT_MAX;
-                            EntityID best = 0;
-                            
-                            const auto& allSceneEntities = req.scene->GetEntities();
-                            for (const Entity& entity : allSceneEntities) {
-                                EntityID otherId = entity.GetID();
-                                EntityData* d2 = req.scene->GetEntityData(otherId);
-                                if (!d2 || !d2->Navigation || !d2->Navigation->Runtime) continue;
-                                glm::vec3 aabbMin = d2->Navigation->AABB.min;
-                                glm::vec3 aabbMax = d2->Navigation->AABB.max;
-                                glm::vec3 c = (aabbMin + aabbMax) * 0.5f;
-                                float dsq = glm::distance2(pos, c);
-                                if (dsq < bestDist2) {
-                                    bestDist2 = dsq;
-                                    best = otherId;
-                                }
-                            }
-                            if (best != 0) {
-                                d->NavAgent->NavMeshEntity = best;
-                            }
-                        }
-                    }
+                    AutoBindPrefabNavAgents(*req.scene, req.allPrefabEntities, false);
                 }
                 
                 {
@@ -4212,45 +4424,160 @@ EntityID RuntimePrefabInstantiator::InstantiateBlocking(const std::string& prefa
     return rootId;
 }
 
-void RuntimePrefabInstantiator::UpdateAsync(double budgetMs) {
-    std::shared_ptr<AsyncPrefabRequest> current;
-    {
-        std::lock_guard<std::mutex> lock(s_asyncPrefabMutex);
-        if (!s_asyncPrefabQueue.empty()) {
-            current = s_asyncPrefabQueue.front();
-        }
-    }
-    
-    if (!current) return;
-    
-    const bool done = StepAsyncPrefab(*current, budgetMs);
-    if (!done) {
-        return;
+bool RuntimePrefabInstantiator::PreloadFromMemory(const std::string& prefabPath,
+                                                  std::shared_ptr<std::vector<uint8_t>> data) {
+    if (prefabPath.empty() || !data || data->size() < sizeof(PrefabBinaryHeader)) {
+        return false;
     }
 
-    if (current->scene && current->placeholderRoot != INVALID_ENTITY_ID) {
-        if (EntityData* rootData = current->scene->GetEntityData(current->placeholderRoot)) {
-            rootData->PrefabAsyncPending = false;
-            rootData->PrefabAsyncFailed = (current->phase == AsyncPrefabPhase::Failed);
-        }
-    }
-    
-    if (current->phase == AsyncPrefabPhase::Failed) {
-        if (current->scene && current->placeholderRoot != INVALID_ENTITY_ID && !current->useOverrideRoot) {
-            current->scene->QueueRemoveEntity(current->placeholderRoot);
-        }
-    }
-    
-    {
-        std::lock_guard<std::mutex> lock(s_asyncPrefabMutex);
-        if (!s_asyncPrefabQueue.empty() && s_asyncPrefabQueue.front() == current) {
-            s_asyncPrefabQueue.pop_front();
+    const bool useCache = ShouldUsePrefabBinaryCache();
+    const std::string cacheKey = useCache ? NormalizePrefabCacheKey(prefabPath) : std::string{};
+    if (useCache && !cacheKey.empty()) {
+        if (auto cached = TryGetPrefabBinaryCache(cacheKey)) {
+            data = std::move(cached);
         } else {
-            auto it = std::find(s_asyncPrefabQueue.begin(), s_asyncPrefabQueue.end(), current);
-            if (it != s_asyncPrefabQueue.end()) {
-                s_asyncPrefabQueue.erase(it);
+            StorePrefabBinaryCache(cacheKey, data);
+        }
+    }
+
+    if (!data || data->size() < sizeof(PrefabBinaryHeader)) {
+        return false;
+    }
+
+    PrefabBinaryHeader header{};
+    std::memcpy(&header, data->data(), sizeof(PrefabBinaryHeader));
+    if (header.base.magic != PREFAB_MAGIC) {
+        return false;
+    }
+
+    if ((header.base.flags & 1) == 0 && !cacheKey.empty()) {
+        std::shared_ptr<ParsedPrefabLayout> parsedLayout = TryGetParsedPrefabLayoutCache(cacheKey);
+        if (!parsedLayout || !IsParsedPrefabLayoutCompatible(*parsedLayout, header)) {
+            auto rebuiltLayout = std::make_shared<ParsedPrefabLayout>();
+            std::string parseError;
+            if (!BuildParsedPrefabLayout(*data, header, *rebuiltLayout, &parseError)) {
+                PREFAB_LOG_ERROR(parseError);
+                return false;
+            }
+            StoreParsedPrefabLayoutCache(cacheKey, std::move(rebuiltLayout));
+        }
+    }
+
+    return true;
+}
+
+bool RuntimePrefabInstantiator::Preload(const std::string& prefabPath) {
+    if (prefabPath.empty()) {
+        return false;
+    }
+
+    const bool useCache = ShouldUsePrefabBinaryCache();
+    const std::string cacheKey = useCache ? NormalizePrefabCacheKey(prefabPath) : std::string{};
+    if (useCache && !cacheKey.empty()) {
+        if (auto cached = TryGetPrefabBinaryCache(cacheKey)) {
+            return PreloadFromMemory(prefabPath, cached);
+        }
+    }
+
+    auto bytes = std::make_shared<std::vector<uint8_t>>();
+    if (!FileSystem::Instance().ReadFile(prefabPath, *bytes)) {
+        PREFAB_LOG_ERROR("Failed to preload prefab: " << prefabPath);
+        return false;
+    }
+
+    return PreloadFromMemory(prefabPath, std::move(bytes));
+}
+
+bool RuntimePrefabInstantiator::PreloadByGuid(const ClaymoreGUID& prefabGuid) {
+    if (prefabGuid.high == 0 && prefabGuid.low == 0) {
+        return false;
+    }
+
+    IAssetResolver* resolver = Assets::GetResolver();
+    if (!resolver) {
+        return false;
+    }
+
+    std::string path = resolver->GetPathForGUID(prefabGuid);
+    if (path.empty()) {
+        return false;
+    }
+
+    if (Assets::ShouldLoadBinary()) {
+        std::string binaryPath = resolver->GetBinaryPath(path);
+        if (IsPreparedBinaryReady(path, binaryPath)) {
+            path = std::move(binaryPath);
+        } else if (!Assets::AllowSourceFallback()) {
+            PREFAB_LOG_ERROR("Missing or stale compiled prefab for GUID: " << prefabGuid.ToString());
+            return false;
+        } else {
+            return false;
+        }
+    }
+
+    return Preload(path);
+}
+
+void RuntimePrefabInstantiator::UpdateAsync(double budgetMs) {
+    auto frameStart = std::chrono::high_resolution_clock::now();
+    auto elapsedMs = [&]() {
+        const auto now = std::chrono::high_resolution_clock::now();
+        return std::chrono::duration<double, std::milli>(now - frameStart).count();
+    };
+
+    auto finalizeRequest = [](const std::shared_ptr<AsyncPrefabRequest>& current) {
+        if (!current) return;
+
+        if (current->scene && current->placeholderRoot != INVALID_ENTITY_ID) {
+            if (EntityData* rootData = current->scene->GetEntityData(current->placeholderRoot)) {
+                rootData->PrefabAsyncPending = false;
+                rootData->PrefabAsyncFailed = (current->phase == AsyncPrefabPhase::Failed);
             }
         }
+
+        if (current->phase == AsyncPrefabPhase::Failed) {
+            if (current->scene && current->placeholderRoot != INVALID_ENTITY_ID && !current->useOverrideRoot) {
+                current->scene->QueueRemoveEntity(current->placeholderRoot);
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(s_asyncPrefabMutex);
+        auto it = std::find(s_asyncPrefabQueue.begin(), s_asyncPrefabQueue.end(), current);
+        if (it != s_asyncPrefabQueue.end()) {
+            s_asyncPrefabQueue.erase(it);
+        }
+    };
+
+    while (elapsedMs() < budgetMs) {
+        std::shared_ptr<AsyncPrefabRequest> current;
+        {
+            std::lock_guard<std::mutex> lock(s_asyncPrefabMutex);
+            for (const auto& req : s_asyncPrefabQueue) {
+                if (!req) continue;
+                const bool waitingForData =
+                    req->phase == AsyncPrefabPhase::WaitingForData &&
+                    !req->dataReady.load(std::memory_order_acquire) &&
+                    !req->loadFailed.load(std::memory_order_acquire) &&
+                    !req->cancelled.load(std::memory_order_acquire);
+                if (!waitingForData) {
+                    current = req;
+                    break;
+                }
+            }
+        }
+
+        if (!current) {
+            return;
+        }
+
+        const double remainingMs = std::max(0.0, budgetMs - elapsedMs());
+        const bool done = StepAsyncPrefab(*current, remainingMs);
+        if (done) {
+            finalizeRequest(current);
+            continue;
+        }
+
+        return;
     }
 }
 
@@ -4286,6 +4613,27 @@ void RuntimePrefabInstantiator::ResetRuntimeCaches() {
         s_prefabParsedLayoutCache.clear();
     }
     PREFAB_LOG("Runtime prefab caches reset");
+}
+
+void RuntimePrefabInstantiator::InvalidateCache(const std::string& prefabPath) {
+    const std::vector<std::string> keys = BuildPrefabCacheInvalidationKeys(prefabPath);
+    {
+        std::lock_guard<std::mutex> lock(s_asyncPrefabMutex);
+        for (const auto& req : s_asyncPrefabQueue) {
+            if (!req || req->cacheKey.empty()) {
+                continue;
+            }
+            if (std::find(keys.begin(), keys.end(), req->cacheKey) != keys.end()) {
+                req->loadError = "Prefab cache invalidated while async instantiation was pending";
+                req->cancelled.store(true, std::memory_order_release);
+            }
+        }
+    }
+
+    for (const std::string& key : keys) {
+        ErasePrefabJsonCacheForGuid(TryReadPrefabSourceGuidForCacheKey(key));
+        ErasePrefabRuntimeCacheForKey(key);
+    }
 }
 
 void RuntimePrefabInstantiator::CancelAsyncForScene(Scene& scene, bool removePlaceholders) {
@@ -4427,13 +4775,17 @@ EntityID RuntimePrefabInstantiator::InstantiateByGuid(const ClaymoreGUID& prefab
         return static_cast<EntityID>(-1);
     }
     
-    // Ensure .prefabb extension
-    std::filesystem::path p(path);
-    if (p.extension() != ".prefabb") {
-        p.replace_extension(".prefabb");
+    if (Assets::ShouldLoadBinary()) {
+        std::string binaryPath = resolver->GetBinaryPath(path);
+        if (IsPreparedBinaryReady(path, binaryPath)) {
+            path = std::move(binaryPath);
+        } else {
+            PREFAB_LOG_ERROR("Missing or stale compiled prefab for GUID: " << prefabGuid.ToString());
+            return static_cast<EntityID>(-1);
+        }
     }
-    
-    return Instantiate(p.string(), scene, existingRoot, useExistingRoot);
+
+    return Instantiate(path, scene, existingRoot, useExistingRoot);
 }
 
 } // namespace runtime
@@ -4545,8 +4897,14 @@ void RemapPrefabEntityReferences(Scene& scene, const std::vector<EntityID>& crea
                 }
                 data->Skeleton->BoneEntities[i] = mapped;
             }
+            // Stage 3 foundation: DeepCopy does not carry the per-bone back-reference
+            // marker, so rebuild it from the freshly remapped BoneEntities. Without this,
+            // cloned / prefab-spawned characters (the alkahest spawn path) resolve bone
+            // world matrices from the stale AoS transform instead of the live pose
+            // palette. Safe + idempotent (a bad marker only falls back to AoS).
+            scene.RebindSkeletonBoneMarkers(id);
         }
-        
+
         // Remap Skinning SkeletonRoot
         if (data->Skinning) {
             EntityID oldId = data->Skinning->SkeletonRoot;

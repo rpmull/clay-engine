@@ -67,6 +67,26 @@ void PhysicsLayerManager::Clear() {
     RegisterDefaults();
 }
 
+void PhysicsLayerManager::SetLayers(const std::vector<std::string>& layers) {
+    m_NameToIndex.clear();
+    m_LayerNames.clear();
+
+    if (layers.empty()) {
+        RegisterDefaults();
+        return;
+    }
+
+    for (const auto& name : layers) {
+        if (name.empty()) continue;
+        RegisterLayer(name); // preserves order, dedupes, caps at MAX_LAYERS
+    }
+
+    // Safety net: index 0 must be a valid fallback layer.
+    if (m_LayerNames.empty()) {
+        RegisterDefaults();
+    }
+}
+
 void PhysicsLayerManager::RegisterDefaults() {
     // Register some common default layers
     // Users can add more via the editor or scripts

@@ -5,6 +5,7 @@
 #include "core/rendering/MaterialCache.h"
 #include "core/rendering/TextureLoader.h"
 #include "core/vfs/FileSystem.h"
+#include "core/physics/PhysicsLayerManager.h"
 #include <fstream>
 #include <iostream>
 #include "editor/application.h"
@@ -88,6 +89,10 @@ bool NormalizeProjectName(const std::string& value, std::string& normalized, std
     }
 
     return true;
+}
+
+bool IsValidResolutionPreset(const ViewportResolutionPreset& preset) {
+    return !preset.label.empty() && preset.width > 0 && preset.height > 0;
 }
 
 void MoveGeneratedFileIfPresent(const std::filesystem::path& sourcePath,
@@ -183,6 +188,19 @@ bool Project::Load(const std::filesystem::path& path) {
         for (const auto& t : j["layers"]) s_Layers.push_back(t.get<std::string>());
     }
     if (s_Layers.empty()) s_Layers.push_back("Default");
+
+    // Physics layers (project-defined; index = position). Apply to the global
+    // PhysicsLayerManager so name->index resolution matches what was authored.
+    // Absent (older projects) -> reset to the built-in defaults.
+    {
+        std::vector<std::string> physicsLayers;
+        if (j.contains("physicsLayers") && j["physicsLayers"].is_array()) {
+            for (const auto& t : j["physicsLayers"]) {
+                if (t.is_string()) physicsLayers.push_back(t.get<std::string>());
+            }
+        }
+        PhysicsLayers::PhysicsLayerManager::Get().SetLayers(physicsLayers);
+    }
     
     // Game cursor settings
     s_CursorSettings = GameCursorSettings{}; // Reset to defaults
@@ -214,6 +232,21 @@ bool Project::Load(const std::filesystem::path& path) {
         s_EditorCustomPalette.text = ParseColor(p, "text", s_EditorCustomPalette.text);
         s_EditorCustomPalette.textDim = ParseColor(p, "textDim", s_EditorCustomPalette.textDim);
         s_EditorCustomPalette.warning = ParseColor(p, "warning", s_EditorCustomPalette.warning);
+    }
+    s_ViewportResolutionPresets.clear();
+    if (j.contains("viewportResolutionPresets") && j["viewportResolutionPresets"].is_array()) {
+        for (const auto& item : j["viewportResolutionPresets"]) {
+            if (!item.is_object()) {
+                continue;
+            }
+            ViewportResolutionPreset preset;
+            preset.label = item.value("label", std::string());
+            preset.width = item.value("width", 0u);
+            preset.height = item.value("height", 0u);
+            if (IsValidResolutionPreset(preset)) {
+                s_ViewportResolutionPresets.push_back(std::move(preset));
+            }
+        }
     }
 
     std::cout << "[Project] Loaded: " << s_ProjectName << std::endl;
@@ -296,6 +329,8 @@ bool Project::Save() {
     // Persist tags and layers if present
     if (!s_Tags.empty()) j["tags"] = s_Tags; else j["tags"] = json::array({"Untagged"});
     if (!s_Layers.empty()) j["layers"] = s_Layers; else j["layers"] = json::array({"Default"});
+    // Physics layers (the full ordered list, defaults + user-added). Index matters.
+    j["physicsLayers"] = PhysicsLayers::PhysicsLayerManager::Get().GetAllLayers();
     
     // Game cursor settings
     if (!s_CursorSettings.texturePath.empty()) {
@@ -327,6 +362,19 @@ bool Project::Save() {
     palette["textDim"] = ToColorJson(s_EditorCustomPalette.textDim);
     palette["warning"] = ToColorJson(s_EditorCustomPalette.warning);
     j["editorCustomPalette"] = std::move(palette);
+    if (!s_ViewportResolutionPresets.empty()) {
+        j["viewportResolutionPresets"] = json::array();
+        for (const auto& preset : s_ViewportResolutionPresets) {
+            if (!IsValidResolutionPreset(preset)) {
+                continue;
+            }
+            json entry;
+            entry["label"] = preset.label;
+            entry["width"] = preset.width;
+            entry["height"] = preset.height;
+            j["viewportResolutionPresets"].push_back(std::move(entry));
+        }
+    }
 
     std::ofstream out(desiredProjectFile);
     if (!out) {

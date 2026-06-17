@@ -6,6 +6,7 @@
 #include "HumanoidAvatar.h"
 #include "AvatarDefinition.h"
 #include "AvatarSerializer.h"
+#include "AnimationAssetCache.h"
 #include "core/ecs/AnimationComponents.h"
 #include "core/vfs/FileSystem.h"
 #include "core/assets/IAssetResolver.h"
@@ -37,15 +38,6 @@ namespace animation {
 namespace {
 
 using namespace std::string_literals;
-
-#if defined(CLAYMORE_EDITOR)
-bool TryEnsureBinaryForPlayMode(const std::string& sourcePath) {
-    if (sourcePath.empty()) return false;
-    if (Assets::GetLoadMode() != AssetLoadMode::PlayMode) return false;
-    if (FileSystem::Instance().IsPakMounted()) return false;
-    return BinaryAssetCache::Instance().EnsureBinary(sourcePath);
-}
-#endif
 
 constexpr uint32_t kAnimBinMagic = 'A' | ('N' << 8) | ('I' << 16) | ('M' << 24);
 constexpr uint16_t kAnimBinVersion = 4;  // v4: added humanoid track mode (v3: root motion, v2: referenceHipsHeight)
@@ -1208,8 +1200,8 @@ AnimationClip LoadAnimationClip(const std::string& path) {
     
 #ifdef CLAYMORE_EDITOR
     // Get binary cache path
-    binaryPath = BinaryAssetCache::Instance().GetBinaryPath(path);
-    if (!binaryPath.empty()) {
+    if (BinaryAssetCache::Instance().IsCurrent(path)) {
+        binaryPath = BinaryAssetCache::Instance().GetBinaryPath(path);
         loadedBinary = ReadCompiledAnimation(std::filesystem::path(binaryPath), asset);
     }
 #endif
@@ -1236,24 +1228,12 @@ AnimationClip LoadAnimationClip(const std::string& path) {
         return UnwrapAssetAsLegacyClip(asset);
     }
 
-#if defined(CLAYMORE_EDITOR)
-    if (!loadedBinary && shouldLoadBinary && TryEnsureBinaryForPlayMode(path)) {
-        binaryPath = BinaryAssetCache::Instance().GetBinaryPath(path);
-        if (!binaryPath.empty()) {
-            loadedBinary = ReadCompiledAnimation(std::filesystem::path(binaryPath), asset);
-            if (loadedBinary && !asset.tracks.empty()) {
-                return UnwrapAssetAsLegacyClip(asset);
-            }
-        }
-    }
-#endif
-    
     if (shouldLoadBinary && !allowSourceFallback) {
         std::cerr << "[AnimationSerializer] Missing binary animation clip: " << path << "\n";
         return empty;
     }
     
-    // No binary found - load JSON and compile it
+    // No binary found - load JSON only when source fallback is allowed.
     AnimationClip clip;
     
     std::string text;
@@ -1287,8 +1267,9 @@ AnimationClip LoadAnimationClip(const std::string& path) {
     }
     
 #ifdef CLAYMORE_EDITOR
-    // Compile and save binary for future use
-    if (!binaryPath.empty()) {
+    // Keep the cache warm during editor authoring, but do not rebuild on play-mode
+    // load paths.
+    if (Assets::GetLoadMode() == AssetLoadMode::Editor && !binaryPath.empty()) {
         AnimationAsset assetToCompile = WrapLegacyClipAsAsset(clip);
         std::error_code ec;
         std::filesystem::create_directories(std::filesystem::path(binaryPath).parent_path(), ec);
@@ -1586,6 +1567,8 @@ bool SaveAnimationAsset(const AnimationAsset& asset, const std::string& path)
         WriteCompiledAnimation(asset, std::filesystem::path(binaryPath));
         std::cout << "[AnimationSerializer] Updated binary cache: " << binaryPath << std::endl;
     }
+    InvalidateAnimationAssetCache(path);
+    InvalidateAnimationAssetCache(binaryPath);
 #endif
 
     return true;
@@ -1605,7 +1588,9 @@ AnimationAsset LoadAnimationAsset(const std::string& path)
 #ifdef CLAYMORE_EDITOR
         // PRIORITY 1: Binary cache (.animbin in .bin folder) - this is the canonical binary format
         if (useBinaryCache) {
-            std::string binaryPath = BinaryAssetCache::Instance().GetBinaryPath(path);
+            std::string binaryPath = BinaryAssetCache::Instance().IsCurrent(path)
+                ? BinaryAssetCache::Instance().GetBinaryPath(path)
+                : std::string();
             if (!binaryPath.empty() && FileSystem::Instance().Exists(binaryPath)) {
                 if (ReadCompiledAnimation(std::filesystem::path(binaryPath), asset)) {
                     FinalizeLoadedAnimationAsset(asset, finalizePath);
@@ -1674,18 +1659,6 @@ AnimationAsset LoadAnimationAsset(const std::string& path)
 #endif
     }
 
-#if defined(CLAYMORE_EDITOR)
-    if (shouldLoadBinary && useBinaryCache && TryEnsureBinaryForPlayMode(path)) {
-        std::string binaryPath = BinaryAssetCache::Instance().GetBinaryPath(path);
-        if (!binaryPath.empty()) {
-            if (ReadCompiledAnimation(std::filesystem::path(binaryPath), asset)) {
-                FinalizeLoadedAnimationAsset(asset, finalizePath);
-                return asset;
-            }
-        }
-    }
-#endif
-
     if (shouldLoadBinary && !allowSourceFallback) {
         std::cerr << "[AnimationSerializer] Missing binary animation asset: " << path << "\n";
         return AnimationAsset{};
@@ -1714,8 +1687,11 @@ AnimationAsset LoadAnimationAsset(const std::string& path)
     }
 
 #ifdef CLAYMORE_EDITOR
-    // Compile and save binary for future use (regardless of play mode)
-    if (!FileSystem::Instance().IsPakMounted() && !asset.tracks.empty()) {
+    // In editor authoring mode, keep the cache fresh after source loads. Play mode
+    // consumes prepared binaries only; rebuilding here creates runtime stalls.
+    if (Assets::GetLoadMode() == AssetLoadMode::Editor &&
+        !FileSystem::Instance().IsPakMounted() &&
+        !asset.tracks.empty()) {
         std::string binaryPath = BinaryAssetCache::Instance().GetBinaryPath(path);
         if (!binaryPath.empty()) {
             std::error_code ec;

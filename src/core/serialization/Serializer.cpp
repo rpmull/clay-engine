@@ -24,9 +24,6 @@
 #include "core/vfs/FileSystem.h"
 #include "core/assets/IAssetResolver.h"
 #include "editor/Project.h"
-#if !defined(CLAYMORE_RUNTIME)
-#include "editor/pipeline/BinaryAssetCache.h"
-#endif
 #include <unordered_set>
 #include "core/prefab/PrefabAPI.h"
 #include "core/prefab/PrefabDelta.h"
@@ -34,27 +31,10 @@
 #include "core/ecs/ScenePostProcessing.h"
 #include "core/physics/PhysicsLayerManager.h"
 
-namespace {
-#if !defined(CLAYMORE_RUNTIME)
-bool TryEnsureBinaryForPlayMode(const std::string& sourcePath) {
-    if (sourcePath.empty()) return false;
-    if (Assets::GetLoadMode() != AssetLoadMode::PlayMode) return false;
-    if (FileSystem::Instance().IsPakMounted()) return false;
-    static thread_local bool s_EnsuringBinary = false;
-    if (s_EnsuringBinary) return false;
-    s_EnsuringBinary = true;
-    const bool ensured = BinaryAssetCache::Instance().EnsureBinary(sourcePath);
-    s_EnsuringBinary = false;
-    return ensured;
-}
-#endif
-}
-
 #include "core/ecs/Scene.h"
 #include "core/rendering/VertexTypes.h"
 #include "core/rendering/Mesh.h"
 #include "core/rendering/MaterialManager.h"
-#include "core/rendering/SkinnedPBRMaterial.h"
 #include "core/rendering/MaterialAsset.h"
 #include "editor/nodegraph/ShaderGraphMaterial.h"
 #include "core/rendering/Terrain.h"
@@ -267,6 +247,40 @@ static std::shared_ptr<PBRMaterial> EnsureEditablePBRMaterialForSlot(MeshCompone
     }
 
     return std::dynamic_pointer_cast<PBRMaterial>(mesh.materials[slot]);
+}
+
+static void ShareEquivalentMaterialSlots(MeshComponent& mesh) {
+    if (mesh.OwnedMaterialSlots.size() < mesh.materials.size()) {
+        mesh.OwnedMaterialSlots.resize(mesh.materials.size(), false);
+    }
+
+    for (size_t slot = 0; slot < mesh.materials.size(); ++slot) {
+        std::shared_ptr<Material>& material = mesh.materials[slot];
+        if (!material) {
+            continue;
+        }
+
+        const MaterialEquivalenceKeyInfo keyInfo =
+            GetMaterialEquivalenceKey(material.get());
+        if (!keyInfo.EquivalentSafe) {
+            continue;
+        }
+
+        material = AcquireEquivalentMaterial(material);
+        mesh.OwnedMaterialSlots[slot] = false;
+        if (slot == 0) {
+            mesh.material = material;
+        }
+    }
+
+    if (!mesh.materials.empty() && mesh.materials[0]) {
+        mesh.material = mesh.materials[0];
+    }
+
+    mesh.UniqueMaterial = std::any_of(
+        mesh.OwnedMaterialSlots.begin(),
+        mesh.OwnedMaterialSlots.end(),
+        [](bool owned) { return owned; });
 }
 
 // Compute sibling index for disambiguation when multiple siblings share the same name
@@ -2337,6 +2351,11 @@ void Serializer::DeserializeMesh(const json& data, MeshComponent& mesh, std::uni
     mesh.SkipFrustumCulling = data.value("skipFrustumCulling", mesh.SkipFrustumCulling);
     mesh.BoundsPadding = data.value("boundsPadding", mesh.BoundsPadding);
 
+    // Share identical resolved materials across entities. This keeps authored
+    // slot overrides intact while avoiding hundreds of equivalent runtime
+    // clones for repeated characters and props.
+    ShareEquivalentMaterialSlots(mesh);
+
     if (alphaOverride) {
         if (!renderOverrides) {
             renderOverrides = std::make_unique<RenderOverridesComponent>();
@@ -2441,6 +2460,9 @@ json Serializer::SerializeLight(const LightComponent& light) {
     data["type"] = static_cast<int>(light.Type);
     data["color"] = SerializeVec3(light.Color);
     data["intensity"] = light.Intensity;
+    data["range"] = light.Range;
+    data["spotInnerAngleDegrees"] = light.SpotInnerAngleDegrees;
+    data["spotOuterAngleDegrees"] = light.SpotOuterAngleDegrees;
     data["pointShadowsEnabled"] = light.PointShadowsEnabled;
     return data;
 }
@@ -2681,6 +2703,12 @@ void Serializer::DeserializeLight(const json& data, LightComponent& light) {
     if (data.contains("type")) light.Type = static_cast<LightType>(data["type"]);
     if (data.contains("color")) light.Color = DeserializeVec3(data["color"]);
     if (data.contains("intensity")) light.Intensity = data["intensity"];
+    light.Range = data.value("range", light.Range);
+    light.SpotInnerAngleDegrees = data.value("spotInnerAngleDegrees", light.SpotInnerAngleDegrees);
+    light.SpotOuterAngleDegrees = data.value("spotOuterAngleDegrees", light.SpotOuterAngleDegrees);
+    if (light.SpotOuterAngleDegrees < light.SpotInnerAngleDegrees) {
+        light.SpotOuterAngleDegrees = light.SpotInnerAngleDegrees;
+    }
     light.PointShadowsEnabled = data.value("pointShadowsEnabled", false);
 }
 
@@ -2780,6 +2808,7 @@ static nlohmann::json SerializeCharacterController(const CharacterControllerComp
 	j["walkStairs"] = cc.EnableWalkStairs;
 	j["jumpSpeed"] = cc.JumpSpeed;
 	j["physicsLayer"] = cc.PhysicsLayerName;
+	j["collisionMask"] = cc.CollisionMask;
 	return j;
 }
 
@@ -2798,6 +2827,7 @@ void Serializer::DeserializeCharacterController(const nlohmann::json& j, Charact
 		int32_t idx = PhysicsLayers::PhysicsLayerManager::Get().GetLayerIndex(cc.PhysicsLayerName);
 		cc.PhysicsLayer = (idx >= 0) ? static_cast<uint32_t>(idx) : 1; // Default to Player (1)
 	}
+	if (j.contains("collisionMask")) cc.CollisionMask = j["collisionMask"];
 }
 
 // Grass Deformer Component serialization
@@ -6101,27 +6131,26 @@ EntityID Serializer::DeserializeEntity(const json& data, Scene& scene) {
         bool meshIsSkinned = (entityData->Mesh->mesh && entityData->Mesh->mesh->HasSkinning());
         if (meshIsSkinned) {
             auto oldMat = entityData->Mesh->material;
-            bool needsSkinned = true;
-            if (oldMat) {
-                std::string n = oldMat->GetName();
-                // Consider any material with name containing "Skinned" as skinned-capable
-                if (std::dynamic_pointer_cast<SkinnedPBRMaterial>(oldMat) || n.find("Skinned") != std::string::npos) {
-                    needsSkinned = false;
-                }
-            }
-            if (needsSkinned) {
-                auto newMat = MaterialManager::Instance().CreateSceneSkinnedDefaultMaterial(&Scene::Get());
-                if (oldMat) {
-                    // Preserve blend/depth/cull flags and common tint
-                    newMat->m_StateFlags = oldMat->GetStateFlags();
-                    glm::vec4 tint(1.0f);
-                    if (oldMat->TryGetUniform("u_ColorTint", tint)) newMat->SetUniform("u_ColorTint", tint);
-                }
-                entityData->Mesh->material = newMat;
+            if (MaterialNeedsSkinnedVariant(oldMat)) {
+                std::shared_ptr<Material> skinned =
+                    AcquireSkinnedMaterialVariant(Scene::Get(), oldMat);
+                entityData->Mesh->material = skinned;
                 // Keep primary aligned with slot 0 if slots exist
-                if (!entityData->Mesh->materials.empty()) {
-                    entityData->Mesh->materials[0] = newMat;
+                if (entityData->Mesh->materials.empty()) {
+                    entityData->Mesh->materials.push_back(skinned);
+                } else {
+                    entityData->Mesh->materials[0] = skinned;
                 }
+                if (entityData->Mesh->OwnedMaterialSlots.empty()) {
+                    entityData->Mesh->OwnedMaterialSlots.resize(entityData->Mesh->materials.size(), false);
+                } else if (skinned) {
+                    entityData->Mesh->OwnedMaterialSlots[0] =
+                        !GetMaterialEquivalenceKey(skinned.get()).EquivalentSafe;
+                }
+                entityData->Mesh->UniqueMaterial = std::any_of(
+                    entityData->Mesh->OwnedMaterialSlots.begin(),
+                    entityData->Mesh->OwnedMaterialSlots.end(),
+                    [](bool owned) { return owned; });
             }
         }
     }
@@ -6571,7 +6600,13 @@ json Serializer::SerializeScene(Scene& scene, EntityID rootFilter) {
         jenv["ambientColor"] = SerializeVec3(env.AmbientColor);
         jenv["ambientIntensity"] = env.AmbientIntensity;
         jenv["useSkybox"] = env.UseSkybox;
-        // Skybox texture path not serialized yet (TextureCube asset system pending)
+        jenv["useSkyboxEquirectangular"] = env.UseSkyboxEquirectangular;
+        jenv["skyboxEquirectangularPath"] = env.SkyboxEquirectangularPath;
+        jenv["skyboxEquirectangularResolution"] = env.SkyboxEquirectangularResolution;
+        jenv["skyboxFacePaths"] = json::array();
+        for (const std::string& path : env.SkyboxFacePaths) {
+            jenv["skyboxFacePaths"].push_back(path);
+        }
         jenv["exposure"] = env.Exposure;
         jenv["fogEnabled"] = env.EnableFog;
         jenv["fogColor"] = SerializeVec3(env.FogColor);
@@ -6604,7 +6639,21 @@ json Serializer::SerializeScene(Scene& scene, EntityID rootFilter) {
         jenv["shadowSamples"] = env.ShadowSamples;
         jenv["shadowStrength"] = env.ShadowStrength;
         // Texture filtering preference
-        jenv["textureFilter"] = (env.TextureFilter == Environment::TextureFilterMode::Linear) ? "Linear" : "Point";
+        switch (env.TextureFilter) {
+        case Environment::TextureFilterMode::Point:
+            jenv["textureFilter"] = "Point";
+            break;
+        case Environment::TextureFilterMode::Anisotropic:
+            jenv["textureFilter"] = "Anisotropic";
+            break;
+        case Environment::TextureFilterMode::Linear:
+        default:
+            jenv["textureFilter"] = "Linear";
+            break;
+        }
+        jenv["textureMaxDimension"] = env.TextureMaxDimension;
+        jenv["renderResolutionWidth"] = env.RenderResolutionWidth;
+        jenv["renderResolutionHeight"] = env.RenderResolutionHeight;
         sceneData["environment"] = std::move(jenv);
     } catch(...) {}
 
@@ -7361,6 +7410,17 @@ bool Serializer::DeserializeScene(const json& data, Scene& scene) {
             if (jenv.contains("ambientColor")) env.AmbientColor = DeserializeVec3(jenv["ambientColor"]);
             env.AmbientIntensity = jenv.value("ambientIntensity", env.AmbientIntensity);
             env.UseSkybox = jenv.value("useSkybox", env.UseSkybox);
+            env.UseSkyboxEquirectangular = jenv.value("useSkyboxEquirectangular", env.UseSkyboxEquirectangular);
+            env.SkyboxEquirectangularPath = jenv.value("skyboxEquirectangularPath", env.SkyboxEquirectangularPath);
+            env.SkyboxEquirectangularResolution = static_cast<uint16_t>(
+                jenv.value("skyboxEquirectangularResolution", static_cast<uint32_t>(env.SkyboxEquirectangularResolution)));
+            env.SkyboxFacePaths.fill(std::string());
+            if (jenv.contains("skyboxFacePaths") && jenv["skyboxFacePaths"].is_array()) {
+                const size_t faceCount = std::min<size_t>(env.SkyboxFacePaths.size(), jenv["skyboxFacePaths"].size());
+                for (size_t i = 0; i < faceCount; ++i) {
+                    env.SkyboxFacePaths[i] = jenv["skyboxFacePaths"][i].get<std::string>();
+                }
+            }
             env.Exposure = jenv.value("exposure", env.Exposure);
             env.EnableFog = jenv.value("fogEnabled", env.EnableFog);
             if (jenv.contains("fogColor")) env.FogColor = DeserializeVec3(jenv["fogColor"]);
@@ -7396,10 +7456,19 @@ bool Serializer::DeserializeScene(const json& data, Scene& scene) {
             // Texture filtering preference
             try {
                 std::string tf = jenv.value("textureFilter", std::string("Linear"));
-                env.TextureFilter = (tf == "Point")
-                    ? Environment::TextureFilterMode::Point
-                    : Environment::TextureFilterMode::Linear;
+                if (tf == "Point") {
+                    env.TextureFilter = Environment::TextureFilterMode::Point;
+                } else if (tf == "Anisotropic") {
+                    env.TextureFilter = Environment::TextureFilterMode::Anisotropic;
+                } else {
+                    env.TextureFilter = Environment::TextureFilterMode::Linear;
+                }
             } catch(...) {}
+            env.TextureMaxDimension = static_cast<uint16_t>(jenv.value("textureMaxDimension", static_cast<uint32_t>(env.TextureMaxDimension)));
+            env.RenderResolutionWidth = static_cast<uint16_t>(jenv.value("renderResolutionWidth", static_cast<uint32_t>(env.RenderResolutionWidth)));
+            env.RenderResolutionHeight = static_cast<uint16_t>(jenv.value("renderResolutionHeight", static_cast<uint32_t>(env.RenderResolutionHeight)));
+            env.SkyboxTexture.reset();
+            env.SkyboxRuntimeCacheKey.clear();
         } catch(...) {}
     }
 
@@ -10223,7 +10292,16 @@ bool Serializer::LoadSceneFromFile(const std::string& filepath, Scene& scene) {
                 sourcePath = srcPath.string();
             }
 
-            std::string binaryPath = Assets::GetBinaryPath(sourcePath);
+            const bool requirePreparedBinary =
+                Assets::GetLoadMode() == AssetLoadMode::PlayMode && !FileSystem::Instance().IsPakMounted();
+            std::string binaryPath;
+            if (IAssetResolver* resolver = Assets::GetResolver()) {
+                if (!requirePreparedBinary || resolver->IsBinaryCurrent(sourcePath)) {
+                    binaryPath = resolver->GetBinaryPath(sourcePath);
+                }
+            } else if (!requirePreparedBinary) {
+                binaryPath = Assets::GetBinaryPath(sourcePath);
+            }
             if (!binaryPath.empty()) {
                 if (binary::EntityBinaryLoader::Load(binaryPath, scene)) {
                     std::cout << "[Serializer] Loaded binary scene: " << binaryPath << std::endl;
@@ -10233,16 +10311,18 @@ bool Serializer::LoadSceneFromFile(const std::string& filepath, Scene& scene) {
             }
             
             // Also try with .sceneb extension directly
-            std::filesystem::path binPath(sourcePath);
-            binPath.replace_extension(".sceneb");
-            if (binary::EntityBinaryLoader::Load(binPath.string(), scene)) {
-                std::cout << "[Serializer] Loaded binary scene: " << binPath << std::endl;
-                prefab::QueueScenePrefabs(scene);
-                return true;
+            if (!requirePreparedBinary) {
+                std::filesystem::path binPath(sourcePath);
+                binPath.replace_extension(".sceneb");
+                if (binary::EntityBinaryLoader::Load(binPath.string(), scene)) {
+                    std::cout << "[Serializer] Loaded binary scene: " << binPath << std::endl;
+                    prefab::QueueScenePrefabs(scene);
+                    return true;
+                }
             }
             
             // If filepath already ends with .sceneb, try it directly
-            if (filepath.find(".sceneb") != std::string::npos) {
+            if (!requirePreparedBinary && filepath.find(".sceneb") != std::string::npos) {
                 if (binary::EntityBinaryLoader::Load(filepath, scene)) {
                     std::cout << "[Serializer] Loaded binary scene: " << filepath << std::endl;
                     prefab::QueueScenePrefabs(scene);
@@ -10250,25 +10330,7 @@ bool Serializer::LoadSceneFromFile(const std::string& filepath, Scene& scene) {
                 }
             }
 
-#if !defined(CLAYMORE_RUNTIME)
-            if (TryEnsureBinaryForPlayMode(sourcePath)) {
-                std::string compiledPath = Assets::GetBinaryPath(sourcePath);
-                if (!compiledPath.empty()) {
-                    if (binary::EntityBinaryLoader::Load(compiledPath, scene)) {
-                        std::cout << "[Serializer] Loaded compiled binary scene: " << compiledPath << std::endl;
-                        prefab::QueueScenePrefabs(scene);
-                        return true;
-                    }
-                }
-                std::filesystem::path compiledExt(sourcePath);
-                compiledExt.replace_extension(".sceneb");
-                if (binary::EntityBinaryLoader::Load(compiledExt.string(), scene)) {
-                    std::cout << "[Serializer] Loaded compiled binary scene: " << compiledExt << std::endl;
-                    prefab::QueueScenePrefabs(scene);
-                    return true;
-                }
-            }
-#endif
+            std::cerr << "[Serializer] Binary scene was not prepared or current: " << sourcePath << std::endl;
         }
         if (Assets::ShouldLoadBinary() && !Assets::AllowSourceFallback()) {
             std::cerr << "[Serializer] Missing binary scene (binary-only mode): " << filepath << std::endl;
@@ -11879,19 +11941,26 @@ EntityID Serializer::LoadPrefabToScene(const std::string& filepath, Scene& scene
                 if (!d) continue;
                 if (d->Skinning && d->Mesh) {
                     bool meshIsSkinned = (d->Mesh->mesh && d->Mesh->mesh->HasSkinning());
-                    if (meshIsSkinned && !std::dynamic_pointer_cast<SkinnedPBRMaterial>(d->Mesh->material)) {
+                    if (meshIsSkinned && MaterialNeedsSkinnedVariant(d->Mesh->material)) {
                         auto oldMat = d->Mesh->material;
-                        auto newMat = MaterialManager::Instance().CreateSceneSkinnedDefaultMaterial(&scene);
-                        if (oldMat) {
-                            // Preserve blend/depth/cull flags and common tint
-                            newMat->m_StateFlags = oldMat->GetStateFlags();
-                            glm::vec4 tint(1.0f);
-                            if (oldMat->TryGetUniform("u_ColorTint", tint)) newMat->SetUniform("u_ColorTint", tint);
+                        std::shared_ptr<Material> skinned =
+                            AcquireSkinnedMaterialVariant(scene, oldMat);
+                        d->Mesh->material = skinned;
+                        if (d->Mesh->materials.empty()) {
+                            d->Mesh->materials.push_back(skinned);
+                        } else {
+                            d->Mesh->materials[0] = skinned;
                         }
-                        d->Mesh->material = newMat;
-                        if (!d->Mesh->materials.empty()) {
-                            d->Mesh->materials[0] = newMat;
+                        if (d->Mesh->OwnedMaterialSlots.empty()) {
+                            d->Mesh->OwnedMaterialSlots.resize(d->Mesh->materials.size(), false);
+                        } else if (skinned) {
+                            d->Mesh->OwnedMaterialSlots[0] =
+                                !GetMaterialEquivalenceKey(skinned.get()).EquivalentSafe;
                         }
+                        d->Mesh->UniqueMaterial = std::any_of(
+                            d->Mesh->OwnedMaterialSlots.begin(),
+                            d->Mesh->OwnedMaterialSlots.end(),
+                            [](bool owned) { return owned; });
                     }
                 }
                 if (d->Skinning && d->Skinning->SkeletonRoot == (EntityID)-1) {

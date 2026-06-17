@@ -96,7 +96,10 @@ namespace CommonProperties {
     PropertyID PSXParams;
     PropertyID PSXWorld;
     PropertyID ToonParams;
-    
+    PropertyID Posterize;
+    PropertyID PSXShadowParams;
+    PropertyID PSXEmission;
+
     static bool s_initialized = false;
     
     void Initialize() {
@@ -126,6 +129,9 @@ namespace CommonProperties {
         PSXParams = PropertyID::Get("u_psxParams");
         PSXWorld = PropertyID::Get("u_psxWorld");
         ToonParams = PropertyID::Get("u_toonParams");
+        Posterize = PropertyID::Get("u_posterize");
+        PSXShadowParams = PropertyID::Get("u_psxShadowParams");
+        PSXEmission = PropertyID::Get("u_psxEmission");
     }
 }
 

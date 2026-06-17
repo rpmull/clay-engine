@@ -33,6 +33,7 @@ bool SetupParticleInterop();
 bool SetupResourceInterop();
 bool SetupDialogueInterop();
 bool SetupAnimationEventInterop();
+bool SetupAnimationStateInterop();
 bool SetupQuestInterop();
 
 } // namespace runtime

@@ -40,17 +40,6 @@
 #include "editor/pipeline/BinaryAssetCache.h"
 #endif
 
-namespace {
-#if defined(CLAYMORE_EDITOR)
-bool TryEnsureBinaryForPlayMode(const std::string& sourcePath) {
-    if (sourcePath.empty()) return false;
-    if (Assets::GetLoadMode() != AssetLoadMode::PlayMode) return false;
-    if (FileSystem::Instance().IsPakMounted()) return false;
-    return BinaryAssetCache::Instance().EnsureBinary(sourcePath);
-}
-#endif
-}
-
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
@@ -271,6 +260,16 @@ static void ClearPrefabAssetCacheForPath(const std::string& prefabPath) {
     s_PrefabAssetCache.erase("normal:" + normalized);
 }
 
+static bool IsPreparedBinaryReady(const std::string& sourcePath, const std::string& binaryPath) {
+    if (binaryPath.empty() || !FileSystem::Instance().Exists(binaryPath)) {
+        return false;
+    }
+    if (auto* resolver = Assets::GetResolver()) {
+        return resolver->IsBinaryCurrent(sourcePath);
+    }
+    return true;
+}
+
 static std::string GetPrefabPathFromGuid(const ClaymoreGUID& guid) {
     // Use the global asset resolver (works in editor, play mode, and runtime)
     if (auto* resolver = Assets::GetResolver()) {
@@ -283,7 +282,8 @@ static std::string GetPrefabPathFromGuid(const ClaymoreGUID& guid) {
 #ifdef CLAYMORE_RUNTIME
                     return binaryPath;
 #else
-                    if (FileSystem::Instance().Exists(binaryPath)) {
+                    if (FileSystem::Instance().Exists(binaryPath) &&
+                        resolver->IsBinaryCurrent(sourcePath)) {
                         return binaryPath;
                     }
                     if (!resolver->AllowSourceFallback()) {
@@ -382,18 +382,6 @@ bool LoadPrefab(const std::string& path, PrefabAsset& out) {
                       << " (" << out.EntityCount() << " entities)\n";
             return true;
         }
-#if defined(CLAYMORE_EDITOR)
-        std::filesystem::path sourcePath(resolvedPath);
-        sourcePath.replace_extension(".prefab");
-        if (TryEnsureBinaryForPlayMode(sourcePath.string())) {
-            std::string binaryPath = Assets::GetBinaryPath(sourcePath.string());
-            if (!binaryPath.empty() && binary::PrefabBinaryLoader::Load(binaryPath, out)) {
-                std::cout << "[PrefabIO] Loaded compiled binary prefab: " << binaryPath
-                          << " (" << out.EntityCount() << " entities)\n";
-                return true;
-            }
-        }
-#endif
         std::cerr << "[PrefabIO] Failed to load binary prefab: " << path << std::endl;
         return false;
     }
@@ -405,16 +393,6 @@ bool LoadPrefab(const std::string& path, PrefabAsset& out) {
                       << " (" << out.EntityCount() << " entities)\n";
             return true;
         }
-#if defined(CLAYMORE_EDITOR)
-        if (TryEnsureBinaryForPlayMode(resolvedPath)) {
-            binaryPath = Assets::GetBinaryPath(resolvedPath);
-            if (!binaryPath.empty() && binary::PrefabBinaryLoader::Load(binaryPath, out)) {
-                std::cout << "[PrefabIO] Loaded compiled binary prefab: " << binaryPath
-                          << " (" << out.EntityCount() << " entities)\n";
-                return true;
-            }
-        }
-#endif
     }
     
     if (Assets::ShouldLoadBinary() && !Assets::AllowSourceFallback()) {
@@ -650,17 +628,12 @@ EntityID InstantiatePrefabFromPathBlocking(const std::string& prefabPath, Scene&
     }
 
     if ((ext == ".prefab" || ext == ".json") && Assets::ShouldLoadBinary()) {
-#if defined(CLAYMORE_EDITOR)
-        (void)TryEnsureBinaryForPlayMode(prefabPath);
-        if (resolvedPath != prefabPath) {
-            (void)TryEnsureBinaryForPlayMode(resolvedPath);
-        }
-#endif
         std::string binaryPath = Assets::GetBinaryPath(prefabPath);
         if (binaryPath.empty() && resolvedPath != prefabPath) {
             binaryPath = Assets::GetBinaryPath(resolvedPath);
         }
-        if (!binaryPath.empty()) {
+        if (IsPreparedBinaryReady(prefabPath, binaryPath) ||
+            (resolvedPath != prefabPath && IsPreparedBinaryReady(resolvedPath, binaryPath))) {
             EntityID rootId = runtime::RuntimePrefabInstantiator::InstantiateBlocking(binaryPath, dst, existingRoot, useExistingRoot);
             if (rootId != INVALID_ENTITY_ID) {
                 return rootId;
@@ -668,7 +641,7 @@ EntityID InstantiatePrefabFromPathBlocking(const std::string& prefabPath, Scene&
         }
 
         if (!Assets::AllowSourceFallback()) {
-            std::cerr << "[Prefab] Binary prefab load failed and source fallback disabled: "
+            std::cerr << "[Prefab] Binary prefab missing, stale, or failed and source fallback disabled: "
                       << prefabPath << std::endl;
             MarkPathFailed(prefabPath);
             return INVALID_ENTITY_ID;
@@ -732,7 +705,8 @@ EntityID InstantiatePrefabFromPath(const std::string& prefabPath, Scene& dst, En
         if (binaryPath.empty() && resolvedPath != prefabPath) {
             binaryPath = Assets::GetBinaryPath(resolvedPath);
         }
-        if (!binaryPath.empty()) {
+        if (IsPreparedBinaryReady(prefabPath, binaryPath) ||
+            (resolvedPath != prefabPath && IsPreparedBinaryReady(resolvedPath, binaryPath))) {
             EntityID rootId = dst.m_IsPlaying
                 ? runtime::RuntimePrefabInstantiator::Instantiate(binaryPath, dst, existingRoot, useExistingRoot)
                 : runtime::RuntimePrefabInstantiator::InstantiateBlocking(binaryPath, dst, existingRoot, useExistingRoot);
@@ -741,7 +715,7 @@ EntityID InstantiatePrefabFromPath(const std::string& prefabPath, Scene& dst, En
             }
         }
         if (!Assets::AllowSourceFallback()) {
-            std::cerr << "[Prefab] Binary prefab load failed and source fallback disabled: " << prefabPath << std::endl;
+            std::cerr << "[Prefab] Binary prefab missing, stale, or failed and source fallback disabled: " << prefabPath << std::endl;
             MarkPathFailed(prefabPath);
             return INVALID_ENTITY_ID;
         }

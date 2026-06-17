@@ -1,0 +1,16 @@
+D:\Projects\cmeng\managed\Modules\Claymore.Modules.RPG\obj\Release\net10.0\Claymore.Modules.RPG.csproj.AssemblyReference.cache
+D:\Projects\cmeng\managed\Modules\Claymore.Modules.RPG\obj\Release\net10.0\Claymore.Modules.RPG.GeneratedMSBuildEditorConfig.editorconfig
+D:\Projects\cmeng\managed\Modules\Claymore.Modules.RPG\obj\Release\net10.0\Claymore.Modules.RPG.AssemblyInfoInputs.cache
+D:\Projects\cmeng\managed\Modules\Claymore.Modules.RPG\obj\Release\net10.0\Claymore.Modules.RPG.AssemblyInfo.cs
+D:\Projects\cmeng\managed\Modules\Claymore.Modules.RPG\obj\Release\net10.0\Claymore.Modules.RPG.csproj.CoreCompileInputs.cache
+D:\Projects\cmeng\managed\Modules\Claymore.Modules.RPG\obj\Release\net10.0\Claymore.Modules.RPG.sourcelink.json
+D:\Projects\cmeng\managed\Modules\Claymore.Modules.RPG\bin\Release\net10.0\Claymore.Modules.RPG.deps.json
+D:\Projects\cmeng\managed\Modules\Claymore.Modules.RPG\bin\Release\net10.0\Claymore.Modules.RPG.dll
+D:\Projects\cmeng\managed\Modules\Claymore.Modules.RPG\bin\Release\net10.0\Claymore.Modules.RPG.pdb
+D:\Projects\cmeng\managed\Modules\Claymore.Modules.RPG\bin\Release\net10.0\ClaymoreEngine.dll
+D:\Projects\cmeng\managed\Modules\Claymore.Modules.RPG\bin\Release\net10.0\ClaymoreEngine.pdb
+D:\Projects\cmeng\managed\Modules\Claymore.Modules.RPG\obj\Release\net10.0\Claymore.7E1BFBA3.Up2Date
+D:\Projects\cmeng\managed\Modules\Claymore.Modules.RPG\obj\Release\net10.0\Claymore.Modules.RPG.dll
+D:\Projects\cmeng\managed\Modules\Claymore.Modules.RPG\obj\Release\net10.0\refint\Claymore.Modules.RPG.dll
+D:\Projects\cmeng\managed\Modules\Claymore.Modules.RPG\obj\Release\net10.0\Claymore.Modules.RPG.pdb
+D:\Projects\cmeng\managed\Modules\Claymore.Modules.RPG\obj\Release\net10.0\ref\Claymore.Modules.RPG.dll

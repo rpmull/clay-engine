@@ -14,6 +14,7 @@ extern "C" {
     __declspec(dllexport) bool HasComponent(int entityID, const char* componentName);
     __declspec(dllexport) void AddComponent(int entityID, const char* componentName);
     __declspec(dllexport) void RemoveComponent(int entityID, const char* componentName);
+    __declspec(dllexport) void AddScript(int entityID, const char* className);
 
     // --- LightComponent ---
     __declspec(dllexport) int GetLightType(int entityID);
@@ -32,6 +33,7 @@ extern "C" {
     __declspec(dllexport) void SetRigidBodyUseGravity(int entityID, bool useGravity);
     __declspec(dllexport) uint32_t GetRigidBodyCollisionMask(int entityID);
     __declspec(dllexport) void SetRigidBodyCollisionMask(int entityID, uint32_t collisionMask);
+    __declspec(dllexport) bool SetRigidBodyPhysicsLayer(int entityID, const char* layerName);
     __declspec(dllexport) void ApplyRigidBodyForce(int entityID, float x, float y, float z);
     __declspec(dllexport) void ApplyRigidBodyTorque(int entityID, float x, float y, float z);
     __declspec(dllexport) void ApplyRigidBodyImpulse(int entityID, float x, float y, float z);
@@ -47,6 +49,8 @@ extern "C" {
     __declspec(dllexport) void CC_Jump(int entityID, float speed);
     __declspec(dllexport) bool CC_IsGrounded(int entityID);
     __declspec(dllexport) void CC_SetPosition(int entityID, float x, float y, float z);
+    __declspec(dllexport) uint32_t CC_GetCollisionMask(int entityID);
+    __declspec(dllexport) void CC_SetCollisionMask(int entityID, uint32_t collisionMask);
     __declspec(dllexport) void GetRigidBodyLinearVelocity(int entityID, float* x, float* y, float* z);
     __declspec(dllexport) void SetRigidBodyLinearVelocity(int entityID, float x, float y, float z);
     __declspec(dllexport) void GetRigidBodyAngularVelocity(int entityID, float* x, float* y, float* z);
@@ -204,6 +208,10 @@ extern "C" {
     __declspec(dllexport) void AnimationPlayer_SetSpeed(int entityID, float speed);
     __declspec(dllexport) const char* AnimationPlayer_GetCurrentClipName(int entityID);
     __declspec(dllexport) const char* Animator_GetCurrentStateName(int entityID);
+    __declspec(dllexport) const char* Animator_GetPreviousStateName(int entityID);
+    // Predicted next base-layer state given current state + parameters/triggers.
+    // Returns the current (self) state name when no transition currently qualifies.
+    __declspec(dllexport) const char* Animator_GetNextStateName(int entityID);
     __declspec(dllexport) bool Animator_IsPlaying(int entityID);
     // Animator enable/disable (for ragdoll)
     __declspec(dllexport) bool Animator_GetEnabled(int entityID);

@@ -85,7 +85,7 @@ struct DictionaryPropertyValue {
 
 struct PropertyInfo {
     std::string name;
-    PropertyType type;
+    PropertyType type = PropertyType::Int;
     PropertyValue defaultValue;
     PropertyValue currentValue;
     // For ComponentRef/ScriptRef/ClayObject, holds the managed full type name to validate drops
@@ -93,7 +93,7 @@ struct PropertyInfo {
     
     // Extended metadata for complex types
     EnumMetadata enumMeta;           // For Enum type: dropdown options
-    PropertyType listElementType;    // For List type: element type
+    PropertyType listElementType = PropertyType::Int;    // For List type: element type
     std::string listElementTypeName; // For List type: element type name (for enums/structs)
     std::vector<PropertyInfo> structFields; // For Struct type: nested fields
     

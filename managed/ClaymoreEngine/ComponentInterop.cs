@@ -20,6 +20,9 @@ namespace ClaymoreEngine
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate void RemoveComponentFn(int entityId, [MarshalAs(UnmanagedType.LPStr)] string componentName);
 
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate void AddScriptFn(int entityId, [MarshalAs(UnmanagedType.LPStr)] string className);
+
     // LightComponent
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate int GetLightTypeFn(int entityId);
@@ -64,6 +67,9 @@ namespace ClaymoreEngine
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate void SetRigidBodyCollisionMaskFn(int entityId, uint collisionMask);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate bool SetRigidBodyPhysicsLayerFn(int entityId, [MarshalAs(UnmanagedType.LPStr)] string layerName);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate void GetRigidBodyLinearVelocityFn(int entityId, out float x, out float y, out float z);
@@ -194,6 +200,8 @@ namespace ClaymoreEngine
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate float Animator_GetFloatFn(int entityId, [MarshalAs(UnmanagedType.LPStr)] string name);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate bool  Animator_GetTriggerFn(int entityId, [MarshalAs(UnmanagedType.LPStr)] string name);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate IntPtr Animator_GetStateFn(int entityId);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate IntPtr Animator_GetPreviousStateFn(int entityId);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate IntPtr Animator_GetNextStateFn(int entityId);
     // Animator enable/disable (for ragdoll)
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate bool Animator_GetEnabledFn(int entityId);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void Animator_SetEnabledFn(int entityId, [MarshalAs(UnmanagedType.I1)] bool enabled);
@@ -479,6 +487,8 @@ namespace ClaymoreEngine
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void CC_JumpFn(int entityId, float speed);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate bool CC_IsGroundedFn(int entityId);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void CC_SetPositionFn(int entityId, float x, float y, float z);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate uint CC_GetCollisionMaskFn(int entityId);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void CC_SetCollisionMaskFn(int entityId, uint collisionMask);
 
     // TerrainComponent
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate bool Terrain_GetHeightAtWorldFn(int entityId, float worldX, float worldZ, out float height);
@@ -521,7 +531,7 @@ namespace ClaymoreEngine
 
     public static unsafe class ComponentInterop
     {
-        public const int InteropCount = 401;
+        public const int InteropCount = 407;
 
         // --- Function pointers ---
         // Managed Logging (first so it's available early)
@@ -530,6 +540,7 @@ namespace ClaymoreEngine
         public static HasComponentFn HasComponent;
         public static AddComponentFn AddComponent;
         public static RemoveComponentFn RemoveComponent;
+        public static AddScriptFn AddScript;
 
         // Light
         public static GetLightTypeFn GetLightType;
@@ -548,6 +559,7 @@ namespace ClaymoreEngine
         public static SetRigidBodyUseGravityFn SetRigidBodyUseGravity;
         public static GetRigidBodyCollisionMaskFn GetRigidBodyCollisionMask;
         public static SetRigidBodyCollisionMaskFn SetRigidBodyCollisionMask;
+        public static SetRigidBodyPhysicsLayerFn SetRigidBodyPhysicsLayer;
         public static GetRigidBodyLinearVelocityFn GetRigidBodyLinearVelocity;
         public static SetRigidBodyLinearVelocityFn SetRigidBodyLinearVelocity;
         public static GetRigidBodyAngularVelocityFn GetRigidBodyAngularVelocity;
@@ -695,6 +707,8 @@ namespace ClaymoreEngine
         public static Animator_GetFloatFn Animator_GetFloat;
         public static Animator_GetTriggerFn Animator_GetTrigger;
         public static Animator_GetStateFn Animator_GetStateInternal;
+        public static Animator_GetPreviousStateFn Animator_GetPreviousStateInternal;
+        public static Animator_GetNextStateFn Animator_GetNextStateInternal;
         public static Animator_GetEnabledFn Animator_GetEnabled;
         public static Animator_SetEnabledFn Animator_SetEnabled;
         public static Animator_SetControllerFn Animator_SetController;
@@ -947,6 +961,8 @@ namespace ClaymoreEngine
         public static CC_JumpFn CC_Jump;
         public static CC_IsGroundedFn CC_IsGrounded;
         public static CC_SetPositionFn CC_SetPosition;
+        public static CC_GetCollisionMaskFn CC_GetCollisionMask;
+        public static CC_SetCollisionMaskFn CC_SetCollisionMask;
 
         // Animation Layers
         public static AnimLayer_GetOrCreateFn AnimLayer_GetOrCreate;
@@ -1022,6 +1038,20 @@ namespace ClaymoreEngine
         {
             if (Animator_GetStateInternal == null) return string.Empty;
             IntPtr ptr = Animator_GetStateInternal(entityId);
+            return ptr != IntPtr.Zero ? Marshal.PtrToStringAnsi(ptr) : string.Empty;
+        }
+
+        public static string Animator_GetPreviousState(int entityId)
+        {
+            if (Animator_GetPreviousStateInternal == null) return string.Empty;
+            IntPtr ptr = Animator_GetPreviousStateInternal(entityId);
+            return ptr != IntPtr.Zero ? Marshal.PtrToStringAnsi(ptr) : string.Empty;
+        }
+
+        public static string Animator_GetNextState(int entityId)
+        {
+            if (Animator_GetNextStateInternal == null) return string.Empty;
+            IntPtr ptr = Animator_GetNextStateInternal(entityId);
             return ptr != IntPtr.Zero ? Marshal.PtrToStringAnsi(ptr) : string.Empty;
         }
 
@@ -1115,6 +1145,7 @@ namespace ClaymoreEngine
             HasComponent = SafeGetDelegate<HasComponentFn>((IntPtr)ptrs[i], i, "HasComponent"); i++;
             AddComponent = SafeGetDelegate<AddComponentFn>((IntPtr)ptrs[i], i, "AddComponent"); i++;
             RemoveComponent = SafeGetDelegate<RemoveComponentFn>((IntPtr)ptrs[i], i, "RemoveComponent"); i++;
+            AddScript = SafeGetDelegate<AddScriptFn>((IntPtr)ptrs[i], i, "AddScript"); i++;
             Console.WriteLine($"[ComponentInterop] After core component funcs i={i}");
             
             GetLightType = SafeGetDelegate<GetLightTypeFn>((IntPtr)ptrs[i], i, "GetLightType"); i++;
@@ -1180,6 +1211,8 @@ namespace ClaymoreEngine
             Animator_GetFloat = SafeGetDelegate<Animator_GetFloatFn>((IntPtr)ptrs[i], i, "Animator_GetFloat"); i++;
             Animator_GetTrigger = SafeGetDelegate<Animator_GetTriggerFn>((IntPtr)ptrs[i], i, "Animator_GetTrigger"); i++;
             Animator_GetStateInternal = SafeGetDelegate<Animator_GetStateFn>((IntPtr)ptrs[i], i, "Animator_GetState"); i++;
+            Animator_GetPreviousStateInternal = SafeGetDelegate<Animator_GetPreviousStateFn>((IntPtr)ptrs[i], i, "Animator_GetPreviousState"); i++;
+            Animator_GetNextStateInternal = SafeGetDelegate<Animator_GetNextStateFn>((IntPtr)ptrs[i], i, "Animator_GetNextState"); i++;
             Animator_GetEnabled = SafeGetDelegate<Animator_GetEnabledFn>((IntPtr)ptrs[i], i, "Animator_GetEnabled"); i++;
             Animator_SetEnabled = SafeGetDelegate<Animator_SetEnabledFn>((IntPtr)ptrs[i], i, "Animator_SetEnabled"); i++;
             Animator_SetController = SafeGetDelegate<Animator_SetControllerFn>((IntPtr)ptrs[i], i, "Animator_SetController"); i++;
@@ -1274,6 +1307,8 @@ namespace ClaymoreEngine
             CC_Jump = SafeGetDelegate<CC_JumpFn>((IntPtr)ptrs[i], i, "CC_Jump"); i++;
             CC_IsGrounded = SafeGetDelegate<CC_IsGroundedFn>((IntPtr)ptrs[i], i, "CC_IsGrounded"); i++;
             CC_SetPosition = SafeGetDelegate<CC_SetPositionFn>((IntPtr)ptrs[i], i, "CC_SetPosition"); i++;
+            CC_GetCollisionMask = SafeGetDelegate<CC_GetCollisionMaskFn>((IntPtr)ptrs[i], i, "CC_GetCollisionMask"); i++;
+            CC_SetCollisionMask = SafeGetDelegate<CC_SetCollisionMaskFn>((IntPtr)ptrs[i], i, "CC_SetCollisionMask"); i++;
             Console.WriteLine($"[ComponentInterop] After CharacterController funcs i={i}");
 
             // UI Text functions (42 entries)
@@ -1616,7 +1651,7 @@ namespace ClaymoreEngine
             }
 
             // Portal functions (18 entries)
-            if (i + 18 <= count)
+            if (i + 19 <= count)
             {
                 Portal_GetEnabled = SafeGetDelegate<Portal_GetEnabledFn>((IntPtr)ptrs[i], i, "Portal_GetEnabled"); i++;
                 Portal_SetEnabled = SafeGetDelegate<Portal_SetEnabledFn>((IntPtr)ptrs[i], i, "Portal_SetEnabled"); i++;
@@ -1636,6 +1671,7 @@ namespace ClaymoreEngine
                 Portal_SetTriggerRadius = SafeGetDelegate<Portal_SetFloatFn>((IntPtr)ptrs[i], i, "Portal_SetTriggerRadius"); i++;
                 Portal_GetFireExitEvents = SafeGetDelegate<Portal_GetBoolFn>((IntPtr)ptrs[i], i, "Portal_GetFireExitEvents"); i++;
                 Portal_SetFireExitEvents = SafeGetDelegate<Portal_SetBoolFn>((IntPtr)ptrs[i], i, "Portal_SetFireExitEvents"); i++;
+                SetRigidBodyPhysicsLayer = SafeGetDelegate<SetRigidBodyPhysicsLayerFn>((IntPtr)ptrs[i], i, "SetRigidBodyPhysicsLayer"); i++;
                 Console.WriteLine($"[ComponentInterop] After Portal funcs i={i}");
             }
 

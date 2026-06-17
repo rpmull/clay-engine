@@ -12,7 +12,9 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <fstream>
+#include <thread>
  
 #include "application.h"
 #include "editor/tools/WorldGraphBake.h"
@@ -29,11 +31,13 @@
 #include "core/physics/Physics.h"
 #include "core/platform/win32/Win32Window.h"
 #include "core/vfs/FileSystem.h"
+#include "core/serialization/EntityBinaryLoader.h"
 #include "core/serialization/Serializer.h"
 #include "core/utils/Profiler.h"
 #include "core/input/Input.h"
 #include "core/jobs/Jobs.h"
 #include "core/audio/Audio.h"
+#include "core/prefab/PrefabPrewarm.h"
 #include "core/prefab/RuntimePrefabInstantiator.h"
 #include "managed/interop/DialogueInterop.h"
 
@@ -68,6 +72,95 @@ Application* Application::s_Instance = nullptr;
 // =============================================================
 // HELPER FUNCTIONS
 // =============================================================
+namespace {
+bool FinalizeGameStartupPrefabLoads(Scene& scene)
+{
+    constexpr auto kMaxWait = std::chrono::seconds(5);
+    constexpr int kMaxIterations = 4096;
+    const auto start = std::chrono::steady_clock::now();
+
+    auto countPending = [&scene]() {
+        size_t pending = 0;
+        for (const auto& entity : scene.GetEntities()) {
+            const EntityData* data = scene.GetEntityData(entity.GetID());
+            if (data && data->PrefabAsyncPending) {
+                ++pending;
+            }
+        }
+        return pending;
+    };
+
+    size_t pending = countPending();
+    if (pending == 0) {
+        return true;
+    }
+
+    std::cout << "[Game] Waiting for " << pending
+              << " pending prefab load(s) before entering play..." << std::endl;
+
+    for (int iteration = 0; iteration < kMaxIterations && pending > 0; ++iteration) {
+        runtime::RuntimePrefabInstantiator::UpdateAsync(4.0);
+        scene.ProcessPendingCreations();
+        scene.ProcessPendingRemovals();
+
+        pending = countPending();
+        if (pending == 0) {
+            return true;
+        }
+
+        if (std::chrono::steady_clock::now() - start > kMaxWait) {
+            std::cerr << "[Game] WARNING: Timed out waiting for startup prefab loads." << std::endl;
+            return false;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    return countPending() == 0;
+}
+
+bool FinalizeGameStartupAssetWarmup(Scene& scene)
+{
+    TextureLoadSettings textureSettings{};
+    textureSettings.MaxDimension = scene.GetEnvironment().TextureMaxDimension;
+    if (SetPersistentTextureLoadSettings(textureSettings)) {
+        RefreshSceneTextureOverrides(scene);
+    }
+
+    prefab::Clear();
+    prefab::QueueScenePrefabs(scene);
+    if (!prefab::HasPendingWork()) {
+        prefab::Clear();
+        return true;
+    }
+
+    constexpr auto kMaxWait = std::chrono::seconds(15);
+    constexpr int kMaxIterations = 8192;
+    const auto start = std::chrono::steady_clock::now();
+
+    std::cout << "[Game] Prewarming scene dependencies before entering play..." << std::endl;
+
+    for (int iteration = 0; iteration < kMaxIterations; ++iteration) {
+        prefab::Update(8.0);
+        if (!prefab::HasPendingWork()) {
+            prefab::Clear();
+            return true;
+        }
+
+        if (std::chrono::steady_clock::now() - start > kMaxWait) {
+            std::cerr << "[Game] WARNING: Timed out while prewarming scene dependencies." << std::endl;
+            prefab::Clear();
+            return false;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    prefab::Clear();
+    return false;
+}
+}
+
 static void LoadProjectModulesAtStartup()
 {
     const auto& modules = Project::GetModules();
@@ -220,12 +313,18 @@ Application::Application(int width, int height, const std::string& title)
                 if (pos != std::string::npos) vpath = vpath.substr(pos);
                 // Infer type from extension
                 std::string ext = entry.path().extension().string();
-                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-                AssetType at = AssetType::Mesh;
+                std::transform(ext.begin(), ext.end(), ext.begin(),
+                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+                AssetType at = AssetType::Unknown;
                 if (ext == ".fbx" || ext == ".gltf" || ext == ".glb" || ext == ".obj") at = AssetType::Mesh;
                 else if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga") at = AssetType::Texture;
                 else if (ext == ".prefab") at = AssetType::Prefab;
+                else if (ext == ".anim") at = AssetType::Animation;
+                else if (ext == ".animctrl" || ext == ".controller") at = AssetType::AnimatorController;
+                else if (ext == ".mat") at = AssetType::Material;
+                else if (ext == ".sc" || ext == ".glsl" || ext == ".shader") at = AssetType::Shader;
                 else if (ext == ".ttf" || ext == ".otf") at = AssetType::Font;
+                if (at == AssetType::Unknown) continue;
                 AssetLibrary::Instance().RegisterAsset(AssetReference(meta->guid, 0, static_cast<int32_t>(at)), at, vpath, entry.path().filename().string());
                 // Also map absolute path so serializers that wrote absolute paths can resolve
                 AssetLibrary::Instance().RegisterPathAlias(meta->guid, abs);
@@ -269,9 +368,9 @@ Application::Application(int width, int height, const std::string& title)
 
     // 2. Initialize BGFX Renderer (shader compile gated by m_RunEditorUI)
     InitBgfx();
-    // Standalone/game mode: render directly to backbuffer instead of editor offscreen target
     if (!m_RunEditorUI) {
-        Renderer::Get().SetRenderToOffscreen(false);
+        Renderer::Get().SetRenderToOffscreen(true);
+        Renderer::Get().SetPresentOffscreenToBackbuffer(true);
     }
 
     // 3. Initialize ImGui (editor mode only)
@@ -371,8 +470,21 @@ Application::Application(int width, int height, const std::string& title)
                 }
                 std::string entry = j.value("entryScene", "");
                 if (!entry.empty()) {
-                    Serializer::LoadSceneFromFile(entry, *Scene::CurrentScene);
-                    if (m_RunEditorUI) uiLayer->SetCurrentScenePath(entry);
+                    bool loaded = false;
+                    if (std::filesystem::path(entry).extension() == ".sceneb") {
+                        loaded = binary::EntityBinaryLoader::Load(entry, *Scene::CurrentScene);
+                    }
+                    if (!loaded) {
+                        loaded = Serializer::LoadSceneFromFile(entry, *Scene::CurrentScene);
+                    }
+                    if (loaded) {
+                        Scene::CurrentScene->SetScenePath(entry);
+                        if (m_RunEditorUI) {
+                            uiLayer->SetCurrentScenePath(entry);
+                        }
+                    } else {
+                        std::cerr << "[Init] Failed to load entry scene: " << entry << std::endl;
+                    }
                 }
             } catch(const std::exception& e) {
                 std::cerr << "[Init] Failed parsing game_manifest.json: " << e.what() << std::endl;
@@ -383,6 +495,15 @@ Application::Application(int width, int height, const std::string& title)
     // In exported/game mode (no editor UI), create a runtime clone and enter play
     if (!m_RunEditorUI) {
         if (m_GameScene) {
+            if (!FinalizeGameStartupAssetWarmup(*m_GameScene)) {
+                std::cerr << "[Game] WARNING: Startup dependency warmup did not fully complete." << std::endl;
+            }
+            if (!FinalizeGameStartupPrefabLoads(*m_GameScene)) {
+                std::cerr << "[Game] WARNING: Startup prefab loads did not fully complete." << std::endl;
+            }
+            m_GameScene->ReleasePhysicsRuntimeState();
+            m_GameScene->UpdateTransforms();
+            m_GameScene->ResolveScriptEntityReferencesFromMetadata();
             m_RuntimeScene = m_GameScene->RuntimeClone();
             if (m_RuntimeScene) {
                 m_RuntimeScene->m_IsPlaying = true;
@@ -1249,7 +1370,7 @@ void Application::StopPlayMode() {
     Scene& editorScene = uiLayer->GetScene();
     if (editorScene.m_RuntimeScene) {
         runtime::RuntimePrefabInstantiator::CancelAsyncForScene(*editorScene.m_RuntimeScene, true);
-        editorScene.m_RuntimeScene->OnStop();
+        editorScene.m_RuntimeScene->OnStop(); // also stops scene audio (Audio::StopAll)
     }
     editorScene.m_RuntimeScene.reset();
     Scene::CurrentScene = &editorScene;

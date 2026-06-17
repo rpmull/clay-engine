@@ -374,15 +374,11 @@ def print_report(stats: CharacterStats, scene_summary: dict[str, dict[str, int]]
 
 
 def main() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    parser = argparse.ArgumentParser(description="Simulate character runtime work for the canonical Claymore humanoid.")
+    parser = argparse.ArgumentParser(description="Simulate character runtime work for the canonical claymore humanoid.")
     parser.add_argument(
         "--project-root",
-        default=str(repo_root),
-        help=(
-            "Path to a Claymore project checkout that contains the canonical "
-            "scene and prefab data used by this simulation."
-        ),
+        default=r"C:\Users\rpmul\projects\alkahest\claymore",
+        help="Path to the user project that contains the canonical scenes and prefabs.",
     )
     parser.add_argument(
         "--characters",
@@ -397,21 +393,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    project_root = Path(args.project_root).resolve()
-    required_paths = [
-        project_root / "assets/prefabs/base_human_96.prefab",
-        project_root / "assets/models/base_human.meta",
-        project_root / "scenes/world.scene",
-    ]
-    missing_paths = [path for path in required_paths if not path.exists()]
-    if missing_paths:
-        missing_text = "\n".join(f"  - {path}" for path in missing_paths)
-        raise SystemExit(
-            "The selected project root does not contain the files this simulation expects.\n"
-            "Pass --project-root to a compatible Claymore game/project checkout.\n"
-            f"{missing_text}"
-        )
-
+    project_root = Path(args.project_root)
     stats = load_character_stats(project_root)
     scene_summary = summarize_scene_entities(
         project_root / "scenes/world.scene",

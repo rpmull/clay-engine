@@ -1,6 +1,7 @@
 #include "ProjectSettingsPanel.h"
 #include <imgui.h>
 #include <filesystem>
+#include <cstdio>
 #include <cstring>
 #include "editor/Project.h"
 #include "managed/ModuleLoader.h"
@@ -29,6 +30,20 @@ void CopyStringToBuffer(const std::string& value, char* buffer, size_t bufferSiz
 
     std::strncpy(buffer, value.c_str(), bufferSize - 1);
     buffer[bufferSize - 1] = '\0';
+}
+
+const ViewportResolutionPreset* FindBuiltinPreset(size_t index)
+{
+    static const ViewportResolutionPreset kBuiltins[] = {
+        { "640 x 360", 640, 360 },
+        { "854 x 480", 854, 480 },
+        { "1280 x 720", 1280, 720 },
+        { "1600 x 900", 1600, 900 },
+        { "1920 x 1080", 1920, 1080 },
+        { "2560 x 1440", 2560, 1440 },
+        { "3840 x 2160", 3840, 2160 },
+    };
+    return index < IM_ARRAYSIZE(kBuiltins) ? &kBuiltins[index] : nullptr;
 }
 }
 
@@ -86,6 +101,10 @@ void ProjectSettingsPanel::OnImGuiRenderEmbedded() {
         }
         if (ImGui::BeginTabItem("Appearance")) {
             DrawAppearanceTab();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Viewport")) {
+            DrawViewportTab();
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
@@ -213,6 +232,78 @@ void ProjectSettingsPanel::DrawAppearanceTab() {
             Project::Save();
             Logger::Log("[ProjectSettings] Custom editor palette updated");
         }
+    }
+}
+
+void ProjectSettingsPanel::DrawViewportTab() {
+    std::vector<ViewportResolutionPreset> presets = Project::GetViewportResolutionPresets();
+    bool changed = false;
+
+    ImGui::Text("Viewport Resolution Presets");
+    ImGui::Separator();
+    ImGui::TextWrapped("These presets are merged into the main viewport resolution dropdown alongside the built-in standards.");
+    ImGui::Spacing();
+
+    for (size_t i = 0; i < presets.size(); ++i) {
+        ImGui::PushID(static_cast<int>(i));
+        char labelBuf[64];
+        std::snprintf(labelBuf, sizeof(labelBuf), "%s", presets[i].label.c_str());
+        char widthBuf[16];
+        std::snprintf(widthBuf, sizeof(widthBuf), "%u", presets[i].width);
+        char heightBuf[16];
+        std::snprintf(heightBuf, sizeof(heightBuf), "%u", presets[i].height);
+
+        ImGui::SetNextItemWidth(180.0f);
+        if (ImGui::InputText("Label", labelBuf, sizeof(labelBuf))) {
+            presets[i].label = labelBuf;
+            changed = true;
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(80.0f);
+        if (ImGui::InputScalar("W", ImGuiDataType_U32, &presets[i].width)) {
+            presets[i].width = std::max<uint32_t>(1u, presets[i].width);
+            changed = true;
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(80.0f);
+        if (ImGui::InputScalar("H", ImGuiDataType_U32, &presets[i].height)) {
+            presets[i].height = std::max<uint32_t>(1u, presets[i].height);
+            changed = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Remove")) {
+            presets.erase(presets.begin() + static_cast<std::ptrdiff_t>(i));
+            changed = true;
+            ImGui::PopID();
+            break;
+        }
+        ImGui::PopID();
+    }
+
+    ImGui::Spacing();
+    if (ImGui::BeginMenu("Add Built-in Preset")) {
+        for (size_t i = 0; const ViewportResolutionPreset* preset = FindBuiltinPreset(i); ++i) {
+            if (ImGui::MenuItem(preset->label.c_str())) {
+                presets.push_back(*preset);
+                changed = true;
+            }
+        }
+        ImGui::EndMenu();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Add Custom Preset")) {
+        presets.push_back({ "Custom", 1280, 720 });
+        changed = true;
+    }
+
+    if (changed) {
+        presets.erase(std::remove_if(presets.begin(), presets.end(),
+            [](const ViewportResolutionPreset& preset) {
+                return preset.label.empty() || preset.width == 0 || preset.height == 0;
+            }), presets.end());
+        Project::SetViewportResolutionPresets(std::move(presets));
+        Project::Save();
+        Logger::Log("[ProjectSettings] Viewport resolution presets updated");
     }
 }
 

@@ -913,14 +913,16 @@ bool Navigation::FindPathAcrossMeshes(Scene& scene, const glm::vec3& start, cons
 void Navigation::RefreshEntityCaches(Scene& scene)
 {
     const uint64_t sceneRevision = scene.GetDirtyRevision();
-    if (m_CachedEntityRevision == sceneRevision) {
+    const size_t entityCount = scene.GetEntities().size();
+    if (m_CachedEntityRevision == sceneRevision &&
+        m_CachedEntityCount == entityCount) {
         return;
     }
 
     m_CachedNavAgentEntities.clear();
     m_CachedNavMeshEntities.clear();
-    m_CachedNavAgentEntities.reserve(scene.GetEntities().size());
-    m_CachedNavMeshEntities.reserve(scene.GetEntities().size());
+    m_CachedNavAgentEntities.reserve(entityCount);
+    m_CachedNavMeshEntities.reserve(entityCount);
 
     for (const auto& e : scene.GetEntities()) {
         auto* d = scene.GetEntityData(e.GetID());
@@ -933,6 +935,7 @@ void Navigation::RefreshEntityCaches(Scene& scene)
         }
     }
     m_CachedEntityRevision = sceneRevision;
+    m_CachedEntityCount = entityCount;
 }
 
 void Navigation::Update(Scene& scene, float dt)

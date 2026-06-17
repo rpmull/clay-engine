@@ -1,6 +1,7 @@
 #include "EntityBinaryLoader.h"
 #include "Serializer.h"
 #include "MeshBinaryLoader.h"
+#include "MeshCache.h"
 #include "MaterialBinaryLoader.h"
 #include "core/ecs/Scene.h"
 #include "core/ecs/Entity.h"
@@ -31,7 +32,6 @@
 #include "core/rendering/TextureLoader.h"
 #include "core/rendering/MaterialCache.h"
 #if defined(CLAYMORE_EDITOR)
-#include "editor/pipeline/BinaryAssetCache.h"
 #include "editor/pipeline/AssetLibrary.h"
 #endif
 #include "core/navigation/NavMesh.h"
@@ -45,19 +45,14 @@
 #include <filesystem>
 #include <functional>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace {
-#if defined(CLAYMORE_EDITOR)
-bool TryEnsureBinaryForPlayMode(const std::string& sourcePath) {
-    if (sourcePath.empty()) return false;
-    if (Assets::GetLoadMode() != AssetLoadMode::PlayMode) return false;
-    if (FileSystem::Instance().IsPakMounted()) return false;
-    return BinaryAssetCache::Instance().EnsureBinary(sourcePath);
-}
-#endif
-
 bool HasFreshSlotPropertyBlocks(const MeshComponent& mesh) {
     if (mesh.SlotPropertyBlocks.empty() && mesh.SlotPropertyBlockTexturePaths.empty()) {
         return false;
@@ -75,8 +70,8 @@ bool HasFreshSlotPropertyBlocks(const MeshComponent& mesh) {
     return false;
 }
 
-void RebuildPropertyBlockTexturesFromPaths(MaterialPropertyBlock& block,
-                                           const std::unordered_map<std::string, std::string>& texturePaths) {
+void RebuildPropertyBlockTexturesFromPathsLocal(MaterialPropertyBlock& block,
+                                                const std::unordered_map<std::string, std::string>& texturePaths) {
     block.Textures.clear();
     block.TexturesByID.clear();
 
@@ -164,16 +159,13 @@ std::shared_ptr<Material> AcquireSharedDefaultMaterial(Scene& scene, bool skinne
 std::mutex s_inlineMaterialCacheMutex;
 std::unordered_map<std::string, std::weak_ptr<Material>> s_inlineMaterialCache;
 
-std::shared_ptr<Material> CloneOwnedInlineMaterial(const std::shared_ptr<Material>& material) {
-    if (!material) {
-        return nullptr;
-    }
+std::shared_ptr<Material> ShareEquivalentMaterial(const std::shared_ptr<Material>& material) {
+    return AcquireEquivalentMaterial(material);
+}
 
-    if (auto clone = material->Clone()) {
-        return clone;
-    }
-
-    return material;
+bool IsEquivalentMaterialShared(const std::shared_ptr<Material>& material) {
+    return material &&
+        GetMaterialEquivalenceKey(material.get()).EquivalentSafe;
 }
 }
 
@@ -331,9 +323,258 @@ static PropertyValue ReadTypedScriptValue(binary::ComponentLoadContext& ctx, Pro
 // Prefab debug logging toggle (chat-driven)
 static bool kPrefabDebugLog = true;
 }  // namespace
-#include <unordered_map>
 
 namespace binary {
+
+namespace {
+constexpr uint32_t kSceneEntityTagStringTableVersion = 31;
+
+struct PreparedSceneLayout {
+    SceneBinaryHeader header{};
+    size_t dataSize = 0;
+    uint64_t timestampToken = 0;
+    std::vector<std::string> strings;
+    std::vector<AssetRefEntry> assetRefs;
+    std::vector<EntityBinaryLoader::PreparedEntityRecord> entities;
+};
+
+std::mutex s_preparedSceneLayoutCacheMutex;
+std::unordered_map<std::string, std::shared_ptr<PreparedSceneLayout>> s_preparedSceneLayoutCache;
+
+uint64_t GetFileTimestampToken(const std::string& path) {
+    if (path.empty()) {
+        return 0;
+    }
+    std::error_code ec;
+    const std::filesystem::path fsPath(path);
+    if (!std::filesystem::exists(fsPath, ec) || ec) {
+        return 0;
+    }
+    const auto writeTime = std::filesystem::last_write_time(fsPath, ec);
+    if (ec) {
+        return 0;
+    }
+    using Rep = decltype(writeTime.time_since_epoch())::rep;
+    const Rep ticks = writeTime.time_since_epoch().count();
+    return static_cast<uint64_t>(ticks < 0 ? -ticks : ticks);
+}
+
+std::string MakeSceneLayoutCacheKey(const std::string& path) {
+    if (path.empty()) {
+        return {};
+    }
+    try {
+        return std::filesystem::weakly_canonical(std::filesystem::path(path)).string();
+    } catch (...) {
+        return path;
+    }
+}
+
+bool IsPreparedSceneLayoutCompatible(const PreparedSceneLayout& layout,
+                                     const SceneBinaryHeader& header,
+                                     size_t dataSize,
+                                     uint64_t timestampToken) {
+    return layout.dataSize == dataSize &&
+           layout.timestampToken == timestampToken &&
+           layout.header.base.magic == header.base.magic &&
+           layout.header.base.version == header.base.version &&
+           layout.header.base.flags == header.base.flags &&
+           layout.header.entityCount == header.entityCount &&
+           layout.header.stringTableOffset == header.stringTableOffset &&
+           layout.header.assetRefTableOffset == header.assetRefTableOffset &&
+           layout.header.environmentOffset == header.environmentOffset &&
+           layout.header.environmentSize == header.environmentSize &&
+           layout.header.modelDeltaTableOffset == header.modelDeltaTableOffset &&
+           layout.header.modelDeltaCount == header.modelDeltaCount;
+}
+
+std::shared_ptr<PreparedSceneLayout> TryGetPreparedSceneLayoutCache(const std::string& key,
+                                                                    const SceneBinaryHeader& header,
+                                                                    size_t dataSize,
+                                                                    uint64_t timestampToken) {
+    if (key.empty() || timestampToken == 0) {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(s_preparedSceneLayoutCacheMutex);
+    auto it = s_preparedSceneLayoutCache.find(key);
+    if (it == s_preparedSceneLayoutCache.end() || !it->second) {
+        return nullptr;
+    }
+    if (!IsPreparedSceneLayoutCompatible(*it->second, header, dataSize, timestampToken)) {
+        s_preparedSceneLayoutCache.erase(it);
+        return nullptr;
+    }
+    return it->second;
+}
+
+void StorePreparedSceneLayoutCache(const std::string& key, std::shared_ptr<PreparedSceneLayout> layout) {
+    if (key.empty() || !layout || layout->timestampToken == 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(s_preparedSceneLayoutCacheMutex);
+    s_preparedSceneLayoutCache[key] = std::move(layout);
+}
+
+const std::vector<AssetRefEntry>& AssetRefsForContext(const EntityBinaryLoader::LoadContext& ctx) {
+    return ctx.assetRefView ? *ctx.assetRefView : ctx.assetRefs;
+}
+
+bool ReadStringTableInto(EntityBinaryLoader::LoadContext& ctx,
+                         const SceneBinaryHeader& header,
+                         std::vector<std::string>& outStrings) {
+    outStrings.clear();
+    if (header.stringTableOffset == 0) {
+        return true;
+    }
+
+    ctx.pos = header.stringTableOffset;
+
+    uint32_t stringCount = 0;
+    if (!ctx.Read(stringCount)) {
+        return false;
+    }
+
+    outStrings.reserve(stringCount);
+
+    for (uint32_t i = 0; i < stringCount; ++i) {
+        uint32_t len = 0;
+        if (!ctx.Read(len)) {
+            return false;
+        }
+        if (len > ctx.size - ctx.pos) {
+            return false;
+        }
+
+        std::string str;
+        str.resize(len);
+        if (len > 0 && !ctx.Read(str.data(), len)) {
+            return false;
+        }
+
+        outStrings.push_back(std::move(str));
+    }
+
+    return true;
+}
+
+bool ReadAssetRefsInto(EntityBinaryLoader::LoadContext& ctx,
+                       const SceneBinaryHeader& header,
+                       std::vector<AssetRefEntry>& outAssetRefs) {
+    outAssetRefs.clear();
+    if (header.assetRefTableOffset == 0) {
+        return true;
+    }
+
+    ctx.pos = header.assetRefTableOffset;
+
+    uint32_t refCount = 0;
+    if (!ctx.Read(refCount)) {
+        return false;
+    }
+    if (refCount > (ctx.size - ctx.pos) / sizeof(AssetRefEntry)) {
+        return false;
+    }
+
+    outAssetRefs.resize(refCount);
+    for (uint32_t i = 0; i < refCount; ++i) {
+        if (!ctx.Read(outAssetRefs[i])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool BuildPreparedSceneLayout(const uint8_t* data,
+                              size_t size,
+                              const SceneBinaryHeader& header,
+                              std::shared_ptr<PreparedSceneLayout>& outLayout,
+                              std::string* error) {
+    auto fail = [&](const char* message) {
+        if (error) {
+            *error = message;
+        }
+        return false;
+    };
+
+    auto layout = std::make_shared<PreparedSceneLayout>();
+    layout->header = header;
+    layout->dataSize = size;
+
+    EntityBinaryLoader::LoadContext ctx;
+    ctx.data = data;
+    ctx.size = size;
+    ctx.pos = 0;
+    ctx.version = header.base.version;
+
+    if (!ReadStringTableInto(ctx, header, layout->strings)) {
+        return fail("Failed to read scene string table");
+    }
+    ctx.stringView = &layout->strings;
+
+    if (!ReadAssetRefsInto(ctx, header, layout->assetRefs)) {
+        return fail("Failed to read scene asset reference table");
+    }
+
+    ctx.pos = sizeof(SceneBinaryHeader);
+    layout->entities.reserve(header.entityCount);
+
+    for (uint32_t i = 0; i < header.entityCount; ++i) {
+        EntityBinaryLoader::PreparedEntityRecord record;
+        if (!ctx.Read(record.entityId)) return fail("Failed to read entity id");
+        if (!ctx.Read(record.parentId)) return fail("Failed to read entity parent");
+        if (!ctx.Read(record.nameIndex)) return fail("Failed to read entity name");
+        if (!ctx.Read(record.guidHigh)) return fail("Failed to read entity guid high");
+        if (!ctx.Read(record.guidLow)) return fail("Failed to read entity guid low");
+        if (!ctx.Read(record.flags)) return fail("Failed to read entity flags");
+
+        if (header.base.version >= 5) {
+            if (!ctx.Read(record.layer)) return fail("Failed to read entity layer");
+            if (header.base.version >= kSceneEntityTagStringTableVersion) {
+                if (!ctx.Read(record.tagIndex)) return fail("Failed to read entity tag index");
+            } else {
+                uint32_t tagLen = 0;
+                if (!ctx.Read(tagLen)) return fail("Failed to read entity tag length");
+                if (tagLen > ctx.size - ctx.pos) return fail("Entity tag out of bounds");
+                record.legacyTag.resize(tagLen);
+                if (tagLen > 0 && !ctx.Read(record.legacyTag.data(), tagLen)) {
+                    return fail("Failed to read entity tag");
+                }
+            }
+        }
+
+        if (header.base.version >= 4 && (record.flags & 0x04)) {
+            if (!ctx.Read(record.modelGuidHigh)) return fail("Failed to read entity model guid high");
+            if (!ctx.Read(record.modelGuidLow)) return fail("Failed to read entity model guid low");
+        }
+
+        if (!ctx.Read(record.componentCount)) return fail("Failed to read entity component count");
+
+        record.componentOffset = ctx.pos;
+        for (uint32_t c = 0; c < record.componentCount; ++c) {
+            ComponentEntry entry;
+            if (!ctx.Read(entry)) {
+                return fail("Failed to read component entry");
+            }
+            const size_t dataOffset = static_cast<size_t>(entry.dataOffset);
+            if (dataOffset > ctx.size || entry.dataSize > ctx.size - dataOffset) {
+                return fail("Component data out of bounds");
+            }
+            if (entry.dataSize > ctx.size - ctx.pos) {
+                return fail("Component entry payload out of bounds");
+            }
+            ctx.pos += entry.dataSize;
+        }
+
+        layout->entities.push_back(std::move(record));
+    }
+
+    outLayout = std::move(layout);
+    return true;
+}
+} // namespace
 
 // =============================================================================
 // Inline primitive mesh creation for runtime
@@ -524,23 +765,26 @@ bool EntityBinaryLoader::LoadContext::Read(void* dst, size_t count) {
 }
 
 std::string EntityBinaryLoader::LoadContext::ReadString(uint32_t index) const {
-    if (index < strings.size()) {
-        return strings[index];
+    const std::vector<std::string>* table = stringView ? stringView : &strings;
+    if (table && index < table->size()) {
+        return (*table)[index];
     }
     return "";
 }
 
 bool EntityBinaryLoader::Load(const std::string& path, Scene& scene) {
     std::vector<uint8_t> data;
+    const std::string cacheKey = MakeSceneLayoutCacheKey(path);
+    const uint64_t timestampToken = GetFileTimestampToken(path);
     
     // Try VFS first
     if (VFS::Get() && VFS::Get()->ReadFile(path, data)) {
-        return LoadFromMemory(data.data(), data.size(), scene);
+        return LoadFromMemoryInternal(data.data(), data.size(), scene, cacheKey, timestampToken);
     }
     
     // Fallback to FileSystem
     if (FileSystem::Instance().ReadFile(path, data)) {
-        return LoadFromMemory(data.data(), data.size(), scene);
+        return LoadFromMemoryInternal(data.data(), data.size(), scene, cacheKey, timestampToken);
     }
     
     std::cerr << "[EntityBinaryLoader] Failed to read file: " << path << std::endl;
@@ -548,6 +792,14 @@ bool EntityBinaryLoader::Load(const std::string& path, Scene& scene) {
 }
 
 bool EntityBinaryLoader::LoadFromMemory(const uint8_t* data, size_t size, Scene& scene) {
+    return LoadFromMemoryInternal(data, size, scene, {}, 0);
+}
+
+bool EntityBinaryLoader::LoadFromMemoryInternal(const uint8_t* data,
+                                                size_t size,
+                                                Scene& scene,
+                                                const std::string& cacheKey,
+                                                uint64_t timestampToken) {
     if (!data || size < sizeof(SceneBinaryHeader)) {
         std::cerr << "[EntityBinaryLoader] Invalid data or size" << std::endl;
         return false;
@@ -566,22 +818,28 @@ bool EntityBinaryLoader::LoadFromMemory(const uint8_t* data, size_t size, Scene&
     
     // Store version in context for version-specific component loading
     ctx.version = header.base.version;
-    
-    // Load string table
-    if (!LoadStringTable(ctx, header)) {
+
+    std::shared_ptr<PreparedSceneLayout> preparedLayout =
+        TryGetPreparedSceneLayoutCache(cacheKey, header, size, timestampToken);
+    if (!preparedLayout) {
+        std::string parseError;
+        if (!BuildPreparedSceneLayout(data, size, header, preparedLayout, &parseError)) {
+            std::cerr << "[EntityBinaryLoader] " << parseError << std::endl;
+            return false;
+        }
+        preparedLayout->timestampToken = timestampToken;
+        StorePreparedSceneLayoutCache(cacheKey, preparedLayout);
+    }
+
+    ctx.stringView = &preparedLayout->strings;
+    ctx.assetRefView = &preparedLayout->assetRefs;
+
+    // Load entities from the prepared metadata state. This mirrors Godot's PackedScene
+    // SceneState approach: metadata is decoded once, then instantiation walks arrays.
+    if (!LoadPreparedEntities(ctx, header, preparedLayout->entities, scene)) {
         return false;
     }
-    
-    // Load asset reference table
-    if (!LoadAssetRefTable(ctx, header)) {
-        return false;
-    }
-    
-    // Load entities
-    if (!LoadEntities(ctx, header, scene)) {
-        return false;
-    }
-    
+
     std::cout << "[EntityBinaryLoader] Successfully loaded " << header.entityCount << " entities from binary" << std::endl;
     
     // Load environment data (v2+)
@@ -851,6 +1109,26 @@ static std::string ResolveGuidToMeshPath(const ClaymoreGUID& guid) {
     return "";
 }
 
+static bool SceneMeshNeedsUniqueInstance(Scene& scene, const EntityData& data) {
+    if (data.BlendShapes && !data.BlendShapes->Shapes.empty()) {
+        return true;
+    }
+
+    EntityID parentId = data.Parent;
+    while (parentId != INVALID_ENTITY_ID) {
+        EntityData* parentData = scene.GetEntityData(parentId);
+        if (!parentData) {
+            break;
+        }
+        if (parentData->UnifiedMorph && !parentData->UnifiedMorph->Names.empty()) {
+            return true;
+        }
+        parentId = parentData->Parent;
+    }
+
+    return false;
+}
+
 void EntityBinaryLoader::ResolveMeshReferences(LoadContext& ctx, Scene& scene) {
     int meshesLoaded = 0;
     int meshesFailed = 0;
@@ -931,7 +1209,7 @@ bool EntityBinaryLoader::ResolveMeshReferencesRange(LoadContext& ctx,
         
         if (meshBinPath.empty()) {
             // Fallback: check asset ref table
-            for (const auto& ref : ctx.assetRefs) {
+            for (const auto& ref : AssetRefsForContext(ctx)) {
                 if (ref.guidHigh == guid.high && ref.guidLow == guid.low) {
                     meshBinPath = ctx.ReadString(ref.pathOffset);
                     // Ensure .meshbin extension
@@ -957,7 +1235,10 @@ bool EntityBinaryLoader::ResolveMeshReferencesRange(LoadContext& ctx,
         bool skinned = false;
         
         try {
-            auto mesh = MeshBinaryLoader::LoadMesh(meshBinPath, submeshIndex, &skinned);
+            const bool canShareCachedMesh = !SceneMeshNeedsUniqueInstance(scene, *data);
+            auto mesh = canShareCachedMesh
+                ? MeshCache::GetOrLoadMesh(meshBinPath, submeshIndex, &skinned)
+                : MeshBinaryLoader::LoadMesh(meshBinPath, submeshIndex, &skinned);
             if (mesh) {
                 mc.mesh = mesh;
                 meshesLoaded++;
@@ -1023,47 +1304,13 @@ bool EntityBinaryLoader::LoadHeader(LoadContext& ctx, SceneBinaryHeader& header)
 }
 
 bool EntityBinaryLoader::LoadStringTable(LoadContext& ctx, const SceneBinaryHeader& header) {
-    if (header.stringTableOffset == 0) {
-        return true; // No string table
-    }
-    
-    ctx.pos = header.stringTableOffset;
-    
-    uint32_t stringCount = 0;
-    if (!ctx.Read(stringCount)) return false;
-    
-    ctx.strings.reserve(stringCount);
-    
-    for (uint32_t i = 0; i < stringCount; ++i) {
-        uint32_t len = 0;
-        if (!ctx.Read(len)) return false;
-        
-        std::string str;
-        str.resize(len);
-        if (len > 0 && !ctx.Read(str.data(), len)) return false;
-        
-        ctx.strings.push_back(std::move(str));
-    }
-    
-    return true;
+    ctx.stringView = nullptr;
+    return ReadStringTableInto(ctx, header, ctx.strings);
 }
 
 bool EntityBinaryLoader::LoadAssetRefTable(LoadContext& ctx, const SceneBinaryHeader& header) {
-    if (header.assetRefTableOffset == 0) {
-        return true; // No asset refs
-    }
-    
-    ctx.pos = header.assetRefTableOffset;
-    
-    uint32_t refCount = 0;
-    if (!ctx.Read(refCount)) return false;
-    
-    ctx.assetRefs.resize(refCount);
-    for (uint32_t i = 0; i < refCount; ++i) {
-        if (!ctx.Read(ctx.assetRefs[i])) return false;
-    }
-    
-    return true;
+    ctx.assetRefView = nullptr;
+    return ReadAssetRefsInto(ctx, header, ctx.assetRefs);
 }
 
 bool EntityBinaryLoader::LoadSingleEntity(LoadContext& ctx,
@@ -1092,11 +1339,17 @@ bool EntityBinaryLoader::LoadSingleEntity(LoadContext& ctx,
     std::string tag;
     if (header.base.version >= 5) {
         if (!ctx.Read(layer)) return false;
-        uint32_t tagLen = 0;
-        if (!ctx.Read(tagLen)) return false;
-        if (tagLen > 0) {
-            tag.resize(tagLen);
-            if (!ctx.Read(tag.data(), tagLen)) return false;
+        if (header.base.version >= kSceneEntityTagStringTableVersion) {
+            uint32_t tagIndex = 0;
+            if (!ctx.Read(tagIndex)) return false;
+            tag = ctx.ReadString(tagIndex);
+        } else {
+            uint32_t tagLen = 0;
+            if (!ctx.Read(tagLen)) return false;
+            if (tagLen > 0) {
+                tag.resize(tagLen);
+                if (!ctx.Read(tag.data(), tagLen)) return false;
+            }
         }
     }
     
@@ -1161,6 +1414,100 @@ bool EntityBinaryLoader::LoadSingleEntity(LoadContext& ctx,
         return false;
     }
     
+    return true;
+}
+
+bool EntityBinaryLoader::LoadSinglePreparedEntity(LoadContext& ctx,
+                                                  const PreparedEntityRecord& record,
+                                                  Scene& scene,
+                                                  std::vector<std::pair<EntityID, EntityID>>& parentRelationships,
+                                                  std::unordered_map<EntityID, EntityID>& oldToNewIdMap,
+                                                  std::vector<EntityID>& outEntityOrder) {
+    std::string name = ctx.ReadString(record.nameIndex);
+    Entity entity = scene.CreateEntityExact(name);
+    EntityID newId = entity.GetID();
+    outEntityOrder.push_back(newId);
+
+    oldToNewIdMap[static_cast<EntityID>(record.entityId)] = newId;
+
+    EntityData* data = scene.GetEntityData(newId);
+    if (!data) {
+        return true;
+    }
+
+    if (record.parentId != 0 && record.parentId != 0xFFFFFFFFu) {
+        parentRelationships.emplace_back(newId, static_cast<EntityID>(record.parentId));
+    }
+
+    data->EntityGuid.high = record.guidHigh;
+    data->EntityGuid.low = record.guidLow;
+
+    if (record.modelGuidHigh != 0 || record.modelGuidLow != 0) {
+        data->ModelAssetGuid.high = record.modelGuidHigh;
+        data->ModelAssetGuid.low = record.modelGuidLow;
+    }
+
+    data->Active = (record.flags & 0x01) != 0;
+    data->Visible = (record.flags & 0x02) != 0;
+    data->Layer = record.layer;
+    data->Tag = (record.tagIndex != 0xFFFFFFFFu) ? ctx.ReadString(record.tagIndex) : record.legacyTag;
+
+    ctx.pos = record.componentOffset;
+
+    bool anyComponentFailed = false;
+    for (uint32_t c = 0; c < record.componentCount; ++c) {
+        ComponentEntry entry;
+        if (!ctx.Read(entry)) {
+            return false;
+        }
+
+        if (!LoadComponent(ctx, entry, scene, newId)) {
+            std::cerr << "[EntityBinaryLoader] Failed to load component type "
+                      << static_cast<int>(entry.typeId) << std::endl;
+            anyComponentFailed = true;
+        }
+    }
+
+    return !anyComponentFailed;
+}
+
+bool EntityBinaryLoader::LoadPreparedEntities(LoadContext& ctx,
+                                              const SceneBinaryHeader& header,
+                                              const std::vector<PreparedEntityRecord>& records,
+                                              Scene& scene) {
+    if (records.size() != header.entityCount) {
+        std::cerr << "[EntityBinaryLoader] Prepared entity count mismatch" << std::endl;
+        return false;
+    }
+
+    std::vector<std::pair<EntityID, EntityID>> parentRelationships;
+    parentRelationships.reserve(records.size());
+
+    std::unordered_map<EntityID, EntityID> oldToNewIdMap;
+    oldToNewIdMap.reserve(records.size());
+
+    std::vector<EntityID> entityOrder;
+    entityOrder.reserve(records.size());
+
+    for (const PreparedEntityRecord& record : records) {
+        if (!LoadSinglePreparedEntity(ctx, record, scene,
+                                      parentRelationships, oldToNewIdMap, entityOrder)) {
+            return false;
+        }
+    }
+
+    for (const auto& [childId, oldParentId] : parentRelationships) {
+        auto it = oldToNewIdMap.find(oldParentId);
+        if (it != oldToNewIdMap.end()) {
+            scene.SetParent(childId, it->second);
+        } else {
+            std::cerr << "[EntityBinaryLoader] Could not find parent entity mapping for old ID: "
+                      << oldParentId << std::endl;
+        }
+    }
+
+    RemapEntityReferences(scene, oldToNewIdMap);
+
     return true;
 }
 
@@ -1535,7 +1882,7 @@ bool LoadComponentBinary(ComponentLoadContext& ctx, EntityData* data, ComponentT
                             for (const auto& [samplerName, path] : serializedTextures) {
                                 texPaths[samplerName] = path;
                             }
-                            RebuildPropertyBlockTexturesFromPaths(data->Mesh->SlotPropertyBlocks[i], texPaths);
+                            RebuildPropertyBlockTexturesFromPathsLocal(data->Mesh->SlotPropertyBlocks[i], texPaths);
                         }
                     }
                 }
@@ -1577,7 +1924,7 @@ bool LoadComponentBinary(ComponentLoadContext& ctx, EntityData* data, ComponentT
                         for (const auto& [samplerName, path] : serializedMeshTextures) {
                             data->Mesh->PropertyBlockTexturePaths[samplerName] = path;
                         }
-                        RebuildPropertyBlockTexturesFromPaths(
+                        RebuildPropertyBlockTexturesFromPathsLocal(
                             data->Mesh->PropertyBlock,
                             data->Mesh->PropertyBlockTexturePaths);
                     }
@@ -1596,6 +1943,18 @@ bool LoadComponentBinary(ComponentLoadContext& ctx, EntityData* data, ComponentT
                 data->Light->Type = static_cast<LightType>(type);
                 data->Light->Color = glm::vec3(color[0], color[1], color[2]);
                 data->Light->Intensity = intensity;
+                constexpr uint32_t kLegacyLightSize =
+                    sizeof(uint32_t) + sizeof(float) * 4;
+                constexpr uint32_t kExtendedLightSize =
+                    kLegacyLightSize + sizeof(float) * 3;
+                if (dataSize >= kExtendedLightSize) {
+                    ctx.Read(data->Light->Range);
+                    ctx.Read(data->Light->SpotInnerAngleDegrees);
+                    ctx.Read(data->Light->SpotOuterAngleDegrees);
+                    if (data->Light->SpotOuterAngleDegrees < data->Light->SpotInnerAngleDegrees) {
+                        data->Light->SpotOuterAngleDegrees = data->Light->SpotInnerAngleDegrees;
+                    }
+                }
                 // Optional in newer binary formats; defaults to false for older assets.
                 if (dataSize == 0 || (ctx.pos - componentStart) < dataSize) {
                     uint8_t pointShadowsEnabled = 0;
@@ -2045,7 +2404,17 @@ bool LoadComponentBinary(ComponentLoadContext& ctx, EntityData* data, ComponentT
                 data->CharacterController->PhysicsLayerName = ctx.ReadString(layerNameIdx);
                 int32_t idx = PhysicsLayers::PhysicsLayerManager::Get().GetLayerIndex(data->CharacterController->PhysicsLayerName);
                 data->CharacterController->PhysicsLayer = (idx >= 0) ? static_cast<uint32_t>(idx) : 1; // Default Player layer
-                std::cout << "[EntityBinaryLoader] Loaded CharacterController: radius=" << radius 
+                // Optional trailing CollisionMask (added after initial format). Guard on component
+                // size so older binaries without the field still load with the default mask.
+                constexpr uint32_t kCharacterControllerSizeWithCollisionMask =
+                    sizeof(float) * 10u + sizeof(uint8_t) * 2u + sizeof(uint32_t) + sizeof(uint32_t);
+                if (dataSize >= kCharacterControllerSizeWithCollisionMask) {
+                    uint32_t collisionMask = data->CharacterController->CollisionMask;
+                    if (ctx.Read(collisionMask)) {
+                        data->CharacterController->CollisionMask = collisionMask;
+                    }
+                }
+                std::cout << "[EntityBinaryLoader] Loaded CharacterController: radius=" << radius
                           << ", height=" << height << std::endl;
             }
             break;
@@ -4943,7 +5312,48 @@ void EntityBinaryLoader::LoadEnvironment(LoadContext& ctx, const SceneBinaryHead
     ctx.Read(env.OutlineColor.y);
     ctx.Read(env.OutlineColor.z);
     ctx.Read(env.OutlineThickness);
-    
+    if (header.base.version >= 32) {
+        uint32_t textureFilter = 0;
+        uint32_t textureMaxDimension = 0;
+        uint32_t renderResolutionWidth = 0;
+        uint32_t renderResolutionHeight = 0;
+        ctx.Read(textureFilter);
+        ctx.Read(textureMaxDimension);
+        ctx.Read(renderResolutionWidth);
+        ctx.Read(renderResolutionHeight);
+        if (textureFilter == static_cast<uint32_t>(Environment::TextureFilterMode::Point)) {
+            env.TextureFilter = Environment::TextureFilterMode::Point;
+        } else if (textureFilter == static_cast<uint32_t>(Environment::TextureFilterMode::Anisotropic)) {
+            env.TextureFilter = Environment::TextureFilterMode::Anisotropic;
+        } else {
+            env.TextureFilter = Environment::TextureFilterMode::Linear;
+        }
+        env.TextureMaxDimension = static_cast<uint16_t>(textureMaxDimension);
+        env.RenderResolutionWidth = static_cast<uint16_t>(renderResolutionWidth);
+        env.RenderResolutionHeight = static_cast<uint16_t>(renderResolutionHeight);
+    }
+    if (header.base.version >= 33) {
+        uint8_t useSkybox = 0;
+        uint8_t useSkyboxEquirectangular = 0;
+        uint32_t equirectPathIdx = 0;
+        uint32_t equirectResolution = 0;
+        ctx.Read(useSkybox);
+        ctx.Read(useSkyboxEquirectangular);
+        ctx.Read(equirectPathIdx);
+        ctx.Read(equirectResolution);
+        env.UseSkybox = useSkybox != 0;
+        env.UseSkyboxEquirectangular = useSkyboxEquirectangular != 0;
+        env.SkyboxEquirectangularPath = ctx.ReadString(equirectPathIdx);
+        env.SkyboxEquirectangularResolution = static_cast<uint16_t>(equirectResolution);
+        for (std::string& facePath : env.SkyboxFacePaths) {
+            uint32_t facePathIdx = 0;
+            ctx.Read(facePathIdx);
+            facePath = ctx.ReadString(facePathIdx);
+        }
+    }
+    env.SkyboxTexture.reset();
+    env.SkyboxRuntimeCacheKey.clear();
+
     std::cout << "[EntityBinaryLoader] Loaded environment data (" << header.environmentSize << " bytes)" << std::endl;
     std::cout << "[EntityBinaryLoader]   ProceduralSky: " << (env.ProceduralSky ? "true" : "false") << std::endl;
     std::cout << "[EntityBinaryLoader]   ShadowsEnabled: " << (env.ShadowsEnabled ? "true" : "false") << std::endl;
@@ -4957,7 +5367,7 @@ static std::shared_ptr<Material> CreateMaterialFromInlineData(const binary::Inli
         auto it = s_inlineMaterialCache.find(cacheKey);
         if (it != s_inlineMaterialCache.end()) {
             if (auto existing = it->second.lock()) {
-                return CloneOwnedInlineMaterial(existing);
+                return ShareEquivalentMaterial(existing);
             }
             s_inlineMaterialCache.erase(it);
         }
@@ -5002,8 +5412,11 @@ static std::shared_ptr<Material> CreateMaterialFromInlineData(const binary::Inli
         mat->SetUniform("u_ColorTint", inl.tint);
     }
     
-    // Set PSX-specific uniforms
+    // Set PSX-specific uniforms. Seed the full PSX uniform set first so every
+    // PSX uniform (posterize, shadow params, emission) exists on the material —
+    // property-block overrides only bind for uniforms the material owns.
     if (inl.materialType == binary::InlineMaterialType::PSX) {
+        MaterialManager::InitializePSXUniformDefaults(*mat, skinned);
         mat->SetUniform("u_psxParams", inl.psxParams);
         mat->SetUniform("u_psxWorld", inl.psxWorld);
         mat->SetUniform("u_toonParams", inl.toonParams);
@@ -5043,11 +5456,12 @@ static std::shared_ptr<Material> CreateMaterialFromInlineData(const binary::Inli
         mat->SetReceiveShadows(inl.receiveShadows);
     }
     
+    std::shared_ptr<Material> shared = ShareEquivalentMaterial(mat);
     {
         std::lock_guard<std::mutex> lock(s_inlineMaterialCacheMutex);
-        s_inlineMaterialCache[cacheKey] = mat;
+        s_inlineMaterialCache[cacheKey] = shared;
     }
-    return CloneOwnedInlineMaterial(mat);
+    return shared;
 }
 
 // Helper to create a RuntimeShaderGraphMaterial from shader graph data
@@ -5197,23 +5611,6 @@ bool EntityBinaryLoader::ResolveMaterialReferencesRange(LoadContext& ctx,
                     materialsLoaded++;
                     std::cout << "[EntityBinaryLoader]   -> Loaded successfully" << std::endl;
                 } else {
-#if defined(CLAYMORE_EDITOR)
-                    if (TryEnsureBinaryForPlayMode(matPath)) {
-                        std::string compiledPath = BinaryAssetCache::Instance().GetBinaryPath(matPath);
-                        if (!compiledPath.empty()) {
-                            auto compiledMaterial = MaterialBinaryLoader::Load(compiledPath, needsSkinned);
-                            if (compiledMaterial) {
-                                mc.materials[i] = compiledMaterial;
-                                if (i == 0 && !mc.material) {
-                                    mc.material = mc.materials[i];
-                                }
-                                materialsLoaded++;
-                                std::cout << "[EntityBinaryLoader]   -> Compiled and loaded: " << compiledPath << std::endl;
-                                continue;
-                            }
-                        }
-                    }
-#endif
                     std::cerr << "[EntityBinaryLoader]   -> FAILED to load: " << matBinPath << std::endl;
                     materialsFailed++;
                 }
@@ -5238,7 +5635,7 @@ bool EntityBinaryLoader::ResolveMaterialReferencesRange(LoadContext& ctx,
             }
             
             for (const auto& sg : mc.ShaderGraphMaterials) {
-                auto mat = CreateShaderGraphMaterial(sg);
+                auto mat = ShareEquivalentMaterial(CreateShaderGraphMaterial(sg));
                 if (mat) {
                     if (sg.slotIndex >= mc.materials.size()) {
                         mc.materials.resize(sg.slotIndex + 1);
@@ -5247,7 +5644,7 @@ bool EntityBinaryLoader::ResolveMaterialReferencesRange(LoadContext& ctx,
                         mc.OwnedMaterialSlots.resize(sg.slotIndex + 1, false);
                     }
                     mc.materials[sg.slotIndex] = mat;
-                    mc.OwnedMaterialSlots[sg.slotIndex] = true;
+                    mc.OwnedMaterialSlots[sg.slotIndex] = !IsEquivalentMaterialShared(mat);
                     
                     if (sg.slotIndex == 0 || !mc.material) {
                         mc.material = mat;
@@ -5286,7 +5683,7 @@ bool EntityBinaryLoader::ResolveMaterialReferencesRange(LoadContext& ctx,
                         mc.OwnedMaterialSlots.resize(inl.slotIndex + 1, false);
                     }
                     mc.materials[inl.slotIndex] = mat;
-                    mc.OwnedMaterialSlots[inl.slotIndex] = true;
+                    mc.OwnedMaterialSlots[inl.slotIndex] = !IsEquivalentMaterialShared(mat);
                     
                     if (inl.slotIndex == 0 || !mc.material) {
                         mc.material = mat;
@@ -5395,6 +5792,9 @@ void EntityBinaryLoader::FixupAnimationComponents(Scene& scene) {
     
     int fixedCount = 0;
     
+    std::unordered_map<EntityID, std::vector<EntityID>> childrenByParent;
+    childrenByParent.reserve(scene.GetEntities().size());
+
     // Debug: Count entities with AnimationPlayer and Skeleton before fixup
     int apCount = 0, skelCount = 0, bothCount = 0;
     for (const Entity& e : scene.GetEntities()) {
@@ -5403,6 +5803,9 @@ void EntityBinaryLoader::FixupAnimationComponents(Scene& scene) {
         if (data->AnimationPlayer) apCount++;
         if (data->Skeleton) skelCount++;
         if (data->AnimationPlayer && data->Skeleton) bothCount++;
+        if (data->Parent != INVALID_ENTITY_ID) {
+            childrenByParent[data->Parent].push_back(e.GetID());
+        }
     }
     std::cout << "[EntityBinaryLoader] FixupAnimation: " << apCount << " entities with AnimationPlayer, "
               << skelCount << " with Skeleton, " << bothCount << " with both" << std::endl;
@@ -5486,18 +5889,22 @@ void EntityBinaryLoader::FixupAnimationComponents(Scene& scene) {
         // This entity has AnimationPlayer but no Skeleton
         // Find a child entity with Skeleton and move/copy AnimationPlayer there
         std::function<EntityID(EntityID)> findSkeletonChild = [&](EntityID parentId) -> EntityID {
-            for (const Entity& child : scene.GetEntities()) {
-                EntityData* childData = scene.GetEntityData(child.GetID());
+            auto childrenIt = childrenByParent.find(parentId);
+            if (childrenIt == childrenByParent.end()) {
+                return 0;
+            }
+
+            for (EntityID childId : childrenIt->second) {
+                EntityData* childData = scene.GetEntityData(childId);
                 if (!childData) continue;
-                if (childData->Parent != parentId) continue;
                 
                 if (childData->Skeleton) {
                     std::cout << "[EntityBinaryLoader]   Found skeleton on child '" << childData->Name << "'" << std::endl;
-                    return child.GetID();
+                    return childId;
                 }
                 
                 // Recursively search children
-                EntityID found = findSkeletonChild(child.GetID());
+                EntityID found = findSkeletonChild(childId);
                 if (found != 0) return found;
             }
             return 0;

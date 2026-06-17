@@ -24,12 +24,16 @@ namespace ClaymoreEngine
         // Native: const char* GetAssetNameByGuid(ulong hi, ulong lo)
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate IntPtr GetAssetNameByGuidFn(ulong hi, ulong lo);
 
+        // Native: int PreloadPrefabByGuid(ulong hi, ulong lo)
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int PreloadPrefabFn(ulong hi, ulong lo);
+
         // Bound by native during startup
         public static InstantiatePrefabFn? Instantiate;
         public static InstantiatePrefabBlockingFn? InstantiateBlocking;
         public static InstantiatePrefabWithRootFn? InstantiateWithRoot;
         public static GetAsyncStatusFn? GetAsyncStatus;
         public static GetAssetNameByGuidFn? GetAssetNameByGuid;
+        public static PreloadPrefabFn? Preload;
 
         public static void InitializeInteropExport(IntPtr* ptrs, int count) => InitializeInterop(ptrs, count);
 
@@ -49,6 +53,7 @@ namespace ClaymoreEngine
                 if (count > i) GetAsyncStatus = Marshal.GetDelegateForFunctionPointer<GetAsyncStatusFn>(ptrs[i++]);
                 if (count > i) GetAssetNameByGuid = Marshal.GetDelegateForFunctionPointer<GetAssetNameByGuidFn>(ptrs[i++]);
                 if (count > i) InstantiateWithRoot = Marshal.GetDelegateForFunctionPointer<InstantiatePrefabWithRootFn>(ptrs[i++]);
+                if (count > i) Preload = Marshal.GetDelegateForFunctionPointer<PreloadPrefabFn>(ptrs[i++]);
                 Console.WriteLine($"[Managed] PrefabInterop delegates initialized ({i} functions).");
             }
             catch (Exception ex)

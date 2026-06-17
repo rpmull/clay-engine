@@ -106,6 +106,9 @@ namespace CommonProperties {
     extern PropertyID PSXParams;
     extern PropertyID PSXWorld;
     extern PropertyID ToonParams;
+    extern PropertyID Posterize;
+    extern PropertyID PSXShadowParams;
+    extern PropertyID PSXEmission;
     
     void Initialize();
 }

@@ -8,6 +8,7 @@
 #include "core/rendering/MaterialCache.h"
 #include "core/rendering/RuntimeShaderGraphMaterial.h"
 #include "core/serialization/EntityBinaryLoader.h"
+#include "core/serialization/MeshCache.h"
 #include "core/serialization/MaterialCache.h"
 #include "core/rendering/ShaderManager.h"
 #include "core/ecs/UIComponents.h"
@@ -19,11 +20,15 @@
 #include "core/animation/AnimationAssetCache.h"
 #include "core/particles/SpriteLoader.h"
 #include "core/dialogue/DialogueLibrary.h"
+#include "core/prefab/RuntimePrefabInstantiator.h"
 
 #include <chrono>
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <unordered_set>
 
@@ -126,6 +131,11 @@ struct MaterialPrewarmJob {
     bool skinned = false;
 };
 
+struct MeshPrewarmJob {
+    std::string path;
+    uint32_t submeshIndex = 0;
+};
+
 struct ShaderProgramJob {
     std::string vs;
     std::string fs;
@@ -138,8 +148,14 @@ public:
     void QueueScenePrefabs(Scene& scene);
     void QueuePrefabGuid(const ClaymoreGUID& guid);
     void Update(double budgetMs);
+    bool HasPendingWork();
+    float GetProgress();
 
 private:
+    size_t GetPendingWorkCountUnlocked() const;
+    void MarkQueuedWorkUnlocked();
+    void MarkCompletedWork();
+
     bool m_Enabled = true;
     std::mutex m_Mutex;
     std::deque<ClaymoreGUID> m_PrefabQueue;
@@ -148,6 +164,8 @@ private:
     std::unordered_set<ClaymoreGUID, ClaymoreGUIDHasher> m_DialogueQueued;
     std::deque<std::string> m_TextureQueue;
     std::unordered_set<std::string> m_TextureQueued;
+    std::deque<MeshPrewarmJob> m_MeshQueue;
+    std::unordered_set<std::string> m_MeshQueued;
     std::deque<MaterialPrewarmJob> m_MaterialQueue;
     std::unordered_set<std::string> m_MaterialQueued;
     std::deque<ShaderProgramJob> m_ShaderQueue;
@@ -160,17 +178,23 @@ private:
     std::unordered_set<std::string> m_AnimAssetQueued;
     std::deque<std::string> m_ParticleSpriteQueue;
     std::unordered_set<std::string> m_ParticleSpriteQueued;
+    size_t m_TotalQueuedWork = 0;
+    size_t m_TotalCompletedWork = 0;
     
     void CollectPrefabDependencies(const std::vector<uint8_t>& data);
     void CollectDependenciesFromEntity(const EntityData& data);
     void QueueDialogueLibrary(const ClaymoreGUID& guid);
     void QueueTexture(const std::string& path);
+    void QueueMesh(const std::string& path, uint32_t submeshIndex);
     void QueueMaterial(const std::string& path, bool skinned);
     void QueueShaderProgram(const std::string& vs, const std::string& fs);
     void QueueAnimationController(const std::string& path);
     void QueueAnimationControllerOverride(const std::string& path);
     void QueueAnimationAsset(const std::string& path);
     void QueueParticleSprite(const std::string& path);
+    void QueueSerializedScriptValue(const PropertyValue& value);
+    void QueueSerializedScriptString(const std::string& value);
+    void QueueResourcePathByExtension(const std::string& path, const ClaymoreGUID* guidHint);
     static std::string ResolveGuidToMeshPath(const ClaymoreGUID& guid);
 };
 
@@ -187,6 +211,8 @@ void PrefabPrewarmManager::Clear() {
     m_DialogueQueued.clear();
     m_TextureQueue.clear();
     m_TextureQueued.clear();
+    m_MeshQueue.clear();
+    m_MeshQueued.clear();
     m_MaterialQueue.clear();
     m_MaterialQueued.clear();
     m_ShaderQueue.clear();
@@ -199,6 +225,50 @@ void PrefabPrewarmManager::Clear() {
     m_AnimAssetQueued.clear();
     m_ParticleSpriteQueue.clear();
     m_ParticleSpriteQueued.clear();
+    m_TotalQueuedWork = 0;
+    m_TotalCompletedWork = 0;
+}
+
+size_t PrefabPrewarmManager::GetPendingWorkCountUnlocked() const {
+    return m_PrefabQueue.size() +
+           m_DialogueQueue.size() +
+           m_TextureQueue.size() +
+           m_MeshQueue.size() +
+           m_MaterialQueue.size() +
+           m_ShaderQueue.size() +
+           m_AnimControllerQueue.size() +
+           m_AnimOverrideQueue.size() +
+           m_AnimAssetQueue.size() +
+           m_ParticleSpriteQueue.size();
+}
+
+void PrefabPrewarmManager::MarkQueuedWorkUnlocked() {
+    ++m_TotalQueuedWork;
+}
+
+void PrefabPrewarmManager::MarkCompletedWork() {
+    std::lock_guard<std::mutex> lock(m_Mutex);
+    ++m_TotalCompletedWork;
+}
+
+bool PrefabPrewarmManager::HasPendingWork() {
+    std::lock_guard<std::mutex> lock(m_Mutex);
+    return GetPendingWorkCountUnlocked() > 0;
+}
+
+float PrefabPrewarmManager::GetProgress() {
+    std::lock_guard<std::mutex> lock(m_Mutex);
+    const size_t pending = GetPendingWorkCountUnlocked();
+    if (pending == 0) {
+        return 1.0f;
+    }
+
+    const size_t total = std::max(m_TotalQueuedWork, m_TotalCompletedWork + pending);
+    if (total == 0) {
+        return 0.0f;
+    }
+
+    return std::clamp(static_cast<float>(m_TotalCompletedWork) / static_cast<float>(total), 0.0f, 1.0f);
 }
 
 void PrefabPrewarmManager::QueueScenePrefabs(Scene& scene) {
@@ -209,101 +279,7 @@ void PrefabPrewarmManager::QueueScenePrefabs(Scene& scene) {
     for (const auto& entity : entities) {
         EntityData* data = scene.GetEntityData(entity.GetID());
         if (!data) continue;
-        
-        for (const auto& script : data->Scripts) {
-            if (!ScriptReflection::HasProperties(script.ClassName)) continue;
-            const auto& props = ScriptReflection::GetScriptProperties(script.ClassName);
-            
-            for (const auto& prop : props) {
-                if (prop.type == PropertyType::Prefab) {
-                    auto it = script.Values.find(prop.name);
-                    if (it != script.Values.end() && std::holds_alternative<std::string>(it->second)) {
-                        std::string guidStr = std::get<std::string>(it->second);
-                        if (!guidStr.empty()) {
-                            QueuePrefabGuid(ClaymoreGUID::FromString(guidStr));
-                        }
-                    } else if (std::holds_alternative<std::string>(prop.currentValue)) {
-                        std::string guidStr = std::get<std::string>(prop.currentValue);
-                        if (!guidStr.empty()) {
-                            QueuePrefabGuid(ClaymoreGUID::FromString(guidStr));
-                        }
-                    }
-                } else if (prop.type == PropertyType::DialogueLibrary) {
-                    auto it = script.Values.find(prop.name);
-                    if (it != script.Values.end() && std::holds_alternative<std::string>(it->second)) {
-                        std::string guidStr = std::get<std::string>(it->second);
-                        if (!guidStr.empty()) {
-                            QueueDialogueLibrary(ClaymoreGUID::FromString(guidStr));
-                        }
-                    } else if (std::holds_alternative<std::string>(prop.currentValue)) {
-                        std::string guidStr = std::get<std::string>(prop.currentValue);
-                        if (!guidStr.empty()) {
-                            QueueDialogueLibrary(ClaymoreGUID::FromString(guidStr));
-                        }
-                    }
-                } else if (prop.type == PropertyType::AnimatorController) {
-                    auto it = script.Values.find(prop.name);
-                    if (it != script.Values.end() && std::holds_alternative<std::string>(it->second)) {
-                        std::string path = std::get<std::string>(it->second);
-                        if (!path.empty()) {
-                            QueueAnimationController(path);
-                        }
-                    } else if (std::holds_alternative<std::string>(prop.currentValue)) {
-                        std::string path = std::get<std::string>(prop.currentValue);
-                        if (!path.empty()) {
-                            QueueAnimationController(path);
-                        }
-                    }
-                } else if (prop.type == PropertyType::AnimatorControllerOverride) {
-                    auto it = script.Values.find(prop.name);
-                    if (it != script.Values.end() && std::holds_alternative<std::string>(it->second)) {
-                        std::string path = std::get<std::string>(it->second);
-                        if (!path.empty()) {
-                            QueueAnimationControllerOverride(path);
-                        }
-                    } else if (std::holds_alternative<std::string>(prop.currentValue)) {
-                        std::string path = std::get<std::string>(prop.currentValue);
-                        if (!path.empty()) {
-                            QueueAnimationControllerOverride(path);
-                        }
-                    }
-                } else if (prop.type == PropertyType::List &&
-                           (prop.listElementType == PropertyType::Prefab ||
-                            prop.listElementType == PropertyType::DialogueLibrary ||
-                            prop.listElementType == PropertyType::AnimatorController ||
-                            prop.listElementType == PropertyType::AnimatorControllerOverride)) {
-                    auto it = script.Values.find(prop.name);
-                    if (it == script.Values.end()) continue;
-                    if (!std::holds_alternative<std::shared_ptr<ListPropertyValue>>(it->second)) continue;
-                    auto listPtr = std::get<std::shared_ptr<ListPropertyValue>>(it->second);
-                    if (!listPtr) continue;
-                    if (listPtr->elementType != prop.listElementType) continue;
-                    
-                    for (const auto& element : listPtr->elements) {
-                        if (std::holds_alternative<std::string>(element)) {
-                            std::string value = std::get<std::string>(element);
-                            if (value.empty()) continue;
-                            switch (prop.listElementType) {
-                                case PropertyType::Prefab:
-                                    QueuePrefabGuid(ClaymoreGUID::FromString(value));
-                                    break;
-                                case PropertyType::DialogueLibrary:
-                                    QueueDialogueLibrary(ClaymoreGUID::FromString(value));
-                                    break;
-                                case PropertyType::AnimatorController:
-                                    QueueAnimationController(value);
-                                    break;
-                                case PropertyType::AnimatorControllerOverride:
-                                    QueueAnimationControllerOverride(value);
-                                    break;
-                                default:
-                                    break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        CollectDependenciesFromEntity(*data);
     }
 }
 
@@ -315,6 +291,7 @@ void PrefabPrewarmManager::QueuePrefabGuid(const ClaymoreGUID& guid) {
     std::lock_guard<std::mutex> lock(m_Mutex);
     if (m_PrefabQueued.insert(guid).second) {
         m_PrefabQueue.push_back(guid);
+        MarkQueuedWorkUnlocked();
     }
 }
 
@@ -325,6 +302,27 @@ void PrefabPrewarmManager::QueueTexture(const std::string& path) {
     std::lock_guard<std::mutex> lock(m_Mutex);
     if (m_TextureQueued.insert(resolved).second) {
         m_TextureQueue.push_back(resolved);
+        MarkQueuedWorkUnlocked();
+    }
+}
+
+void PrefabPrewarmManager::QueueMesh(const std::string& path, uint32_t submeshIndex) {
+    if (path.empty()) return;
+
+    std::string resolved = Assets::ResolvePath(path);
+    if (resolved.empty()) resolved = path;
+
+    std::filesystem::path p(resolved);
+    if (p.extension() != ".meshbin") {
+        p.replace_extension(".meshbin");
+        resolved = p.string();
+    }
+
+    const std::string key = resolved + ":" + std::to_string(submeshIndex);
+    std::lock_guard<std::mutex> lock(m_Mutex);
+    if (m_MeshQueued.insert(key).second) {
+        m_MeshQueue.push_back({ resolved, submeshIndex });
+        MarkQueuedWorkUnlocked();
     }
 }
 
@@ -343,6 +341,7 @@ void PrefabPrewarmManager::QueueMaterial(const std::string& path, bool skinned) 
     std::lock_guard<std::mutex> lock(m_Mutex);
     if (m_MaterialQueued.insert(key).second) {
         m_MaterialQueue.push_back({resolved, skinned});
+        MarkQueuedWorkUnlocked();
     }
 }
 
@@ -352,6 +351,7 @@ void PrefabPrewarmManager::QueueShaderProgram(const std::string& vs, const std::
     std::lock_guard<std::mutex> lock(m_Mutex);
     if (m_ShaderQueued.insert(key).second) {
         m_ShaderQueue.push_back({vs, fs});
+        MarkQueuedWorkUnlocked();
     }
 }
 
@@ -360,6 +360,7 @@ void PrefabPrewarmManager::QueueDialogueLibrary(const ClaymoreGUID& guid) {
     std::lock_guard<std::mutex> lock(m_Mutex);
     if (m_DialogueQueued.insert(guid).second) {
         m_DialogueQueue.push_back(guid);
+        MarkQueuedWorkUnlocked();
     }
 }
 
@@ -370,6 +371,7 @@ void PrefabPrewarmManager::QueueAnimationController(const std::string& path) {
     std::lock_guard<std::mutex> lock(m_Mutex);
     if (m_AnimControllerQueued.insert(resolved).second) {
         m_AnimControllerQueue.push_back(resolved);
+        MarkQueuedWorkUnlocked();
     }
 }
 
@@ -380,6 +382,7 @@ void PrefabPrewarmManager::QueueAnimationControllerOverride(const std::string& p
     std::lock_guard<std::mutex> lock(m_Mutex);
     if (m_AnimOverrideQueued.insert(resolved).second) {
         m_AnimOverrideQueue.push_back(resolved);
+        MarkQueuedWorkUnlocked();
     }
 }
 
@@ -390,6 +393,7 @@ void PrefabPrewarmManager::QueueAnimationAsset(const std::string& path) {
     std::lock_guard<std::mutex> lock(m_Mutex);
     if (m_AnimAssetQueued.insert(resolved).second) {
         m_AnimAssetQueue.push_back(resolved);
+        MarkQueuedWorkUnlocked();
     }
 }
 
@@ -402,6 +406,7 @@ void PrefabPrewarmManager::QueueParticleSprite(const std::string& path) {
     std::lock_guard<std::mutex> lock(m_Mutex);
     if (m_ParticleSpriteQueued.insert(key).second) {
         m_ParticleSpriteQueue.push_back(resolved);
+        MarkQueuedWorkUnlocked();
     }
 }
 
@@ -421,11 +426,205 @@ std::string PrefabPrewarmManager::ResolveGuidToMeshPath(const ClaymoreGUID& guid
     return "";
 }
 
+static std::string TrimCopy(const std::string& value) {
+    const auto first = std::find_if_not(value.begin(), value.end(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    });
+    if (first == value.end()) {
+        return {};
+    }
+    const auto last = std::find_if_not(value.rbegin(), value.rend(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    }).base();
+    return std::string(first, last);
+}
+
+static std::string LowerExtension(const std::string& path) {
+    std::string ext = std::filesystem::path(path).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return ext;
+}
+
+static std::string LowerSlashed(std::string value) {
+    for (char& ch : value) {
+        if (ch == '\\') {
+            ch = '/';
+        } else {
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        }
+    }
+    return value;
+}
+
+static bool LooksLikeGuidToken(const std::string& value, std::string& outGuid) {
+    std::string token = TrimCopy(value);
+    const size_t colon = token.find(':');
+    if (colon != std::string::npos) {
+        token = token.substr(0, colon);
+    }
+    if (token.size() != 32) {
+        return false;
+    }
+    for (char ch : token) {
+        if (!std::isxdigit(static_cast<unsigned char>(ch))) {
+            return false;
+        }
+    }
+    outGuid = token;
+    return true;
+}
+
+static bool IsTextureAssetExtension(const std::string& ext) {
+    return ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" ||
+           ext == ".bmp" || ext == ".hdr" || ext == ".dds" || ext == ".ktx" ||
+           ext == ".ktx2" || ext == ".webp";
+}
+
+void PrefabPrewarmManager::QueueResourcePathByExtension(const std::string& path,
+                                                        const ClaymoreGUID* guidHint) {
+    if (path.empty()) {
+        return;
+    }
+
+    const std::string ext = LowerExtension(path);
+    const std::string normalized = LowerSlashed(path);
+    const bool isPrefabPath = ext == ".prefab" || ext == ".prefabb" ||
+        (ext == ".json" && normalized.find("assets/prefabs/") != std::string::npos);
+
+    if (isPrefabPath) {
+        ClaymoreGUID guid = guidHint ? *guidHint : ClaymoreGUID{};
+        if ((guid.high == 0 && guid.low == 0) && Assets::GetResolver()) {
+            guid = Assets::GetResolver()->GetGUID(path);
+        }
+        QueuePrefabGuid(guid);
+        return;
+    }
+
+    if (ext == ".dlglib") {
+        if (guidHint) {
+            QueueDialogueLibrary(*guidHint);
+        }
+        return;
+    }
+
+    if (ext == ".animctrl" || ext == ".controller") {
+        QueueAnimationController(path);
+        return;
+    }
+
+    if (ext == ".animoverride") {
+        QueueAnimationControllerOverride(path);
+        return;
+    }
+
+    if (ext == ".anim") {
+        QueueAnimationAsset(path);
+        return;
+    }
+
+    if (ext == ".mat" || ext == ".matbin") {
+        QueueMaterial(path, false);
+        return;
+    }
+
+    if (IsTextureAssetExtension(ext)) {
+        QueueTexture(path);
+    }
+}
+
+void PrefabPrewarmManager::QueueSerializedScriptString(const std::string& value) {
+    const std::string trimmed = TrimCopy(value);
+    if (trimmed.empty()) {
+        return;
+    }
+
+    if (trimmed.find('|') != std::string::npos) {
+        size_t start = 0;
+        while (start <= trimmed.size()) {
+            const size_t end = trimmed.find('|', start);
+            QueueSerializedScriptString(trimmed.substr(start, end - start));
+            if (end == std::string::npos) {
+                break;
+            }
+            start = end + 1;
+        }
+        return;
+    }
+
+    std::string guidToken;
+    if (LooksLikeGuidToken(trimmed, guidToken)) {
+        const ClaymoreGUID guid = ClaymoreGUID::FromString(guidToken);
+        if ((guid.high == 0 && guid.low == 0) || AssetReference::IsPrimitiveGuid(guid)) {
+            return;
+        }
+        if (IAssetResolver* resolver = Assets::GetResolver()) {
+            const std::string assetPath = resolver->GetPathForGUID(guid);
+            if (!assetPath.empty()) {
+                QueueResourcePathByExtension(assetPath, &guid);
+            }
+        }
+        return;
+    }
+
+    QueueResourcePathByExtension(trimmed, nullptr);
+}
+
+void PrefabPrewarmManager::QueueSerializedScriptValue(const PropertyValue& value) {
+    if (std::holds_alternative<std::string>(value)) {
+        QueueSerializedScriptString(std::get<std::string>(value));
+        return;
+    }
+
+    if (std::holds_alternative<std::shared_ptr<ListPropertyValue>>(value)) {
+        auto listPtr = std::get<std::shared_ptr<ListPropertyValue>>(value);
+        if (!listPtr) {
+            return;
+        }
+        for (const auto& element : listPtr->elements) {
+            QueueSerializedScriptValue(element);
+        }
+        return;
+    }
+
+    if (std::holds_alternative<std::shared_ptr<StructPropertyValue>>(value)) {
+        auto structPtr = std::get<std::shared_ptr<StructPropertyValue>>(value);
+        if (!structPtr) {
+            return;
+        }
+        for (const auto& field : structPtr->fields) {
+            QueueSerializedScriptValue(field.second);
+        }
+        return;
+    }
+
+    if (std::holds_alternative<std::shared_ptr<DictionaryPropertyValue>>(value)) {
+        auto dictPtr = std::get<std::shared_ptr<DictionaryPropertyValue>>(value);
+        if (!dictPtr) {
+            return;
+        }
+        for (const auto& entry : dictPtr->entries) {
+            QueueSerializedScriptValue(entry.first);
+            QueueSerializedScriptValue(entry.second);
+        }
+    }
+}
+
 void PrefabPrewarmManager::CollectDependenciesFromEntity(const EntityData& data) {
     IAssetResolver* resolver = Assets::GetResolver();
     if (data.Mesh) {
         const auto& mc = *data.Mesh;
         bool needsSkinned = data.Skinning != nullptr;
+        const ClaymoreGUID& meshGuid = mc.meshReference.guid;
+
+        if ((meshGuid.high != 0 || meshGuid.low != 0) &&
+            !AssetReference::IsPrimitiveGuid(meshGuid)) {
+            const std::string meshPath = ResolveGuidToMeshPath(meshGuid);
+            if (!meshPath.empty()) {
+                QueueMesh(meshPath, static_cast<uint32_t>(std::max(0, mc.meshReference.fileID)));
+            }
+        }
         
         if (!mc.MaterialAssetPaths.empty()) {
             for (const auto& matPath : mc.MaterialAssetPaths) {
@@ -497,6 +696,12 @@ void PrefabPrewarmManager::CollectDependenciesFromEntity(const EntityData& data)
     }
 
     if (!data.Scripts.empty()) {
+        for (const auto& script : data.Scripts) {
+            for (const auto& kv : script.Values) {
+                QueueSerializedScriptValue(kv.second);
+            }
+        }
+
         auto queuePrefabFromValue = [&](const PropertyValue& value) {
             if (std::holds_alternative<std::string>(value)) {
                 const std::string& guidStr = std::get<std::string>(value);
@@ -746,20 +951,45 @@ void PrefabPrewarmManager::Update(double budgetMs) {
                 std::string loadPath = sourcePath;
                 if (Assets::ShouldLoadBinary()) {
                     std::string binPath = Assets::GetBinaryPath(sourcePath);
-                    if (!binPath.empty()) {
+                    const bool binaryReady = !binPath.empty() &&
+                        FileSystem::Instance().Exists(binPath) &&
+                        Assets::GetResolver()->IsBinaryCurrent(sourcePath);
+                    if (binaryReady) {
                         loadPath = binPath;
                     } else if (!Assets::AllowSourceFallback()) {
-                        std::cerr << "[PrefabPrewarm] Missing binary prefab for GUID: " 
+                        std::cerr << "[PrefabPrewarm] Missing or stale binary prefab for GUID: "
                                   << prefabGuid.ToString() << std::endl;
+                        MarkCompletedWork();
+                        continue;
+                    } else {
+                        MarkCompletedWork();
                         continue;
                     }
                 }
                 
-                std::vector<uint8_t> bytes;
-                if (FileSystem::Instance().ReadFile(loadPath, bytes)) {
-                    CollectPrefabDependencies(bytes);
+                auto bytes = std::make_shared<std::vector<uint8_t>>();
+                if (FileSystem::Instance().ReadFile(loadPath, *bytes)) {
+                    runtime::RuntimePrefabInstantiator::PreloadFromMemory(loadPath, bytes);
+                    CollectPrefabDependencies(*bytes);
                 }
             }
+            MarkCompletedWork();
+            continue;
+        }
+
+        MeshPrewarmJob meshJob;
+        bool hasMeshJob = false;
+        {
+            std::lock_guard<std::mutex> lock(m_Mutex);
+            if (!m_MeshQueue.empty()) {
+                meshJob = m_MeshQueue.front();
+                m_MeshQueue.pop_front();
+                hasMeshJob = true;
+            }
+        }
+        if (hasMeshJob) {
+            MeshCache::GetOrLoadMesh(meshJob.path, meshJob.submeshIndex, nullptr);
+            MarkCompletedWork();
             continue;
         }
         
@@ -775,6 +1005,7 @@ void PrefabPrewarmManager::Update(double budgetMs) {
         }
         if (hasMatJob) {
             RuntimeMaterialCache::GetOrLoad(matJob.path, matJob.skinned);
+            MarkCompletedWork();
             continue;
         }
         
@@ -790,6 +1021,7 @@ void PrefabPrewarmManager::Update(double budgetMs) {
         }
         if (hasShaderJob) {
             ShaderManager::Instance().LoadProgram(shaderJob.vs, shaderJob.fs);
+            MarkCompletedWork();
             continue;
         }
         
@@ -830,6 +1062,7 @@ void PrefabPrewarmManager::Update(double budgetMs) {
                     }
                 }
             }
+            MarkCompletedWork();
             continue;
         }
 
@@ -851,6 +1084,7 @@ void PrefabPrewarmManager::Update(double budgetMs) {
                     QueueAnimationAsset(entry.OverridePath);
                 }
             }
+            MarkCompletedWork();
             continue;
         }
         
@@ -866,6 +1100,7 @@ void PrefabPrewarmManager::Update(double budgetMs) {
         }
         if (hasAnimJob) {
             cm::animation::LoadAnimationAssetCached(animAssetPath, true);
+            MarkCompletedWork();
             continue;
         }
         
@@ -893,6 +1128,7 @@ void PrefabPrewarmManager::Update(double budgetMs) {
                     }
                 }
             }
+            MarkCompletedWork();
             continue;
         }
         
@@ -906,6 +1142,7 @@ void PrefabPrewarmManager::Update(double budgetMs) {
         }
         if (!spritePath.empty()) {
             particles::AcquireSprite(spritePath);
+            MarkCompletedWork();
             continue;
         }
         
@@ -921,6 +1158,7 @@ void PrefabPrewarmManager::Update(double budgetMs) {
             TextureSpecifier spec;
             spec.Path = texturePath;
             AcquireTextureHandle(spec, TextureColorSpace::Linear);
+            MarkCompletedWork();
             continue;
         }
         
@@ -940,6 +1178,14 @@ void QueuePrefabGuid(const ClaymoreGUID& guid) {
 
 void Update(double budgetMs) {
     GetManager().Update(budgetMs);
+}
+
+bool HasPendingWork() {
+    return GetManager().HasPendingWork();
+}
+
+float GetProgress() {
+    return GetManager().GetProgress();
 }
 
 void SetEnabled(bool enabled) {

@@ -243,6 +243,15 @@ struct EntityData {
    // Set by Scene::InstantiateModel. Used by Editor for prefab serialization.
    // Core only stores the GUID; path resolution happens in Editor layer.
    ClaymoreGUID ModelAssetGuid = {};
+
+   // Runtime-only bone identity back-reference (NOT serialized). Set when a bone
+   // entity is created for a skeleton. Lets transform consumers (managed script
+   // getters, etc.) resolve this bone's world matrix from the skeleton's animated
+   // pose buffer instead of the per-frame-propagated AoS transform. This is what
+   // decouples script-visible bone positions from the generic transform plumbing.
+   // INVALID_ENTITY_ID / -1 for non-bone entities.
+   EntityID BoneSkeletonEntity = INVALID_ENTITY_ID;
+   int BoneIndex = -1;
    
    // Model node deletions: paths of model child nodes intentionally deleted by user.
    // These paths are relative to the model root (e.g., "Armature/Hips/LeftLeg").

@@ -8,7 +8,7 @@ SkinnedPBRMaterial::SkinnedPBRMaterial(const std::string& name, bgfx::ProgramHan
 }   
 
 std::shared_ptr<Material> SkinnedPBRMaterial::Clone() const {
-    auto clone = std::make_shared<SkinnedPBRMaterial>(GetName() + "_Clone", GetProgram());
+    auto clone = std::make_shared<SkinnedPBRMaterial>(MakeCloneName(GetName()), GetProgram());
     
     // Copy PBRMaterial textures (handles are shared, not owned by the material)
     clone->m_AlbedoTex = m_AlbedoTex;
@@ -39,13 +39,22 @@ std::shared_ptr<Material> SkinnedPBRMaterial::Clone() const {
     clone->m_UVTransform = m_UVTransform;
     clone->m_TextureUsage = m_TextureUsage;
     
+    // Copy shadow-receive flags (previously dropped on clone)
+    clone->m_ReceiveShadowsOverride = m_ReceiveShadowsOverride;
+    clone->m_ReceiveShadows = m_ReceiveShadows;
+
     // Copy state flags
     clone->m_StateFlags = m_StateFlags;
-    
-    // Sync uniforms (clone will create fresh handles)
+
+    // Copy ALL generic vec4 uniforms (PSX family, tint params, etc.) so a
+    // skinned PSX clone stays a PSX material. See PBRMaterial::Clone.
+    CopyUniformValuesTo(*clone);
+
+    // Sync uniforms managed by typed PBR fields (clone will create fresh handles)
     clone->SyncScalarUniforms();
     clone->SyncUVUniform();
-    
+    clone->SyncTextureUsageUniform();
+
     return clone;
 }
 

@@ -22,4 +22,13 @@ public:
     std::shared_ptr<class Material> CreateSceneSkinnedDefaultMaterial(class Scene* scene);
 
     std::shared_ptr<DebugMaterial> CreateDefaultDebugMaterial();
+
+    // Seeds every PSX-family uniform with a defined default value.
+    // IMPORTANT: per-entity property-block overrides are only bound for uniforms
+    // the material actually owns (see Material::ApplyPropertyBlockFast), so every
+    // PSX uniform that should be overridable from the inspector or managed code
+    // must be initialized here. Call this from any code path that constructs a
+    // PSX material directly (scene loaders, prefab instantiation, etc.).
+    // skinned: skinned PSX defaults to lightInfluence=1 (matches existing creators).
+    static void InitializePSXUniformDefaults(class Material& material, bool skinned);
 };

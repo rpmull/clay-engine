@@ -8,7 +8,7 @@ EntityInteropLayout BuildEntityInteropLayout() {
     EntityInteropLayout layout;
     layout.entityCoreCount = 35;
     layout.tweenCount = 7;
-    layout.componentCount = 401;
+    layout.componentCount = 407;
     layout.moduleCount = 25;
     layout.sceneCount = 7;
 
@@ -65,6 +65,7 @@ EntityInteropLayout BuildEntityInteropLayout() {
         (void*)HasComponentPtr,
         (void*)AddComponentPtr,
         (void*)RemoveComponentPtr,
+        (void*)AddScriptPtr,
         (void*)GetLightTypePtr,
         (void*)SetLightTypePtr,
         (void*)GetLightColorPtr,
@@ -122,6 +123,8 @@ EntityInteropLayout BuildEntityInteropLayout() {
         (void*)&Animator_GetFloat,
         (void*)&Animator_GetTrigger,
         (void*)&Animator_GetCurrentStateName,
+        (void*)&Animator_GetPreviousStateName,
+        (void*)&Animator_GetNextStateName,
         (void*)&Animator_GetEnabled,
         (void*)&Animator_SetEnabled,
         (void*)&Animator_SetController,
@@ -203,7 +206,7 @@ EntityInteropLayout BuildEntityInteropLayout() {
         (void*)BoneAttachment_GetSkeletonEntityPtr,
         (void*)BoneAttachment_SetSkeletonEntityPtr,
 
-        // Character Controller (7 entries)
+        // Character Controller (9 entries)
         (void*)CC_SetDesiredVelocityPtr,
         (void*)CC_GetDesiredVelocityPtr,
         (void*)CC_SetVerticalVelocityPtr,
@@ -211,6 +214,8 @@ EntityInteropLayout BuildEntityInteropLayout() {
         (void*)CC_JumpPtr,
         (void*)CC_IsGroundedPtr,
         (void*)CC_SetPositionPtr,
+        (void*)CC_GetCollisionMaskPtr,
+        (void*)CC_SetCollisionMaskPtr,
         // UI Text (42 entries)
         (void*)UI_Text_GetTextPtr,
         (void*)UI_Text_SetTextPtr,
@@ -507,6 +512,9 @@ EntityInteropLayout BuildEntityInteropLayout() {
         (void*)Portal_SetTriggerRadiusPtr,
         (void*)Portal_GetFireExitEventsPtr,
         (void*)Portal_SetFireExitEventsPtr,
+
+        // RigidBody physics layer setter (appended to the component segment)
+        (void*)SetRigidBodyPhysicsLayerPtr,
 
         // Module Component Interop (25 entries)
         (void*)HasModuleComponentPtr,

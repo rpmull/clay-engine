@@ -51,7 +51,6 @@
 namespace cm {
 namespace instancer {
 
-
 namespace {
 
 constexpr float kInstancerMinShadowScreenSize = 0.005f;

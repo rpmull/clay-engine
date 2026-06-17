@@ -103,6 +103,46 @@ bool TryExtractShaderInclude(const std::string& line, std::string& outIncludePat
     return false;
 }
 
+bool HasUsableShaderBinary(const fs::path& path, uintmax_t* outSize = nullptr)
+{
+    std::error_code ec;
+    if (!fs::exists(path, ec) || ec) {
+        return false;
+    }
+
+    ec.clear();
+    const uintmax_t size = fs::file_size(path, ec);
+    if (ec || size == 0) {
+        return false;
+    }
+
+    if (outSize != nullptr) {
+        *outSize = size;
+    }
+    return true;
+}
+
+void RemoveStaleShaderBinary(const fs::path& path, const char* reason)
+{
+    std::error_code ec;
+    if (!fs::exists(path, ec) || ec) {
+        return;
+    }
+
+    if (HasUsableShaderBinary(path)) {
+        return;
+    }
+
+    std::cerr << "[ShaderManager] Removing unusable shader binary (" << reason << "): "
+              << path << std::endl;
+    ec.clear();
+    fs::remove(path, ec);
+    if (ec) {
+        std::cerr << "[ShaderManager] Failed to remove stale shader binary: " << path
+                  << " (" << ec.message() << ")" << std::endl;
+    }
+}
+
 fs::path NormalizeExistingPath(const fs::path& path)
 {
     std::error_code ec;
@@ -261,6 +301,8 @@ bool ShaderManager::CompileShader(const std::string& name, ShaderType type)
    includeDirs.push_back(shadersDir / "include");
    includeDirs.push_back(bgfxInc);
 
+   RemoveStaleShaderBinary(shaderOut, "empty or unreadable file");
+
    if (fs::exists(shaderOut)) {
       std::error_code ec;
       const auto binTime = fs::last_write_time(shaderOut, ec);
@@ -295,9 +337,19 @@ bool ShaderManager::CompileShader(const std::string& name, ShaderType type)
 
    int result = system(cmd.c_str());
    if (result != 0) {
+      RemoveStaleShaderBinary(shaderOut, "failed compile output");
       std::cerr << "[ShaderManager] Failed to compile shader: " << shaderSrc << std::endl;
       return false;
       }
+   uintmax_t compiledSize = 0;
+   if (!HasUsableShaderBinary(shaderOut, &compiledSize)) {
+      std::cerr << "[ShaderManager] shaderc produced no usable binary for: " << shaderSrc
+                << " -> " << shaderOut << std::endl;
+      RemoveStaleShaderBinary(shaderOut, "shaderc produced empty output");
+      return false;
+      }
+   std::cout << "[ShaderManager] Compiled shader output: " << shaderOut
+             << " (" << compiledSize << " bytes)" << std::endl;
    return true;
    }
 
@@ -306,6 +358,10 @@ static bgfx::ShaderHandle CreateShaderFromFile(const fs::path& path)
    std::vector<uint8_t> data;
    if (!FileSystem::Instance().ReadFile(path.string(), data)) {
        std::cerr << "[ShaderManager] Failed to read shader: \"" << path.string() << "\"" << std::endl;
+       return BGFX_INVALID_HANDLE;
+   }
+   if (data.empty()) {
+       std::cerr << "[ShaderManager] Shader file is empty: \"" << path.string() << "\"" << std::endl;
        return BGFX_INVALID_HANDLE;
    }
    const bgfx::Memory* mem = bgfx::alloc(uint32_t(data.size() + 1));
@@ -565,6 +621,8 @@ bgfx::ShaderHandle ShaderManager::CompileAndCache(const std::string& path, Shade
     fs::path shaderOut  = compiledDir / (shaderName + ".bin");
     fs::create_directories(shaderOut.parent_path());
 
+    RemoveStaleShaderBinary(shaderOut, "empty or unreadable file");
+
     bool needsCompile = true;
     fs::path varyingFile = ResolveVaryingDef(fs::path(path), type, shadersDir);
     if (fs::exists(shaderOut) && fs::exists(path)) {
@@ -589,15 +647,22 @@ bgfx::ShaderHandle ShaderManager::CompileAndCache(const std::string& path, Shade
         }
         cmd += " -i " + shadersDir.string();
         cmd += " -i " + (shadersDir / "include").string();
-    // Add bgfx built-in shader include path
-    fs::path bgfxInc = exeDir;
-    for(int i=0;i<12 && !fs::exists(bgfxInc / "external/bgfx/src/bgfx_shader.sh"); ++i)
-        bgfxInc = bgfxInc.parent_path();
-    bgfxInc /= "external/bgfx/src";
-    cmd += " -i " + bgfxInc.string();
+        // Add bgfx built-in shader include path
+        fs::path bgfxInc = exeDir;
+        for (int i = 0; i < 12 && !fs::exists(bgfxInc / "external/bgfx/src/bgfx_shader.sh"); ++i)
+            bgfxInc = bgfxInc.parent_path();
+        bgfxInc /= "external/bgfx/src";
+        cmd += " -i " + bgfxInc.string();
         std::cout << "[ShaderManager] Compiling shader: " << path << std::endl;
         if (system(cmd.c_str()) != 0) {
+            RemoveStaleShaderBinary(shaderOut, "failed compile output");
             std::cerr << "[ShaderManager] Failed to compile: " << path << std::endl;
+            return BGFX_INVALID_HANDLE;
+        }
+        if (!HasUsableShaderBinary(shaderOut)) {
+            std::cerr << "[ShaderManager] shaderc produced no usable binary for: "
+                      << path << " -> " << shaderOut << std::endl;
+            RemoveStaleShaderBinary(shaderOut, "shaderc produced empty output");
             return BGFX_INVALID_HANDLE;
         }
     }

@@ -1,5 +1,6 @@
 #include "editor/animation/TimelineDocument.h"
 #include "core/animation/AnimationSerializer.h"
+#include "core/ecs/Scene.h"
 
 using cm::animation::AnimationAsset;
 
@@ -44,7 +45,11 @@ bool TimelineDocument::Load(const std::string& filePath)
 bool TimelineDocument::Save(const std::string& filePath)
 {
     bool ok = cm::animation::SaveAnimationAsset(asset, filePath);
-    if (ok) { path = filePath; dirty = false; }
+    if (ok) {
+        path = filePath;
+        dirty = false;
+        Scene::Get().InvalidateAllAnimatorAssetCaches();
+    }
     return ok;
 }
 

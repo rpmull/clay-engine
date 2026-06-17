@@ -9,9 +9,50 @@
 #include "core/assets/IAssetResolver.h"
 #include "core/vfs/FileSystem.h"
 #include "core/prefab/RuntimePrefabInstantiator.h"
+#include "editor/Project.h"
 #include <navigation/NavDebugDraw.h>
 #include "managed/interop/DotNetHost.h"
 #include <algorithm>
+#include <vector>
+
+namespace {
+struct ResolvedResolutionPreset {
+    std::string Label;
+    uint32_t Width = 0;
+    uint32_t Height = 0;
+    bool Native = false;
+};
+
+std::vector<ResolvedResolutionPreset> BuildResolutionPresetList()
+{
+    std::vector<ResolvedResolutionPreset> presets;
+    presets.push_back({ "Native", 0, 0, true });
+    const ViewportResolutionPreset builtins[] = {
+        { "640 x 360", 640, 360 },
+        { "854 x 480", 854, 480 },
+        { "1280 x 720", 1280, 720 },
+        { "1600 x 900", 1600, 900 },
+        { "1920 x 1080", 1920, 1080 },
+        { "2560 x 1440", 2560, 1440 },
+        { "3840 x 2160", 3840, 2160 },
+    };
+    for (const auto& builtin : builtins) {
+        presets.push_back({ builtin.label, builtin.width, builtin.height, false });
+    }
+    for (const auto& preset : Project::GetViewportResolutionPresets()) {
+        presets.push_back({ preset.label, preset.width, preset.height, false });
+    }
+    return presets;
+}
+
+bool MatchesPreset(const Environment& env, const ResolvedResolutionPreset& preset)
+{
+    if (preset.Native) {
+        return !env.HasFixedRenderResolution();
+    }
+    return env.RenderResolutionWidth == preset.Width && env.RenderResolutionHeight == preset.Height;
+}
+}
 // Renders the main toolbar panel
 void ToolbarPanel::OnImGuiRender(ImGuiID dockspace_id) {
     ImGui::Begin("Toolbar", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoResize);
@@ -118,6 +159,45 @@ void ToolbarPanel::OnImGuiRender(ImGuiID dockspace_id) {
         }
     }
     ImGui::EndDisabled();
+
+    if (m_UILayer) {
+        ImGui::SameLine();
+        ImGui::TextUnformatted("Render:");
+        ImGui::SameLine();
+        auto presets = BuildResolutionPresetList();
+        Scene& scene = m_UILayer->GetScene();
+        Environment& env = scene.GetEnvironment();
+        size_t selectedIndex = 0;
+        for (size_t i = 0; i < presets.size(); ++i) {
+            if (MatchesPreset(env, presets[i])) {
+                selectedIndex = i;
+                break;
+            }
+        }
+        ImGui::SetNextItemWidth(150.0f);
+        if (ImGui::BeginCombo("##ViewportRenderResolution", presets[selectedIndex].Label.c_str())) {
+            for (size_t i = 0; i < presets.size(); ++i) {
+                const bool selected = i == selectedIndex;
+                if (ImGui::Selectable(presets[i].Label.c_str(), selected)) {
+                    if (presets[i].Native) {
+                        env.RenderResolutionWidth = 0;
+                        env.RenderResolutionHeight = 0;
+                    } else {
+                        env.RenderResolutionWidth = static_cast<uint16_t>(presets[i].Width);
+                        env.RenderResolutionHeight = static_cast<uint16_t>(presets[i].Height);
+                    }
+                    scene.MarkDirty();
+                    if (scene.m_RuntimeScene) {
+                        scene.m_RuntimeScene->GetEnvironment() = env;
+                    }
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+    }
 
     // Gizmo toggle
     ImGui::Checkbox("Show Gizmos", &m_ShowGizmos);

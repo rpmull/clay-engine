@@ -785,10 +785,26 @@ std::shared_ptr<Mesh> ReadMeshFromBin(const std::string& filePath,
 
     const bgfx::Memory* vbMem = bgfx::copy(vb.data(), (uint32_t)vb.size());
     if (outSkinned) {
-        mesh->vbh = BGFX_INVALID_HANDLE;
-        mesh->dvbh = bgfx::createDynamicVertexBuffer(vbMem, SkinnedPBRVertex::layout);
-        mesh->Dynamic = true;
         mesh->SkinnedLayout = true;
+        // Only skinned meshes that deform on the CPU (morph targets / blend
+        // shapes) need a dynamic vertex buffer. Plain skinned meshes are
+        // deformed entirely on the GPU from a static bind-pose buffer plus the
+        // bone palette, exactly like meshes imported through ModelLoader.
+        // Previously every skinned mesh was forced Dynamic with no static vbh,
+        // which left the depth/shadow path with only the dvbh branch: any part
+        // lacking a live GPU skinning record (or an up-to-date dvbh) was
+        // silently skipped, so a multi-part character cast only one part's
+        // shadow. Mirror ModelLoader's rule and key Dynamic off real morphs.
+        const bool hasMorphTargets = (d.blendSize > 0);
+        if (hasMorphTargets) {
+            mesh->vbh = BGFX_INVALID_HANDLE;
+            mesh->dvbh = bgfx::createDynamicVertexBuffer(vbMem, SkinnedPBRVertex::layout);
+            mesh->Dynamic = true;
+        } else {
+            mesh->vbh = bgfx::createVertexBuffer(vbMem, SkinnedPBRVertex::layout);
+            mesh->dvbh = BGFX_INVALID_HANDLE;
+            mesh->Dynamic = false;
+        }
     } else {
         mesh->vbh = bgfx::createVertexBuffer(vbMem, PBRVertex::layout);
         mesh->Dynamic = false;

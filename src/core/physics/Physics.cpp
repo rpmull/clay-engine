@@ -2,7 +2,9 @@
 #include "Physics.h"
 #include "PhysicsDebug.h"
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
+#include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/Collision/RayCast.h>
+#include <Jolt/Physics/Collision/ShapeCast.h>
 #include <Jolt/Physics/Collision/CastResult.h>
 #include <Jolt/Physics/Collision/CollisionCollectorImpl.h>
 #include <Jolt/Physics/Collision/NarrowPhaseQuery.h>
@@ -545,6 +547,110 @@ bool Physics::RaycastPoints(const glm::vec3& from, const glm::vec3& to, RaycastH
         PhysicsDebug::AddLinecast(from, to, result, outHit.point, outHit.normal);
     }
     
+    return result;
+}
+
+bool Physics::Spherecast(const glm::vec3& origin, const glm::vec3& direction, float radius, float maxDistance, RaycastHit& outHit, uint32_t layerMask)
+{
+    outHit = RaycastHit{}; // Reset output
+
+    if (!s_PhysicsSystem) return false;
+
+    // Validate direction - avoid NaN from normalizing zero vector
+    float dirLengthSq = glm::dot(direction, direction);
+    if (dirLengthSq < 0.000001f || maxDistance <= 0.0f) return false;
+
+    // A zero/negative radius degenerates to an ordinary ray.
+    if (radius <= 0.0f) {
+        return Raycast(origin, direction, maxDistance, outHit, layerMask);
+    }
+
+    glm::vec3 dir = direction / std::sqrt(dirLengthSq);
+    glm::vec3 sweep = dir * maxDistance;
+
+    // Stack-allocated sphere shape. SetEmbedded() keeps Jolt's ref counting from
+    // trying to free a non-heap object when the cast releases its reference.
+    JPH::SphereShape sphere(radius);
+    sphere.SetEmbedded();
+
+    // Cast from the sphere centre at the origin along the sweep vector. Results
+    // are reported relative to the base offset (origin) for large-world precision.
+    const JPH::RVec3 baseOffset(origin.x, origin.y, origin.z);
+    JPH::RShapeCast shapeCast = JPH::RShapeCast::sFromWorldTransform(
+        &sphere,
+        JPH::Vec3::sReplicate(1.0f),
+        JPH::RMat44::sTranslation(baseOffset),
+        JPH::Vec3(sweep.x, sweep.y, sweep.z));
+
+    JPH::ShapeCastSettings settings; // defaults are fine and cheap for a sphere
+    JPH::ClosestHitCollisionCollector<JPH::CastShapeCollector> collector;
+
+    LayerMaskBodyFilter bodyFilter(layerMask, s_PhysicsSystem);
+    const JPH::NarrowPhaseQuery& query = s_PhysicsSystem->GetNarrowPhaseQuery();
+    query.CastShape(shapeCast, settings, baseOffset, collector, {}, {}, bodyFilter);
+
+    bool hitResult = false;
+    if (collector.HadHit())
+    {
+        const JPH::ShapeCastResult& hit = collector.mHit;
+
+        outHit.hit = true;
+        outHit.distance = hit.mFraction * maxDistance;
+
+        // Contact point is reported relative to the base offset (the origin).
+        outHit.point = origin + glm::vec3(
+            hit.mContactPointOn2.GetX(),
+            hit.mContactPointOn2.GetY(),
+            hit.mContactPointOn2.GetZ());
+
+        // mPenetrationAxis points the way to push the hit body out of the sphere;
+        // the surface normal facing the caster is its negation.
+        glm::vec3 normal(
+            -hit.mPenetrationAxis.GetX(),
+            -hit.mPenetrationAxis.GetY(),
+            -hit.mPenetrationAxis.GetZ());
+        float nLen = glm::length(normal);
+        outHit.normal = (nLen > 1.0e-6f) ? (normal / nLen) : -dir;
+
+        // Entity ID from the hit body's user data.
+        JPH::BodyLockRead lock(s_PhysicsSystem->GetBodyLockInterface(), hit.mBodyID2);
+        if (lock.Succeeded())
+        {
+            outHit.entityId = static_cast<uint32_t>(lock.GetBody().GetUserData());
+        }
+
+        hitResult = true;
+    }
+
+    // Debug visualization (suppressed when called internally from SpherecastPoints).
+    if (!s_InternalRaycast && PhysicsDebug::IsEnabled()) {
+        PhysicsDebug::AddRaycast(origin, direction, maxDistance, hitResult, outHit.point, outHit.normal);
+    }
+
+    return hitResult;
+}
+
+bool Physics::SpherecastPoints(const glm::vec3& from, const glm::vec3& to, float radius, RaycastHit& outHit, uint32_t layerMask)
+{
+    glm::vec3 direction = to - from;
+    float distance = glm::length(direction);
+
+    if (distance < 0.0001f) {
+        outHit = RaycastHit{};
+        return false;
+    }
+
+    // Mark as internal call to prevent duplicate debug visualization.
+    s_InternalRaycast = true;
+    s_CurrentLayerMask = layerMask;
+    bool result = Spherecast(from, direction / distance, radius, distance, outHit, layerMask);
+    s_InternalRaycast = false;
+
+    // Debug visualization for the swept segment (shows from/to points).
+    if (PhysicsDebug::IsEnabled()) {
+        PhysicsDebug::AddLinecast(from, to, result, outHit.point, outHit.normal);
+    }
+
     return result;
 }
 

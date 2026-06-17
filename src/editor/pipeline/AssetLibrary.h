@@ -26,6 +26,7 @@ enum class AssetType {
     Audio = 100,       // Audio files (.wav, .mp3, .ogg, .flac)
     Script = 115,
     Animation = 196,
+    AnimatorController = 197,
     NodeGraph = 220,
     Prefab = 250,
     NavMesh = 310,
@@ -112,4 +113,4 @@ private:
     std::unordered_map<std::string, ClaymoreGUID> m_PathToGUID;
     std::unordered_map<ClaymoreGUID, std::string> m_GUIDToPath;
     std::unordered_map<std::string, std::shared_ptr<Mesh>> m_PrimitiveMeshes;
-}; 
+};

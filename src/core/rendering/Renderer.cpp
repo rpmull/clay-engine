@@ -254,6 +254,7 @@ static uint32_t ResolveWorldCanvasRenderDimension(int explicitSize, int referenc
 #include "TextRenderer.h"
 #include "TextureLoader.h"
 #include "TextureCube.h"
+#include "TextureSamplerFlags.h"
 #ifndef CLAYMORE_RUNTIME
 #include "editor/pipeline/AssetLibrary.h"
 #else
@@ -278,6 +279,7 @@ static uint32_t ResolveWorldCanvasRenderDimension(int explicitSize, int referenc
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 
 #include "GlobalShaderProperties.h"
@@ -369,6 +371,139 @@ namespace
       return s_skyDummy;
    }
 
+   uint16_t ResolveSkyboxTargetSize(const Environment& env)
+   {
+      uint16_t targetSize = std::max<uint16_t>(env.SkyboxEquirectangularResolution, 1u);
+      if (env.TextureMaxDimension > 0) {
+         targetSize = std::min<uint16_t>(targetSize, env.TextureMaxDimension);
+      }
+      return std::max<uint16_t>(targetSize, 1u);
+   }
+
+   std::filesystem::path ResolveSkyboxSourcePath(const std::string& path)
+   {
+      std::filesystem::path candidate(path);
+      std::error_code ec;
+      if (candidate.is_absolute() && std::filesystem::exists(candidate, ec)) {
+         return candidate;
+      }
+
+      const std::filesystem::path& projectRoot = FileSystem::Instance().GetProjectRoot();
+      if (!projectRoot.empty()) {
+         std::filesystem::path rooted = projectRoot / candidate;
+         if (std::filesystem::exists(rooted, ec)) {
+            return rooted;
+         }
+      }
+
+      return candidate;
+   }
+
+   std::string BuildSkyboxSourceStamp(const std::string& path)
+   {
+      if (path.empty()) {
+         return "empty";
+      }
+
+      const std::filesystem::path resolved = ResolveSkyboxSourcePath(path);
+      std::error_code ec;
+      if (std::filesystem::exists(resolved, ec)) {
+         const auto writeTime = std::filesystem::last_write_time(resolved, ec);
+         if (!ec) {
+            return resolved.generic_string() + "@" + std::to_string(writeTime.time_since_epoch().count());
+         }
+         return resolved.generic_string() + "@exists";
+      }
+
+      return path + "@missing";
+   }
+
+   bool HasAllSkyboxFacePaths(const std::array<std::string, 6>& facePaths)
+   {
+      for (const std::string& path : facePaths) {
+         if (path.empty()) {
+            return false;
+         }
+      }
+      return true;
+   }
+
+   std::string BuildSkyboxRuntimeCacheKey(const Environment& env)
+   {
+      if (!env.UseSkybox) {
+         return {};
+      }
+
+      if (env.UseSkyboxEquirectangular) {
+         return "eq|" +
+            std::to_string(ResolveSkyboxTargetSize(env)) + "|" +
+            std::to_string(env.TextureMaxDimension) + "|" +
+            BuildSkyboxSourceStamp(env.SkyboxEquirectangularPath);
+      }
+
+      std::string key = "cube|" + std::to_string(env.TextureMaxDimension);
+      for (const std::string& facePath : env.SkyboxFacePaths) {
+         key.push_back('|');
+         key += BuildSkyboxSourceStamp(facePath);
+      }
+      return key;
+   }
+
+   void EnsureEnvironmentSkyboxResources(Environment& env)
+   {
+      if (!env.UseSkybox) {
+         env.SkyboxTexture.reset();
+         env.SkyboxRuntimeCacheKey.clear();
+         return;
+      }
+
+      const std::string desiredKey = BuildSkyboxRuntimeCacheKey(env);
+      if (desiredKey.empty()) {
+         env.SkyboxTexture.reset();
+         env.SkyboxRuntimeCacheKey.clear();
+         return;
+      }
+
+      if (env.SkyboxRuntimeCacheKey == desiredKey) {
+         if (env.SkyboxTexture && env.SkyboxTexture->IsValid()) {
+            return;
+         }
+         if (!env.SkyboxTexture) {
+            return;
+         }
+      }
+
+      const bool hasConfiguredSkySource =
+         env.UseSkyboxEquirectangular
+            ? !env.SkyboxEquirectangularPath.empty()
+            : HasAllSkyboxFacePaths(env.SkyboxFacePaths);
+
+      if (!hasConfiguredSkySource) {
+         env.SkyboxTexture.reset();
+         env.SkyboxRuntimeCacheKey = desiredKey;
+         return;
+      }
+
+      std::shared_ptr<TextureCube> rebuilt = std::make_shared<TextureCube>();
+      bool loaded = false;
+      if (env.UseSkyboxEquirectangular) {
+         loaded = rebuilt->LoadFromEquirectangular(
+            env.SkyboxEquirectangularPath,
+            ResolveSkyboxTargetSize(env));
+      } else {
+         loaded = rebuilt->LoadFromFaceFiles(env.SkyboxFacePaths, env.TextureMaxDimension);
+      }
+
+      if (loaded && rebuilt->IsValid()) {
+         env.SkyboxTexture = std::move(rebuilt);
+      } else {
+         std::cerr << "[Renderer] Failed to rebuild skybox cubemap." << std::endl;
+         env.SkyboxTexture.reset();
+      }
+
+      env.SkyboxRuntimeCacheKey = desiredKey;
+   }
+
    inline bool NearlyEqual(float a, float b, float eps = 1e-4f)
    {
       return std::abs(a - b) <= eps;
@@ -406,6 +541,64 @@ namespace
          sin(pitch),
          cos(pitch) * cos(yaw)
       ));
+   }
+
+   inline void PopulateLocalLightAttenuation(float range, float& constant, float& linear, float& quadratic)
+   {
+      const float safeRange = glm::max(range, 0.5f);
+      constant = 1.0f;
+      linear = 4.5f / safeRange;
+      quadratic = 75.0f / (safeRange * safeRange);
+   }
+
+   inline LightData BuildLightDataFromComponent(const LightComponent& light, const TransformComponent& transform)
+   {
+      LightData ld{};
+      ld.type = light.Type;
+      ld.color = light.Color * light.Intensity;
+      ld.position = glm::vec3(transform.WorldMatrix[3]);
+      ld.direction = LightDirectionFromTransform(transform);
+      if (light.Type == LightType::Directional) {
+         ld.range = 0.0f;
+         ld.constant = 1.0f;
+         ld.linear = 0.0f;
+         ld.quadratic = 0.0f;
+         ld.spotInnerCos = 1.0f;
+         ld.spotOuterCos = 1.0f;
+      } else {
+         ld.range = glm::max(light.Range, 0.5f);
+         PopulateLocalLightAttenuation(ld.range, ld.constant, ld.linear, ld.quadratic);
+         const float inner = glm::radians(glm::clamp(light.SpotInnerAngleDegrees, 0.1f, 89.0f));
+         const float outer = glm::radians(glm::clamp(glm::max(light.SpotOuterAngleDegrees, light.SpotInnerAngleDegrees), 0.1f, 89.5f));
+         ld.spotInnerCos = std::cos(inner);
+         ld.spotOuterCos = std::cos(outer);
+      }
+      return ld;
+   }
+
+   inline LightData BuildLightDataFromRuntime(const cm::world::RuntimeLightEntry& light)
+   {
+      LightData ld{};
+      ld.type = light.Type;
+      ld.color = light.Color * light.Intensity;
+      ld.position = light.Position;
+      ld.direction = light.Direction;
+      if (light.Type == LightType::Directional) {
+         ld.range = 0.0f;
+         ld.constant = 1.0f;
+         ld.linear = 0.0f;
+         ld.quadratic = 0.0f;
+         ld.spotInnerCos = 1.0f;
+         ld.spotOuterCos = 1.0f;
+      } else {
+         ld.range = glm::max(light.Range, 0.5f);
+         PopulateLocalLightAttenuation(ld.range, ld.constant, ld.linear, ld.quadratic);
+         const float inner = glm::radians(glm::clamp(light.SpotInnerAngleDegrees, 0.1f, 89.0f));
+         const float outer = glm::radians(glm::clamp(glm::max(light.SpotOuterAngleDegrees, light.SpotInnerAngleDegrees), 0.1f, 89.5f));
+         ld.spotInnerCos = std::cos(inner);
+         ld.spotOuterCos = std::cos(outer);
+      }
+      return ld;
    }
 
    inline bool HasValidMeshGpuBuffers(const Mesh& mesh)
@@ -874,6 +1067,8 @@ namespace
 void Renderer::Init(uint32_t width, uint32_t height, void* windowHandle) {
 
    // Set viewport size
+   m_BackbufferWidth = width;
+   m_BackbufferHeight = height;
    m_Width = width;
    m_Height = height;
 
@@ -907,31 +1102,8 @@ void Renderer::Init(uint32_t width, uint32_t height, void* windowHandle) {
 
    // Set default camera
    m_RendererCamera = new Camera(60.0f, float(width) / float(height), 0.1f, 1000.0f);
-
-   // Set up Render Texture
-   const uint64_t texFlags = BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP;
-   m_SceneTexture = bgfx::createTexture2D(width, height, false, 1, bgfx::TextureFormat::BGRA8, texFlags);
-
-   // Prefer 32-bit float depth for better precision in large outdoor scenes.
    m_SceneDepthFormat = ChooseSceneDepthFormat(BGFX_TEXTURE_RT_WRITE_ONLY);
-   m_SceneDepthTexture = bgfx::createTexture2D(
-      width, height, false, 1,
-      m_SceneDepthFormat,
-      BGFX_TEXTURE_RT_WRITE_ONLY
-   );
-
-   // Create the offscreen framebuffer with color and depth textures
-   bgfx::TextureHandle fbTextures[] = { m_SceneTexture, m_SceneDepthTexture };
-   m_SceneFrameBuffer = bgfx::createFrameBuffer(2, fbTextures, true);
-
-   // In editor mode, render to the offscreen framebuffer
-   // In standalone mode, render directly to the backbuffer
-   if (m_RenderToOffscreen) {
-      bgfx::setViewFrameBuffer(0, m_SceneFrameBuffer);
-      }
-   else {
-      bgfx::setViewFrameBuffer(0, BGFX_INVALID_HANDLE);
-      }
+   RecreateSceneTargets(width, height);
 
    // Default clear
    bgfx::setViewClear(0, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH, 0x303030ff);
@@ -983,6 +1155,7 @@ void Renderer::Init(uint32_t width, uint32_t height, void* windowHandle) {
    m_ObjectIdProgramSkinnedMorphInstanced = ShaderManager::Instance().LoadProgram("vs_pbr_skinned_morph_object_id_instanced", "fs_object_id_instanced");
    m_OutlineEdgeProgram     = ShaderManager::Instance().LoadProgram("vs_fullscreen", "fs_outline_edge");
    m_OutlineCompositeProgram2 = ShaderManager::Instance().LoadProgram("vs_fullscreen", "fs_outline_composite");
+   m_PresentProgram = ShaderManager::Instance().LoadProgram("vs_fullscreen", "fs_present");
    if (!bgfx::isValid(u_ObjectIdPacked)) u_ObjectIdPacked = bgfx::createUniform("uObjectId", bgfx::UniformType::Vec4);
    if (!bgfx::isValid(u_SelectedIdPacked)) u_SelectedIdPacked = bgfx::createUniform("uSelectedId", bgfx::UniformType::Vec4);
    if (!bgfx::isValid(s_ObjectId)) s_ObjectId = bgfx::createUniform("sObjectId", bgfx::UniformType::Sampler);
@@ -1026,7 +1199,9 @@ void Renderer::Init(uint32_t width, uint32_t height, void* windowHandle) {
    // Create uniforms for lighting and environment
    u_LightColors = bgfx::createUniform("u_lightColors", bgfx::UniformType::Vec4, kMaxShaderLights);
    u_LightPositions = bgfx::createUniform("u_lightPositions", bgfx::UniformType::Vec4, kMaxShaderLights);
+   u_LightDirections = bgfx::createUniform("u_lightDirections", bgfx::UniformType::Vec4, kMaxShaderLights);
    u_LightParams = bgfx::createUniform("u_lightParams", bgfx::UniformType::Vec4, kMaxShaderLights);
+   u_LightSpotParams = bgfx::createUniform("u_lightSpotParams", bgfx::UniformType::Vec4, kMaxShaderLights);
    u_cameraPos = bgfx::createUniform("u_cameraPos", bgfx::UniformType::Vec4);
 
    // CPU-provided normal matrix for skinned and static meshes
@@ -2997,6 +3172,12 @@ void Renderer::Shutdown() {
    if (bgfx::isValid(m_ClipmapDepthProgram)) { bgfx::destroy(m_ClipmapDepthProgram); m_ClipmapDepthProgram = BGFX_INVALID_HANDLE; }
    if (bgfx::isValid(u_ClipmapParams)) { bgfx::destroy(u_ClipmapParams); u_ClipmapParams = BGFX_INVALID_HANDLE; }
    if (bgfx::isValid(u_ClipmapOffset)) { bgfx::destroy(u_ClipmapOffset); u_ClipmapOffset = BGFX_INVALID_HANDLE; }
+   if (bgfx::isValid(u_LightColors)) { bgfx::destroy(u_LightColors); u_LightColors = BGFX_INVALID_HANDLE; }
+   if (bgfx::isValid(u_LightPositions)) { bgfx::destroy(u_LightPositions); u_LightPositions = BGFX_INVALID_HANDLE; }
+   if (bgfx::isValid(u_LightDirections)) { bgfx::destroy(u_LightDirections); u_LightDirections = BGFX_INVALID_HANDLE; }
+   if (bgfx::isValid(u_LightParams)) { bgfx::destroy(u_LightParams); u_LightParams = BGFX_INVALID_HANDLE; }
+   if (bgfx::isValid(u_LightSpotParams)) { bgfx::destroy(u_LightSpotParams); u_LightSpotParams = BGFX_INVALID_HANDLE; }
+   if (bgfx::isValid(u_cameraPos)) { bgfx::destroy(u_cameraPos); u_cameraPos = BGFX_INVALID_HANDLE; }
    if (bgfx::isValid(u_SkyParams)) { bgfx::destroy(u_SkyParams); u_SkyParams = BGFX_INVALID_HANDLE; }
    if (bgfx::isValid(u_SkyTopColor)) { bgfx::destroy(u_SkyTopColor); u_SkyTopColor = BGFX_INVALID_HANDLE; }
    if (bgfx::isValid(u_SkyHorizonColor)) { bgfx::destroy(u_SkyHorizonColor); u_SkyHorizonColor = BGFX_INVALID_HANDLE; }
@@ -3014,6 +3195,8 @@ void Renderer::Shutdown() {
    if (bgfx::isValid(s_ShadowDebug)) { bgfx::destroy(s_ShadowDebug); s_ShadowDebug = BGFX_INVALID_HANDLE; }
    if (bgfx::isValid(u_ShadowDebugParams)) { bgfx::destroy(u_ShadowDebugParams); u_ShadowDebugParams = BGFX_INVALID_HANDLE; }
    if (bgfx::isValid(m_ShadowDebugProgram)) { bgfx::destroy(m_ShadowDebugProgram); m_ShadowDebugProgram = BGFX_INVALID_HANDLE; }
+   if (bgfx::isValid(m_PresentProgram)) { bgfx::destroy(m_PresentProgram); m_PresentProgram = BGFX_INVALID_HANDLE; }
+   if (bgfx::isValid(s_SceneColor)) { bgfx::destroy(s_SceneColor); s_SceneColor = BGFX_INVALID_HANDLE; }
    DestroyGpuSkinningResources();
    if (bgfx::isValid(s_BoneAtlas)) { bgfx::destroy(s_BoneAtlas); s_BoneAtlas = BGFX_INVALID_HANDLE; }
    if (bgfx::isValid(s_BoneRemapAtlas)) { bgfx::destroy(s_BoneRemapAtlas); s_BoneRemapAtlas = BGFX_INVALID_HANDLE; }
@@ -3048,13 +3231,41 @@ void Renderer::Shutdown() {
 #ifndef CLAYMORE_RUNTIME
    m_CachedDebugMaterial.reset();
 #endif
-   
+
+   FlushRetiredTextureHandles();
    cm::rendering::SetBgfxActive(false);
    bgfx::shutdown();
    }
 
+void Renderer::RefreshCachedFallbackTextures()
+{
+   const uint64_t generation = GetTextureCacheGeneration();
+   if (m_CachedFallbackTextureGeneration == generation &&
+       bgfx::isValid(m_TerrainFallbackAlbedo) &&
+       bgfx::isValid(m_UIWhiteTex)) {
+      return;
+   }
+
+   TextureSpecifier spec;
+   spec.Path = "assets/debug/white.png";
+   bgfx::TextureHandle white = AcquireTextureHandle(spec, TextureColorSpace::Linear);
+   if (!bgfx::isValid(white)) {
+      std::cerr << "[Renderer] Failed to refresh cached white fallback texture." << std::endl;
+      m_TerrainFallbackAlbedo = BGFX_INVALID_HANDLE;
+      m_UIWhiteTex = BGFX_INVALID_HANDLE;
+      m_CachedFallbackTextureGeneration = generation;
+      return;
+   }
+
+   m_TerrainFallbackAlbedo = white;
+   m_UIWhiteTex = white;
+   m_CachedFallbackTextureGeneration = generation;
+}
+
 // ---------------- Frame Lifecycle ----------------
 void Renderer::BeginFrame(float r, float g, float b) {
+   AdvanceTextureCacheFrame();
+   RefreshCachedFallbackTextures();
    ++m_SkinningAtlasFrameSerial;
    m_SkinningAtlasPreparedFrameSerial = 0;
    m_SkinningAtlasPreparedScene = nullptr;
@@ -3161,11 +3372,13 @@ void Renderer::EndFrame() {
    }
 }
 
-void Renderer::Resize(uint32_t width, uint32_t height) {
+void Renderer::RecreateSceneTargets(uint32_t width, uint32_t height) {
    m_Width = width;
    m_Height = height;
 
-   m_RendererCamera->SetViewportSize((float)width, (float)height);
+   if (m_RendererCamera) {
+      m_RendererCamera->SetViewportSize((float)width, (float)height);
+   }
 
    // CRITICAL FIX: Destroy all framebuffers that reference m_SceneDepthTexture BEFORE destroying the depth texture
    // This prevents GPU memory leaks and dangling references
@@ -3187,7 +3400,9 @@ void Renderer::Resize(uint32_t width, uint32_t height) {
       bgfx::TextureHandle fbTex[] = { m_SceneTexture, m_SceneDepthTexture };
       m_SceneFrameBuffer = bgfx::createFrameBuffer(2, fbTex, true);
    }
-   bgfx::setViewFrameBuffer(0, m_SceneFrameBuffer);
+   const bgfx::FrameBufferHandle mainSceneFramebuffer =
+      m_RenderToOffscreen ? m_SceneFrameBuffer : bgfx::FrameBufferHandle{ bgfx::kInvalidHandle };
+   bgfx::setViewFrameBuffer(0, mainSceneFramebuffer);
 
    // Recreate selection mask RTs (destroy textures first, then framebuffers)
    if (bgfx::isValid(m_OccMaskFB)) { bgfx::destroy(m_OccMaskFB); m_OccMaskFB = BGFX_INVALID_HANDLE; }
@@ -3234,6 +3449,76 @@ void Renderer::Resize(uint32_t width, uint32_t height) {
    m_ObjectIdPickResult = INVALID_ENTITY_ID;
 }
 
+void Renderer::Resize(uint32_t width, uint32_t height) {
+   m_BackbufferWidth = width;
+   m_BackbufferHeight = height;
+   if (m_RendererCamera) {
+      const float cameraWidth = (m_Width > 0) ? static_cast<float>(m_Width) : static_cast<float>(width);
+      const float cameraHeight = (m_Height > 0) ? static_cast<float>(m_Height) : static_cast<float>(height);
+      m_RendererCamera->SetViewportSize(cameraWidth, cameraHeight);
+   }
+   if (m_Width == 0 || m_Height == 0 || (m_Width == width && m_Height == height)) {
+      if (m_Width == 0 || m_Height == 0) {
+         RecreateSceneTargets(width, height);
+      }
+      return;
+   }
+}
+
+void Renderer::SetRenderToOffscreen(bool enable) {
+   m_RenderToOffscreen = enable;
+   const bgfx::FrameBufferHandle mainSceneFramebuffer =
+      m_RenderToOffscreen ? m_SceneFrameBuffer : bgfx::FrameBufferHandle{ bgfx::kInvalidHandle };
+   bgfx::setViewFrameBuffer(0, mainSceneFramebuffer);
+}
+
+void Renderer::SetSceneRenderResolution(uint32_t width, uint32_t height) {
+   width = std::max<uint32_t>(1u, width);
+   height = std::max<uint32_t>(1u, height);
+   if (m_Width == width && m_Height == height) {
+      return;
+   }
+   RecreateSceneTargets(width, height);
+}
+
+void Renderer::ApplySceneRenderPolicy(const Scene& scene) {
+   const Environment& env = scene.GetEnvironment();
+   const uint32_t targetWidth = env.HasFixedRenderResolution()
+      ? static_cast<uint32_t>(env.RenderResolutionWidth)
+      : std::max<uint32_t>(1u, m_BackbufferWidth);
+   const uint32_t targetHeight = env.HasFixedRenderResolution()
+      ? static_cast<uint32_t>(env.RenderResolutionHeight)
+      : std::max<uint32_t>(1u, m_BackbufferHeight);
+   SetSceneRenderResolution(targetWidth, targetHeight);
+   TextureLoadSettings textureSettings{};
+   textureSettings.MaxDimension = env.TextureMaxDimension;
+   if (SetPersistentTextureLoadSettings(textureSettings)) {
+      RefreshSceneTextureOverrides(const_cast<Scene&>(scene));
+   }
+}
+
+void Renderer::SubmitScenePresentPass() {
+   if (!m_PresentOffscreenToBackbuffer || !m_RenderToOffscreen || !bgfx::isValid(m_PresentProgram) ||
+       !bgfx::isValid(m_SceneTexture) || !bgfx::isValid(m_FullscreenVB) || !bgfx::isValid(m_FullscreenIB)) {
+      return;
+   }
+
+   constexpr uint16_t kView_ScenePresent = 254;
+   bgfx::setViewRect(kView_ScenePresent, 0, 0,
+      static_cast<uint16_t>(std::max<uint32_t>(1u, m_BackbufferWidth)),
+      static_cast<uint16_t>(std::max<uint32_t>(1u, m_BackbufferHeight)));
+   bgfx::setViewFrameBuffer(kView_ScenePresent, BGFX_INVALID_HANDLE);
+   bgfx::setViewClear(kView_ScenePresent, BGFX_CLEAR_NONE, 0, 1.0f, 0);
+   float idM[16];
+   bx::mtxIdentity(idM);
+   bgfx::setTransform(idM);
+   bgfx::setVertexBuffer(0, m_FullscreenVB);
+   bgfx::setIndexBuffer(m_FullscreenIB);
+   bgfx::setTexture(0, s_SceneColor, m_SceneTexture);
+   bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A);
+   bgfx::submit(kView_ScenePresent, m_PresentProgram);
+}
+
 // ---------------- Scene Rendering ----------------
 void Renderer::RenderScene(Scene& scene) {
    static uint64_t s_RenderSceneFrameCounter = 0;
@@ -3244,6 +3529,7 @@ void Renderer::RenderScene(Scene& scene) {
    static uint64_t s_LastRenderBindingVersionForBindCache = 0;
    static bool s_RenderBindingVersionInitialized = false;
    static uint32_t s_BindCacheCooldownFrames = 0;
+   ApplySceneRenderPolicy(scene);
    ++s_RenderSceneFrameCounter;
    const uint64_t sceneRevisionForBindCache = scene.GetDirtyRevision();
    const cm::world::RuntimeWorld* bindCacheRuntimeWorld = scene.GetRuntimeWorld();
@@ -3286,6 +3572,8 @@ void Renderer::RenderScene(Scene& scene) {
    Profiler::Get().SetCounter("Render/ShadowSkinnedOffscreenSkipped", 0);
    Profiler::Get().SetCounter("Render/ShadowMainViewCulled", 0);
    Profiler::Get().SetCounter("Render/ShadowCascadeSubmits", 0);
+   Profiler::Get().SetCounter("Render/ShadowSkinningPrepCandidates", 0);
+   Profiler::Get().SetCounter("Render/ShadowSkinningPrepSkipped", 0);
    Profiler::Get().SetCounter("Render/BindCacheCooldownFrames", s_BindCacheCooldownFrames);
    Profiler::Get().SetCounter("Render/MaterialBindCacheEnabled", enableMaterialBindCache ? 1u : 0u);
    Profiler::Get().SetCounter("Render/SkinningAtlasPrepCalls", 0);
@@ -3328,25 +3616,41 @@ void Renderer::RenderScene(Scene& scene) {
    uint32_t activeLayerMask = 0xFFFFFFFFu;
    bool enforceLayerMask = false;
    if (scene.m_IsPlaying) {
-      for (const auto& eCam : scene.GetEntities()) {
-         auto* dCam = scene.GetEntityData(eCam.GetID());
+      // PERF: only camera entities can match renderCamera, so iterate the cached
+      // RuntimeWorld camera list (O(cameras)) instead of every entity (O(scene)).
+      // Falls back to a full scan when the runtime bridge is not yet populated.
+      const cm::world::RuntimeWorld* camRw = scene.GetRuntimeWorld();
+      auto matchRenderCamera = [&](EntityID camId) -> bool {
+         auto* dCam = scene.GetEntityData(camId);
          if (dCam && dCam->Camera && &dCam->Camera->Camera == renderCamera) {
             activeLayerMask = dCam->Camera->LayerMask;
             enforceLayerMask = true;
-            break;
+            return true;
+         }
+         return false;
+      };
+      if (camRw && !camRw->GetCameraSceneEntities().empty()) {
+         for (EntityID camId : camRw->GetCameraSceneEntities()) {
+            if (matchRenderCamera(camId)) break;
+         }
+      } else {
+         for (const auto& eCam : scene.GetEntities()) {
+            if (matchRenderCamera(eCam.GetID())) break;
          }
       }
    }
 
+  Environment& sceneEnvironment = scene.GetEnvironment();
+  EnsureEnvironmentSkyboxResources(sceneEnvironment);
   const bool editorLightingOverride = ShouldApplyEditorLightingOverride(scene);
 
   // Upload environment and cache for external systems
-  m_CachedEnvironment = scene.GetEnvironment();
+  m_CachedEnvironment = sceneEnvironment;
   m_CachedEditorLightingOverride = editorLightingOverride;
   UploadEnvironmentToShader(m_CachedEnvironment, m_CachedEditorLightingOverride);
 
    // Shadows: ensure resources and render shadow map if enabled
-   const Environment& envSh = scene.GetEnvironment();
+   const Environment& envSh = sceneEnvironment;
    Scene* prevShadowScene = m_ShadowContextScene;
    bool prevShadowEnabled = m_ShadowContextEnabled;
    m_ShadowContextScene = &scene;
@@ -3369,12 +3673,16 @@ void Renderer::RenderScene(Scene& scene) {
   // --------------------------------------
    {
    ScopedTimer t("Render/Sky");
-   const Environment& envForSky = scene.GetEnvironment();
+   const Environment& envForSky = sceneEnvironment;
    glm::vec3 sunDir = ComputePrimarySunDirection(scene);
   glm::vec4 sunDirUniform(sunDir, 0.0f);
   bgfx::setUniform(u_SunDirection, &sunDirUniform);
    if (envForSky.ProceduralSky && bgfx::isValid(m_FullscreenVB) && bgfx::isValid(m_FullscreenIB)) {
-      glm::vec4 skyParams(1.0f, 0.0f, 1.0f, 0.0f);
+      const bool skyboxAvailable = envForSky.UseSkybox && envForSky.SkyboxTexture && envForSky.SkyboxTexture->IsValid();
+      const float skyboxMaxMip = skyboxAvailable
+         ? static_cast<float>(std::max<int>(0, static_cast<int>(envForSky.SkyboxTexture->GetMipCount()) - 1))
+         : 0.0f;
+      glm::vec4 skyParams(1.0f, 0.0f, skyboxMaxMip, 1.0f);
       bgfx::setUniform(u_SkyParams, &skyParams);
 
       float id[16]; bx::mtxIdentity(id);
@@ -3386,9 +3694,7 @@ void Renderer::RenderScene(Scene& scene) {
          // fs_sky always declares s_skybox at slot 0, even when we render the
          // purely procedural branch. Bind a dummy cubemap so D3D11 debug layers
          // don't spam every fullscreen sky draw.
-         const uint32_t skySamplerFlags =
-            BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP | BGFX_SAMPLER_W_CLAMP |
-            BGFX_SAMPLER_MIN_ANISOTROPIC | BGFX_SAMPLER_MAG_ANISOTROPIC;
+         const uint32_t skySamplerFlags = cm::rendering::GetClampTextureSamplerFlags(envForSky, true);
          bgfx::TextureHandle skyboxHandle =
             (envForSky.UseSkybox && envForSky.SkyboxTexture && envForSky.SkyboxTexture->IsValid())
                ? envForSky.SkyboxTexture->GetHandle()
@@ -3534,24 +3840,7 @@ void Renderer::RenderScene(Scene& scene) {
       m_ScratchLights.reserve(static_cast<size_t>(kMaxShaderLights));
    }
    auto buildLightData = [&](const EntityData* data) -> LightData {
-      LightData ld;
-      ld.type = data->Light->Type;
-      ld.color = data->Light->Color * data->Light->Intensity;
-      ld.position = glm::vec3(data->Transform.WorldMatrix[3]);
-      if (data->Light->Type == LightType::Directional) {
-         ld.direction = LightDirectionFromTransform(data->Transform);
-         ld.range = 0.0f;
-         ld.constant = 1.0f;
-         ld.linear = 0.0f;
-         ld.quadratic = 0.0f;
-      } else {
-         ld.direction = glm::vec3(0.0f);
-         ld.range = 50.0f;
-         ld.constant = 1.0f;
-         ld.linear = 0.09f;
-         ld.quadratic = 0.032f;
-      }
-      return ld;
+      return BuildLightDataFromComponent(*data->Light, data->Transform);
    };
    if (!runtimeRenderWorld.Lights.empty()) {
       int primaryDirectionalIndex = -1;
@@ -3574,24 +3863,7 @@ void Renderer::RenderScene(Scene& scene) {
          [](const auto& a, const auto& b) { return a.first < b.first; });
 
       auto appendLight = [&](const cm::world::RuntimeLightEntry& light) {
-         LightData ld{};
-         ld.type = light.Type;
-         ld.color = light.Color * light.Intensity;
-         ld.position = light.Position;
-         if (light.Type == LightType::Directional) {
-            ld.direction = light.Direction;
-            ld.range = 0.0f;
-            ld.constant = 1.0f;
-            ld.linear = 0.0f;
-            ld.quadratic = 0.0f;
-         } else {
-            ld.direction = glm::vec3(0.0f);
-            ld.range = 50.0f;
-            ld.constant = 1.0f;
-            ld.linear = 0.09f;
-            ld.quadratic = 0.032f;
-         }
-         m_ScratchLights.push_back(ld);
+         m_ScratchLights.push_back(BuildLightDataFromRuntime(light));
       };
 
       if (primaryDirectionalIndex >= 0) {
@@ -4173,10 +4445,14 @@ void Renderer::RenderScene(Scene& scene) {
   };
   std::vector<EntityID> mainViewMeshEntityIds;
   std::vector<MainViewMeshInput> mainViewMeshInputs;
+  std::unordered_set<EntityID> mainViewSkinnedShadowEntities;
+  std::unordered_set<EntityID> mainViewSkinnedShadowSkeletonRoots;
   if (!m_ScratchVisibleMeshIds.empty()) {
      mainViewVisibleMeshIds.assign(m_ScratchVisibleMeshIds.size(), 0u);
      mainViewMeshEntityIds.reserve(m_ScratchVisibleMeshIds.size());
      mainViewMeshInputs.reserve(m_ScratchVisibleMeshIds.size());
+     mainViewSkinnedShadowEntities.reserve(64);
+     mainViewSkinnedShadowSkeletonRoots.reserve(64);
 
      std::unordered_map<SkeletonComponent*, bool> skeletonMainViewVisibility;
      skeletonMainViewVisibility.reserve(64);
@@ -4337,6 +4613,12 @@ void Renderer::RenderScene(Scene& scene) {
         input.Skinning = data->Skinning.get();
         input.Skeleton = skeleton;
         mainViewMeshInputs.push_back(input);
+        if (data->Skinning && meshPtr->HasSkinning()) {
+           mainViewSkinnedShadowEntities.insert(eid);
+           if (skelRoot != INVALID_ENTITY_ID) {
+              mainViewSkinnedShadowSkeletonRoots.insert(skelRoot);
+           }
+        }
         if (skeleton) {
            skeletonMainViewVisibility[skeleton] = true;
         }
@@ -4386,13 +4668,185 @@ void Renderer::RenderScene(Scene& scene) {
            ? m_ScratchVisibleMeshIds.size() - mainViewMeshEntityIds.size()
            : 0u));
 
-  const std::vector<EntityID>* skinningShadowEntities = &m_ScratchShadowMeshEntityIds;
-  PrepareGpuSkinningAtlases(scene, m_ScratchVisibleMeshIds, skinningShadowEntities);
-  PrepareGpuMaterializedSkinnedMeshes(scene, m_ScratchVisibleMeshIds, skinningShadowEntities);
+  auto skinnedShadowVisibleInMainView =
+      [&](EntityID entityId, EntityID skelRoot) -> bool {
+     if (!scene.m_IsPlaying) {
+        return true;
+     }
+
+     if (mainViewSkinnedShadowEntities.find(entityId) != mainViewSkinnedShadowEntities.end()) {
+        return true;
+     }
+
+     return skelRoot != INVALID_ENTITY_ID &&
+        mainViewSkinnedShadowSkeletonRoots.find(skelRoot) != mainViewSkinnedShadowSkeletonRoots.end();
+  };
+
+  auto skinnedShadowBoundsMayAffectMainView =
+      [&](const glm::vec3& boundsMin, const glm::vec3& boundsMax) -> bool {
+     if (!scene.m_IsPlaying || !doCull) {
+        return true;
+     }
+
+     if (AabbIntersectsFrustum(fr, boundsMin, boundsMax)) {
+        return true;
+     }
+
+     const glm::vec3 center = (boundsMin + boundsMax) * 0.5f;
+     const float radius = 0.5f * glm::length(boundsMax - boundsMin);
+     const float fringe = glm::clamp(radius * 2.0f + 2.0f, 3.0f, 12.0f);
+     const glm::vec3 margin(fringe);
+     if (AabbIntersectsFrustum(fr, boundsMin - margin, boundsMax + margin)) {
+        return true;
+     }
+
+     return glm::length(center - cameraPosition) <= (radius + 2.0f);
+  };
+
+  auto tryGetShadowPrepBounds =
+      [&](size_t shadowIndex, const EntityData* data, const Mesh* mesh, glm::vec3& outMin, glm::vec3& outMax) -> bool {
+     if (!data || !mesh) {
+        return false;
+     }
+
+     if (tryGetActiveRagdollBounds(data, mesh, outMin, outMax)) {
+        return true;
+     }
+
+     if (runtimeWorld && shadowIndex < m_ScratchShadowMeshHandles.size()) {
+        const cm::world::RuntimeBounds* runtimeBounds =
+           runtimeWorld->TryGetBounds(m_ScratchShadowMeshHandles[shadowIndex]);
+        if (runtimeBounds && runtimeBounds->Valid) {
+           outMin = runtimeBounds->WorldMin;
+           outMax = runtimeBounds->WorldMax;
+           return true;
+        }
+     }
+
+     const glm::vec3 lmin = mesh->BoundsMin;
+     const glm::vec3 lmax = mesh->BoundsMax;
+     const glm::vec3 lcenter = (lmin + lmax) * 0.5f;
+     const glm::vec3 lextents =
+        (lmax - lmin) * 0.5f * std::max(0.01f, data->Mesh ? data->Mesh->BoundsPadding : 1.0f);
+     const glm::mat4& M = data->Transform.WorldMatrix;
+     const glm::vec3 worldCenter = glm::vec3(M * glm::vec4(lcenter, 1.0f));
+     glm::vec3 ex;
+     ex.x = std::abs(M[0][0]) * lextents.x + std::abs(M[1][0]) * lextents.y + std::abs(M[2][0]) * lextents.z;
+     ex.y = std::abs(M[0][1]) * lextents.x + std::abs(M[1][1]) * lextents.y + std::abs(M[2][1]) * lextents.z;
+     ex.z = std::abs(M[0][2]) * lextents.x + std::abs(M[1][2]) * lextents.y + std::abs(M[2][2]) * lextents.z;
+     outMin = worldCenter - ex;
+     outMax = worldCenter + ex;
+     return true;
+  };
+
+  std::vector<EntityID> shadowSkinningPrepEntityIds;
+  std::vector<uint8_t> shadowSkinnedMainViewSkipMask;
+  uint64_t shadowSkinningPrepCandidates = 0;
+  uint64_t shadowSkinningPrepSkipped = 0;
+  uint64_t shadowSkinningMainViewCulled = 0;
+  const bool includeShadowSkinningPrep =
+     renderShadowMapThisFrame && !m_ScratchShadowMeshEntityIds.empty();
+  const bool filterSkinnedShadowWork = includeShadowSkinningPrep && scene.m_IsPlaying && doCull;
+  if (filterSkinnedShadowWork && !m_ScratchShadowMeshEntityIds.empty()) {
+     shadowSkinningPrepEntityIds.reserve(m_ScratchShadowMeshEntityIds.size());
+     shadowSkinnedMainViewSkipMask.assign(m_ScratchShadowMeshEntityIds.size(), 0u);
+
+     // A multi-part skinned character (e.g. body + clothing meshes) shares one
+     // skeleton root but is authored as several shadow-casting entities. The
+     // per-part keep test below can pass for one part and fail for another even
+     // though they occupy the same volume, which historically let only a single
+     // part reach the shadow map. Treat the skeleton group as the unit of work:
+     // remember each part's skeleton root, and once any part of a group is kept
+     // for shadow prep, keep every casting part of that group too.
+     const EntityID kNoSkelRoot = INVALID_ENTITY_ID;
+     std::vector<EntityID> shadowPrepSkelRoots(m_ScratchShadowMeshEntityIds.size(), kNoSkelRoot);
+     std::unordered_set<EntityID> shadowRelevantSkelRoots;
+     shadowRelevantSkelRoots.reserve(16);
+
+     for (size_t shadowIndex = 0; shadowIndex < m_ScratchShadowMeshEntityIds.size(); ++shadowIndex) {
+        const EntityID shadowEntity = m_ScratchShadowMeshEntityIds[shadowIndex];
+        auto* data = shadowIndex < m_ScratchShadowMeshData.size() ? m_ScratchShadowMeshData[shadowIndex] : nullptr;
+        if (!data || !data->Mesh || !data->Mesh->mesh || !data->Skinning) {
+           continue;
+        }
+
+        const Mesh* mesh = data->Mesh->mesh.get();
+        if (!mesh || !mesh->HasSkinning()) {
+           continue;
+        }
+
+        ++shadowSkinningPrepCandidates;
+        const EntityID skelRoot = ResolveSkinningSkeletonRootEntity(data);
+        shadowPrepSkelRoots[shadowIndex] = skelRoot;
+        const bool visibleInMainView = skinnedShadowVisibleInMainView(shadowEntity, skelRoot);
+        bool keepForShadowPrep = visibleInMainView;
+        if (!visibleInMainView) {
+           ++shadowSkinningMainViewCulled;
+           glm::vec3 boundsMin(0.0f);
+           glm::vec3 boundsMax(0.0f);
+           keepForShadowPrep =
+              tryGetShadowPrepBounds(shadowIndex, data, mesh, boundsMin, boundsMax) &&
+              skinnedShadowBoundsMayAffectMainView(boundsMin, boundsMax);
+        }
+
+        if (keepForShadowPrep) {
+           shadowSkinningPrepEntityIds.push_back(shadowEntity);
+           if (skelRoot != kNoSkelRoot) {
+              shadowRelevantSkelRoots.insert(skelRoot);
+           }
+        } else {
+           shadowSkinnedMainViewSkipMask[shadowIndex] = 1u;
+           ++shadowSkinningPrepSkipped;
+        }
+     }
+
+     // Second pass: rescue skipped parts whose skeleton group is shadow-relevant
+     // so the whole character casts a shadow, not just the part that passed.
+     if (!shadowRelevantSkelRoots.empty()) {
+        for (size_t shadowIndex = 0; shadowIndex < shadowSkinnedMainViewSkipMask.size(); ++shadowIndex) {
+           if (shadowSkinnedMainViewSkipMask[shadowIndex] == 0u) {
+              continue;
+           }
+           const EntityID skelRoot = shadowPrepSkelRoots[shadowIndex];
+           if (skelRoot == kNoSkelRoot ||
+               shadowRelevantSkelRoots.find(skelRoot) == shadowRelevantSkelRoots.end()) {
+              continue;
+           }
+           shadowSkinnedMainViewSkipMask[shadowIndex] = 0u;
+           shadowSkinningPrepEntityIds.push_back(m_ScratchShadowMeshEntityIds[shadowIndex]);
+           --shadowSkinningPrepSkipped;
+        }
+     }
+  }
+  Profiler::Get().SetCounter("Render/ShadowSkinningPrepCandidates", shadowSkinningPrepCandidates);
+  Profiler::Get().SetCounter("Render/ShadowSkinningPrepSkipped", shadowSkinningPrepSkipped);
+
+  const std::vector<EntityID>* skinningShadowEntities = nullptr;
+  if (filterSkinnedShadowWork) {
+     skinningShadowEntities =
+        shadowSkinningPrepEntityIds.empty() ? nullptr : &shadowSkinningPrepEntityIds;
+  } else if (includeShadowSkinningPrep) {
+     skinningShadowEntities = &m_ScratchShadowMeshEntityIds;
+  }
+  { ScopedTimer tAtlas("Render/SkinningAtlasPrep");
+  PrepareGpuSkinningAtlases(scene, mainViewMeshEntityIds, skinningShadowEntities);
+  }
+  // Materialized skinning is substantially more GPU-expensive than the atlas
+  // setup above, so keep it limited to meshes that actually survived the
+  // main-view cull. Shadow-only and editor-side passes can reuse these
+  // buffers when available and otherwise fall back to direct skinned draws.
+  { ScopedTimer tMat("Render/MaterializedSkinningPrep");
+  PrepareGpuMaterializedSkinnedMeshes(scene, mainViewMeshEntityIds);
+  }
 
   if (renderShadowMapThisFrame) {
      ScopedTimer t("Render/Shadows");
-     RenderShadowMap(scene, renderCamera);
+     RenderShadowMap(
+        scene,
+        renderCamera,
+        shadowSkinnedMainViewSkipMask.empty() ? nullptr : &shadowSkinnedMainViewSkipMask,
+        shadowSkinningMainViewCulled,
+        shadowSkinningPrepSkipped);
   } else {
      m_ShadowCascadeSubmitCounts = {0u, 0u, 0u, 0u};
   }
@@ -5512,10 +5966,7 @@ void Renderer::RenderScene(Scene& scene) {
   // --------------------------------------
   { ScopedTimer t("Render/Terrain");
   const Environment& terrainEnv = scene.GetEnvironment();
-  const uint32_t terrainSamplerFlags =
-      (terrainEnv.TextureFilter == Environment::TextureFilterMode::Point)
-          ? (BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT | BGFX_SAMPLER_MIP_POINT)
-          : (BGFX_SAMPLER_MIN_ANISOTROPIC | BGFX_SAMPLER_MAG_ANISOTROPIC);
+  const uint32_t terrainSamplerFlags = cm::rendering::GetTextureFilterFlags(terrainEnv.TextureFilter);
   const uint32_t terrainDataSamplerFlags =
       BGFX_SAMPLER_MIN_POINT |
       BGFX_SAMPLER_MAG_POINT |
@@ -6550,45 +7001,56 @@ void Renderer::RenderUIOverlay(Scene& scene,
             return cacheIt->second;
          }
 
+         // When a world-space canvas is rendered into a supersampled offscreen
+         // target, scale all UI up by that factor so the higher-resolution target
+         // carries proportionally more detail (crisp text). The reference ratio is
+         // computed against the logical, pre-supersample size so it isn't counted
+         // twice; the supersample is then applied uniformly at the end (covering
+         // ConstantPixelSize and reference-less canvases too).
+         const float superSample = m_WorldCanvasSupersample;
+         const float effW = (superSample > 1.0f && m_WorldCanvasLogicalWidth > 0)
+            ? static_cast<float>(m_WorldCanvasLogicalWidth) : static_cast<float>(m_Width);
+         const float effH = (superSample > 1.0f && m_WorldCanvasLogicalHeight > 0)
+            ? static_cast<float>(m_WorldCanvasLogicalHeight) : static_cast<float>(m_Height);
+
          glm::vec2 resolvedScale(1.0f, 1.0f);
-         if (!canvas || canvas->ReferenceWidth <= 0 || canvas->ReferenceHeight <= 0) {
-            canvasScaleCache[canvas] = resolvedScale;
-            return resolvedScale;  // No reference resolution = no scaling
+         if (canvas && canvas->ReferenceWidth > 0 && canvas->ReferenceHeight > 0) {
+            float refW = static_cast<float>(canvas->ReferenceWidth);
+            float refH = static_cast<float>(canvas->ReferenceHeight);
+            float scaleX = effW / refW;
+            float scaleY = effH / refH;
+
+            switch (canvas->ReferenceScaleMode) {
+               case CanvasComponent::ScaleMode::ConstantPixelSize:
+                  resolvedScale = glm::vec2(1.0f, 1.0f);  // No scaling
+                  break;
+               case CanvasComponent::ScaleMode::ScaleWithWidth:
+                  resolvedScale = glm::vec2(scaleX, scaleX);  // Use width scale for both axes
+                  break;
+               case CanvasComponent::ScaleMode::ScaleWithHeight:
+                  resolvedScale = glm::vec2(scaleY, scaleY);  // Use height scale for both axes
+                  break;
+               case CanvasComponent::ScaleMode::ScaleWithSmallest:
+                  {
+                     float minScale = std::min(scaleX, scaleY);
+                     resolvedScale = glm::vec2(minScale, minScale);
+                  }
+                  break;
+               case CanvasComponent::ScaleMode::ScaleWithLargest:
+                  {
+                     float maxScale = std::max(scaleX, scaleY);
+                     resolvedScale = glm::vec2(maxScale, maxScale);
+                  }
+                  break;
+               case CanvasComponent::ScaleMode::Expand:
+                  resolvedScale = glm::vec2(scaleX, scaleY);  // Independent scaling per axis
+                  break;
+               default:
+                  break;
+            }
          }
-         
-         float refW = static_cast<float>(canvas->ReferenceWidth);
-         float refH = static_cast<float>(canvas->ReferenceHeight);
-         float scaleX = static_cast<float>(m_Width) / refW;
-         float scaleY = static_cast<float>(m_Height) / refH;
-         
-         switch (canvas->ReferenceScaleMode) {
-            case CanvasComponent::ScaleMode::ConstantPixelSize:
-               resolvedScale = glm::vec2(1.0f, 1.0f);  // No scaling
-               break;
-            case CanvasComponent::ScaleMode::ScaleWithWidth:
-               resolvedScale = glm::vec2(scaleX, scaleX);  // Use width scale for both axes
-               break;
-            case CanvasComponent::ScaleMode::ScaleWithHeight:
-               resolvedScale = glm::vec2(scaleY, scaleY);  // Use height scale for both axes
-               break;
-            case CanvasComponent::ScaleMode::ScaleWithSmallest:
-               {
-                  float minScale = std::min(scaleX, scaleY);
-                  resolvedScale = glm::vec2(minScale, minScale);
-               }
-               break;
-            case CanvasComponent::ScaleMode::ScaleWithLargest:
-               {
-                  float maxScale = std::max(scaleX, scaleY);
-                  resolvedScale = glm::vec2(maxScale, maxScale);
-               }
-               break;
-            case CanvasComponent::ScaleMode::Expand:
-               resolvedScale = glm::vec2(scaleX, scaleY);  // Independent scaling per axis
-               break;
-            default:
-               break;
-         }
+
+         resolvedScale *= superSample;
          canvasScaleCache[canvas] = resolvedScale;
          return resolvedScale;
       };
@@ -9580,8 +10042,11 @@ void Renderer::RenderWorldSpaceCanvases(Scene& scene,
       glm::mat4 model = glm::mat4(1.0f);
       float quadWidth = 0.0f;
       float quadHeight = 0.0f;
-      uint32_t renderWidth = 0;
+      uint32_t renderWidth = 0;   // offscreen texture resolution (logical * supersample)
       uint32_t renderHeight = 0;
+      uint32_t logicalWidth = 0;  // pre-supersample size; drives the world-space quad size
+      uint32_t logicalHeight = 0;
+      float supersample = 1.0f;
       float hitDistance = std::numeric_limits<float>::max();
       float hitMouseX = 0.0f;
       float hitMouseY = 0.0f;
@@ -9605,10 +10070,24 @@ void Renderer::RenderWorldSpaceCanvases(Scene& scene,
       WorldCanvasEntry entry;
       entry.entityId = entityId;
       entry.canvas = data->Canvas.get();
-      entry.renderWidth = ResolveWorldCanvasRenderDimension(entry.canvas->Width, entry.canvas->ReferenceWidth, width);
-      entry.renderHeight = ResolveWorldCanvasRenderDimension(entry.canvas->Height, entry.canvas->ReferenceHeight, height);
-      entry.quadWidth = static_cast<float>(entry.renderWidth) * 0.01f;
-      entry.quadHeight = static_cast<float>(entry.renderHeight) * 0.01f;
+      // Logical size drives the world-space quad (and therefore the on-screen size).
+      entry.logicalWidth = ResolveWorldCanvasRenderDimension(entry.canvas->Width, entry.canvas->ReferenceWidth, width);
+      entry.logicalHeight = ResolveWorldCanvasRenderDimension(entry.canvas->Height, entry.canvas->ReferenceHeight, height);
+      // Render the offscreen target at a supersampled resolution so the text and
+      // UI baked into it stay crisp when the quad is magnified up close. The quad
+      // itself keeps the logical world size, so this only adds texel density.
+      constexpr uint32_t kMaxWorldCanvasDim = 2048;
+      float superSample = 2.0f;
+      while (superSample > 1.0f &&
+             (static_cast<uint32_t>(entry.logicalWidth * superSample) > kMaxWorldCanvasDim ||
+              static_cast<uint32_t>(entry.logicalHeight * superSample) > kMaxWorldCanvasDim)) {
+         superSample -= 0.5f;
+      }
+      entry.supersample = superSample;
+      entry.renderWidth = std::max<uint32_t>(1u, static_cast<uint32_t>(entry.logicalWidth * superSample));
+      entry.renderHeight = std::max<uint32_t>(1u, static_cast<uint32_t>(entry.logicalHeight * superSample));
+      entry.quadWidth = static_cast<float>(entry.logicalWidth) * 0.01f;
+      entry.quadHeight = static_cast<float>(entry.logicalHeight) * 0.01f;
       entry.model = entry.canvas->Billboard
          ? BuildCanvasBillboardMatrix(data->Transform.WorldMatrix, viewMatrix)
          : data->Transform.WorldMatrix;
@@ -9827,6 +10306,12 @@ void Renderer::RenderWorldSpaceCanvases(Scene& scene,
          m_UIMouseNormalizedValid = false;
       }
 
+      // Carry the offscreen supersample through canvas scaling so layout offsets
+      // and text atlas sizes both scale up uniformly (see getCanvasScale).
+      m_WorldCanvasSupersample = canvasEntry.supersample;
+      m_WorldCanvasLogicalWidth = canvasEntry.logicalWidth;
+      m_WorldCanvasLogicalHeight = canvasEntry.logicalHeight;
+
       RenderUIOverlay(
          scene,
          viewBase,
@@ -9838,6 +10323,10 @@ void Renderer::RenderWorldSpaceCanvases(Scene& scene,
          &currentOffscreenViewIds,
          false,
          false);
+
+      m_WorldCanvasSupersample = 1.0f;
+      m_WorldCanvasLogicalWidth = 0;
+      m_WorldCanvasLogicalHeight = 0;
 
       if (canvasAllowInput) {
          m_UIMouseX = savedMouseX;
@@ -9857,10 +10346,13 @@ void Renderer::RenderWorldSpaceCanvases(Scene& scene,
    m_UIMouseNY = savedMouseNY;
    m_UIMouseValid = savedMouseValid;
    m_UIMouseNormalizedValid = savedMouseNormalizedValid;
+   SubmitScenePresentPass();
 }
 
 void Renderer::RenderScene(Scene& scene, uint16_t viewId)
    {
+   Environment& sceneEnvironment = scene.GetEnvironment();
+   EnsureEnvironmentSkyboxResources(sceneEnvironment);
    // Prepare camera matrices (respect scene camera only while playing)
    Camera* renderCamera = scene.m_IsPlaying ? scene.GetActiveCamera() : nullptr;
    if (!renderCamera) renderCamera = m_RendererCamera;
@@ -9879,18 +10371,30 @@ void Renderer::RenderScene(Scene& scene, uint16_t viewId)
    uint32_t activeLayerMask = 0xFFFFFFFFu;
    bool enforceLayerMask = false;
    if (scene.m_IsPlaying) {
-      for (const auto& eCam : scene.GetEntities()) {
-         auto* dCam = scene.GetEntityData(eCam.GetID());
+      // PERF: iterate cached RuntimeWorld camera list instead of every entity.
+      const cm::world::RuntimeWorld* camRw = scene.GetRuntimeWorld();
+      auto matchRenderCamera = [&](EntityID camId) -> bool {
+         auto* dCam = scene.GetEntityData(camId);
          if (dCam && dCam->Camera && &dCam->Camera->Camera == renderCamera) {
             activeLayerMask = dCam->Camera->LayerMask;
             enforceLayerMask = true;
-            break;
+            return true;
+         }
+         return false;
+      };
+      if (camRw && !camRw->GetCameraSceneEntities().empty()) {
+         for (EntityID camId : camRw->GetCameraSceneEntities()) {
+            if (matchRenderCamera(camId)) break;
+         }
+      } else {
+         for (const auto& eCam : scene.GetEntities()) {
+            if (matchRenderCamera(eCam.GetID())) break;
          }
       }
    }
 
    const bool editorLightingOverride = ShouldApplyEditorLightingOverride(scene);
-   UploadEnvironmentToShader(scene.GetEnvironment(), editorLightingOverride);
+   UploadEnvironmentToShader(sceneEnvironment, editorLightingOverride);
 
    Scene* prevShadowScene = m_ShadowContextScene;
    bool prevShadowEnabled = m_ShadowContextEnabled;
@@ -9900,37 +10404,36 @@ void Renderer::RenderScene(Scene& scene, uint16_t viewId)
 
    // PERFORMANCE: Use scratch buffer instead of per-frame allocation
    m_ScratchLights.clear();
-   if (m_ScratchLights.capacity() < static_cast<size_t>(kMaxShaderLights)) {
-      m_ScratchLights.reserve(static_cast<size_t>(kMaxShaderLights));
-   }
-   auto buildLightData = [&](const EntityData* data) -> LightData {
-      LightData ld;
-      ld.type = data->Light->Type;
-      ld.color = data->Light->Color * data->Light->Intensity;
-      ld.position = glm::vec3(data->Transform.WorldMatrix[3]);
-      if (data->Light->Type == LightType::Directional) {
-         ld.direction = LightDirectionFromTransform(data->Transform);
-         ld.range = 0.0f; ld.constant = 1.0f; ld.linear = 0.0f; ld.quadratic = 0.0f;
-      } else {
-         ld.direction = glm::vec3(0.0f);
-         ld.range = 50.0f; ld.constant = 1.0f; ld.linear = 0.09f; ld.quadratic = 0.032f;
-      }
-      return ld;
-   };
+    if (m_ScratchLights.capacity() < static_cast<size_t>(kMaxShaderLights)) {
+        m_ScratchLights.reserve(static_cast<size_t>(kMaxShaderLights));
+    }
+    auto buildLightData = [&](const EntityData* data) -> LightData {
+        return BuildLightDataFromComponent(*data->Light, data->Transform);
+    };
    EntityID primaryDirectional = INVALID_ENTITY_ID;
    std::vector<std::pair<float, EntityID>> pointCandidates;
-   pointCandidates.reserve(scene.GetEntities().size());
    const glm::vec3 lightSelectOrigin = renderCamera ? renderCamera->GetPosition() : glm::vec3(0.0f);
-   for (auto& entity : scene.GetEntities()) {
-      auto* data = scene.GetEntityData(entity.GetID());
-      if (!data || !data->Light || !IsPresentationVisible(data)) continue;
+   // PERF: iterate the cached RuntimeWorld light list (O(lights)) instead of every
+   // entity (O(scene)); per-light predicate is unchanged, so behavior is preserved.
+   auto collectLightCandidate = [&](EntityID lightId) {
+      auto* data = scene.GetEntityData(lightId);
+      if (!data || !data->Light || !IsPresentationVisible(data)) return;
       if (data->Light->Type == LightType::Directional) {
-         if (primaryDirectional == INVALID_ENTITY_ID) primaryDirectional = entity.GetID();
-         continue;
+         if (primaryDirectional == INVALID_ENTITY_ID) primaryDirectional = lightId;
+         return;
       }
       const glm::vec3 lp = glm::vec3(data->Transform.WorldMatrix[3]);
       const float distSq = glm::dot(lp - lightSelectOrigin, lp - lightSelectOrigin);
-      pointCandidates.emplace_back(distSq, entity.GetID());
+      pointCandidates.emplace_back(distSq, lightId);
+   };
+   const cm::world::RuntimeWorld* lightRw = scene.GetRuntimeWorld();
+   if (lightRw && !lightRw->GetLightSceneEntities().empty()) {
+      const auto& lightIds = lightRw->GetLightSceneEntities();
+      pointCandidates.reserve(lightIds.size());
+      for (EntityID lightId : lightIds) collectLightCandidate(lightId);
+   } else {
+      pointCandidates.reserve(scene.GetEntities().size());
+      for (const auto& entity : scene.GetEntities()) collectLightCandidate(entity.GetID());
    }
    std::sort(pointCandidates.begin(), pointCandidates.end(),
       [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -10023,7 +10526,6 @@ void Renderer::RenderScene(Scene& scene, uint16_t viewId)
    }
 
    PrepareGpuSkinningAtlases(scene, m_ScratchVisibleMeshIds);
-   PrepareGpuMaterializedSkinnedMeshes(scene, m_ScratchVisibleMeshIds);
 
    // Build frustum from THIS render's camera matrices for proper culling in offscreen views
    // (Don't use m_view/m_proj which belong to the main viewport)
@@ -10333,17 +10835,30 @@ void Renderer::RenderScene(const RenderContext& ctx)
     uint32_t activeLayerMask = 0xFFFFFFFFu;
     bool enforceLayerMask = false;
     if (scene.m_IsPlaying) {
-        for (const auto& eCam : scene.GetEntities()) {
-            auto* dCam = scene.GetEntityData(eCam.GetID());
+        // PERF: iterate cached RuntimeWorld camera list instead of every entity.
+        const cm::world::RuntimeWorld* camRw = scene.GetRuntimeWorld();
+        auto matchRenderCamera = [&](EntityID camId) -> bool {
+            auto* dCam = scene.GetEntityData(camId);
             if (dCam && dCam->Camera && &dCam->Camera->Camera == renderCamera) {
                 activeLayerMask = dCam->Camera->LayerMask;
                 enforceLayerMask = true;
-                break;
+                return true;
+            }
+            return false;
+        };
+        if (camRw && !camRw->GetCameraSceneEntities().empty()) {
+            for (EntityID camId : camRw->GetCameraSceneEntities()) {
+                if (matchRenderCamera(camId)) break;
+            }
+        } else {
+            for (const auto& eCam : scene.GetEntities()) {
+                if (matchRenderCamera(eCam.GetID())) break;
             }
         }
     }
     
-    const Environment& env = scene.GetEnvironment();
+    Environment& env = scene.GetEnvironment();
+    EnsureEnvironmentSkyboxResources(env);
     const bool editorLightingOverride = ShouldApplyEditorLightingOverride(scene);
     UploadEnvironmentToShader(env, editorLightingOverride || ctx.forceFogDisabled);
 
@@ -10358,33 +10873,32 @@ void Renderer::RenderScene(const RenderContext& ctx)
         m_ScratchLights.reserve(static_cast<size_t>(kMaxShaderLights));
     }
     auto buildLightData = [&](const EntityData* data) -> LightData {
-        LightData ld;
-        ld.type = data->Light->Type;
-        ld.color = data->Light->Color * data->Light->Intensity;
-        ld.position = glm::vec3(data->Transform.WorldMatrix[3]);
-        if (data->Light->Type == LightType::Directional) {
-            ld.direction = LightDirectionFromTransform(data->Transform);
-            ld.range = 0.0f; ld.constant = 1.0f; ld.linear = 0.0f; ld.quadratic = 0.0f;
-        } else {
-            ld.direction = glm::vec3(0.0f);
-            ld.range = 50.0f; ld.constant = 1.0f; ld.linear = 0.09f; ld.quadratic = 0.032f;
-        }
-        return ld;
+        return BuildLightDataFromComponent(*data->Light, data->Transform);
     };
     EntityID primaryDirectional = INVALID_ENTITY_ID;
     std::vector<std::pair<float, EntityID>> pointCandidates;
-    pointCandidates.reserve(scene.GetEntities().size());
     const glm::vec3 lightSelectOrigin = renderCamera ? renderCamera->GetPosition() : glm::vec3(0.0f);
-    for (auto& entity : scene.GetEntities()) {
-        auto* data = scene.GetEntityData(entity.GetID());
-        if (!data || !data->Light || !IsPresentationVisible(data) || !data->Active) continue;
+    // PERF: iterate the cached RuntimeWorld light list (O(lights)) instead of every
+    // entity (O(scene)); per-light predicate is unchanged, so behavior is preserved.
+    auto collectLightCandidate = [&](EntityID lightId) {
+        auto* data = scene.GetEntityData(lightId);
+        if (!data || !data->Light || !IsPresentationVisible(data) || !data->Active) return;
         if (data->Light->Type == LightType::Directional) {
-            if (primaryDirectional == INVALID_ENTITY_ID) primaryDirectional = entity.GetID();
-            continue;
+            if (primaryDirectional == INVALID_ENTITY_ID) primaryDirectional = lightId;
+            return;
         }
         const glm::vec3 lp = glm::vec3(data->Transform.WorldMatrix[3]);
         const float distSq = glm::dot(lp - lightSelectOrigin, lp - lightSelectOrigin);
-        pointCandidates.emplace_back(distSq, entity.GetID());
+        pointCandidates.emplace_back(distSq, lightId);
+    };
+    const cm::world::RuntimeWorld* lightRw = scene.GetRuntimeWorld();
+    if (lightRw && !lightRw->GetLightSceneEntities().empty()) {
+        const auto& lightIds = lightRw->GetLightSceneEntities();
+        pointCandidates.reserve(lightIds.size());
+        for (EntityID lightId : lightIds) collectLightCandidate(lightId);
+    } else {
+        pointCandidates.reserve(scene.GetEntities().size());
+        for (const auto& entity : scene.GetEntities()) collectLightCandidate(entity.GetID());
     }
     std::sort(pointCandidates.begin(), pointCandidates.end(),
         [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -10505,7 +11019,6 @@ void Renderer::RenderScene(const RenderContext& ctx)
     };
 
     PrepareGpuSkinningAtlases(scene, m_ScratchVisibleMeshIds);
-    PrepareGpuMaterializedSkinnedMeshes(scene, m_ScratchVisibleMeshIds);
     
     // Render meshes
     { ScopedTimer t("Render/Viewport/Meshes");
@@ -10878,7 +11391,7 @@ void Renderer::DrawMesh(const Mesh& mesh, const float* transform, const Material
 
 // ---------------- Light Management ----------------
 void Renderer::UploadLightsToShader(const std::vector<LightData>&lights) {
-   glm::vec4 colors[kMaxShaderLights], positions[kMaxShaderLights], params[kMaxShaderLights];
+   glm::vec4 colors[kMaxShaderLights], positions[kMaxShaderLights], directions[kMaxShaderLights], params[kMaxShaderLights], spotParams[kMaxShaderLights];
 
    for (int i = 0; i < kMaxShaderLights; ++i) {
       if (i < lights.size()) {
@@ -10888,29 +11401,34 @@ void Renderer::UploadLightsToShader(const std::vector<LightData>&lights) {
          colors[i] = glm::vec4(light.color, 1.0f);
 
          if (light.type == LightType::Directional) {
-            // For directional lights: xyz = direction, w = 0 (directional)
-            positions[i] = glm::vec4(light.direction, 0.0f);
-            }
-         else {
-            // For point lights: xyz = position, w = 1 (point)
+            positions[i] = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);
+         } else if (light.type == LightType::Point) {
             positions[i] = glm::vec4(light.position, 1.0f);
-            }
+         } else {
+            positions[i] = glm::vec4(light.position, 2.0f);
+         }
+         directions[i] = glm::vec4(light.direction, 0.0f);
 
          // Light parameters: x = range, y = constant, z = linear, w = quadratic
          params[i] = glm::vec4(light.range, light.constant, light.linear, light.quadratic);
-         }
+         spotParams[i] = glm::vec4(light.spotInnerCos, light.spotOuterCos, 0.0f, 0.0f);
+      }
       else {
          // Disabled light
          colors[i] = glm::vec4(0.0f);
          positions[i] = glm::vec4(0.0f);
+         directions[i] = glm::vec4(0.0f);
          params[i] = glm::vec4(0.0f);
-         }
+         spotParams[i] = glm::vec4(1.0f, 1.0f, 0.0f, 0.0f);
       }
+   }
 
    bgfx::setUniform(u_LightColors, colors, kMaxShaderLights);
    bgfx::setUniform(u_LightPositions, positions, kMaxShaderLights);
+   bgfx::setUniform(u_LightDirections, directions, kMaxShaderLights);
    bgfx::setUniform(u_LightParams, params, kMaxShaderLights);
-   }
+   bgfx::setUniform(u_LightSpotParams, spotParams, kMaxShaderLights);
+}
 
 void Renderer::UploadEnvironmentToShader(const Environment & env, bool forceFogDisabled)
    {
@@ -10926,9 +11444,17 @@ void Renderer::UploadEnvironmentToShader(const Environment & env, bool forceFogD
    glm::vec4 fogParams(fogDensity, env.FogColor.r, env.FogColor.g, env.FogColor.b);
    bgfx::setUniform(u_FogParams, &fogParams);
 
-   // Sky params: x = procedural sky active, y = skybox cubemap available.
+   // Sky params: x = procedural sky active, y = skybox cubemap available,
+   // z = max skybox mip level for reflection LOD, w = sky-pass gamma flag.
    const bool skyboxAvailable = env.UseSkybox && env.SkyboxTexture && env.SkyboxTexture->IsValid();
-   glm::vec4 skyParams(env.ProceduralSky ? 1.0f : 0.0f, skyboxAvailable ? 1.0f : 0.0f, 0.0f, 0.0f);
+   const float skyboxMaxMip = skyboxAvailable
+      ? static_cast<float>(std::max<int>(0, static_cast<int>(env.SkyboxTexture->GetMipCount()) - 1))
+      : 0.0f;
+   glm::vec4 skyParams(
+      env.ProceduralSky ? 1.0f : 0.0f,
+      skyboxAvailable ? 1.0f : 0.0f,
+      skyboxMaxMip,
+      0.0f);
    bgfx::setUniform(u_SkyParams, &skyParams);
    
     // Unity-style sky parameters
@@ -12054,7 +12580,6 @@ void Renderer::RenderObjectIdScene(Scene& scene, uint16_t viewId) {
       "Render/ObjectIdVisibleCandidates",
       static_cast<uint64_t>(m_ScratchVisibleMeshIds.size()));
    PrepareGpuSkinningAtlases(scene, m_ScratchVisibleMeshIds);
-   PrepareGpuMaterializedSkinnedMeshes(scene, m_ScratchVisibleMeshIds);
 
    Renderer::SkinningBindCacheState skinningCache{};
    uint64_t objectIdSkinnedBatchedInstances = 0;
@@ -12291,7 +12816,6 @@ void Renderer::DrawEntityOutline(Scene & scene, EntityID selectedEntity) {
 
       const std::vector<EntityID> outlinedMeshIds{ selectedEntity };
       PrepareGpuSkinningAtlases(scene, outlinedMeshIds);
-      PrepareGpuMaterializedSkinnedMeshes(scene, outlinedMeshIds);
 
       std::shared_ptr<Mesh> meshPtr = data->Mesh->mesh;
       if (HasRenderableVertexSource(*this, data, meshPtr.get())) {
@@ -12506,7 +13030,6 @@ void Renderer::DrawEntityOutline(Scene& scene, EntityID entityId, const glm::vec
 
       const std::vector<EntityID> outlinedMeshIds{ entityId };
       PrepareGpuSkinningAtlases(scene, outlinedMeshIds);
-      PrepareGpuMaterializedSkinnedMeshes(scene, outlinedMeshIds);
 
       std::shared_ptr<Mesh> meshPtr = data->Mesh->mesh;
       if (HasRenderableVertexSource(*this, data, meshPtr.get())) {
@@ -13019,7 +13542,12 @@ static glm::mat4 OrthoOffCenter(float left, float right, float bottom, float top
    return m;
 }
 
-void Renderer::RenderShadowMap(Scene& scene, const Camera* camera)
+void Renderer::RenderShadowMap(
+   Scene& scene,
+   const Camera* camera,
+   const std::vector<uint8_t>* skinnedShadowMainViewSkipMask,
+   uint64_t precomputedSkinnedShadowMainViewCulled,
+   uint64_t precomputedSkinnedShadowOffscreenSkipped)
 {
    const bool hasDirectionalShadowTarget = bgfx::isValid(m_ShadowFB);
    const bool hasPointShadowTarget = bgfx::isValid(m_PointShadowFB) && bgfx::isValid(m_PointShadowColor);
@@ -13292,8 +13820,8 @@ void Renderer::RenderShadowMap(Scene& scene, const Camera* camera)
    uint64_t shadowCastersScanned = 0;
    uint64_t shadowCascadeCulled = 0;
    uint64_t shadowSkinnedCascadeSkipped = 0;
-   uint64_t shadowSkinnedOffscreenSkipped = 0;
-   uint64_t shadowMainViewCulled = 0;
+   uint64_t shadowSkinnedOffscreenSkipped = precomputedSkinnedShadowOffscreenSkipped;
+   uint64_t shadowMainViewCulled = precomputedSkinnedShadowMainViewCulled;
    uint64_t shadowCascadeSubmits = 0;
    uint64_t shadowSkinnedBatchedInstances = 0;
   std::array<uint32_t, 4> cascadeSubmitCounts = {0u, 0u, 0u, 0u};
@@ -13338,6 +13866,12 @@ void Renderer::RenderShadowMap(Scene& scene, const Camera* camera)
       return true;
    };
 
+   auto shouldSkipSkinnedShadowForMainView = [&](size_t shadowIndex) -> bool {
+      return skinnedShadowMainViewSkipMask != nullptr &&
+         shadowIndex < skinnedShadowMainViewSkipMask->size() &&
+         (*skinnedShadowMainViewSkipMask)[shadowIndex] != 0u;
+   };
+
    // =========================================================================
    // PERF: Shadow LOD - skip small or distant objects from shadow maps
    // This significantly reduces shadow pass draw calls for complex scenes.
@@ -13378,6 +13912,10 @@ void Renderer::RenderShadowMap(Scene& scene, const Camera* camera)
       if (!IsPresentationVisible(d) || !d->Active || !d->Mesh || !d->Mesh->mesh) continue;
       std::shared_ptr<Mesh> meshPtr = d->Mesh->mesh; if (!meshPtr) continue;
       if (!HasRenderableVertexSource(*this, d, meshPtr.get())) continue;
+      const bool isSkinnedCaster = meshPtr->HasSkinning();
+      if (isSkinnedCaster && shouldSkipSkinnedShadowForMainView(shadowIndex)) {
+         continue;
+      }
 
       glm::vec3 shadowCullMin(0.0f);
       glm::vec3 shadowCullMax(0.0f);
@@ -13412,8 +13950,7 @@ void Renderer::RenderShadowMap(Scene& scene, const Camera* camera)
          if (screenSize < minShadowScreenSize) continue;
       }
 
-      const EntityID skelRoot = haveSharedSkinnedBounds ? ResolveSkinningSkeletonRootEntity(d) : INVALID_ENTITY_ID;
-      const bool isSkinnedCaster = meshPtr->HasSkinning();
+      const EntityID skelRoot = isSkinnedCaster ? ResolveSkinningSkeletonRootEntity(d) : INVALID_ENTITY_ID;
       const bool gpuMorphSkinnedCaster =
          isSkinnedCaster &&
          d->Skinning &&
@@ -13436,7 +13973,7 @@ void Renderer::RenderShadowMap(Scene& scene, const Camera* camera)
             : 0.0f;
       for (int ci = 0; ci < m_CascadeCount; ++ci) {
          bool visibleInCascade = false;
-         if (skelRoot != INVALID_ENTITY_ID) {
+         if (haveSharedSkinnedBounds && skelRoot != INVALID_ENTITY_ID) {
             auto& cache = shadowCascadeVisibilityCache[ci];
             auto cacheIt = cache.find(skelRoot);
             if (cacheIt == cache.end()) {
@@ -14160,7 +14697,7 @@ void Renderer::RenderShadowMap(Scene& scene, const Camera* camera)
             c.entity = selectedShaderLights[slot];
             c.shaderSlot = static_cast<int>(slot);
             c.position = glm::vec3(d->Transform.WorldMatrix[3]);
-            c.range = 50.0f;
+            c.range = glm::max(d->Light->Range, 0.5f);
             c.cameraDistSq = glm::dot(c.position - camPos, c.position - camPos);
             // Coarse gate: skip lights far from camera where shadows are unlikely visible.
             const float maxShadowDist = shadowFar + c.range;
@@ -14206,6 +14743,10 @@ void Renderer::RenderShadowMap(Scene& scene, const Camera* camera)
                if (!IsPresentationVisible(d) || !d->Active || !d->Mesh || !d->Mesh->mesh) continue;
                std::shared_ptr<Mesh> meshPtr = d->Mesh->mesh;
                if (!meshPtr) continue;
+               const bool isSkinnedCaster = meshPtr->HasSkinning();
+               if (isSkinnedCaster && shouldSkipSkinnedShadowForMainView(shadowIndex)) {
+                  continue;
+               }
                glm::vec3 worldMin(0.0f);
                glm::vec3 worldMax(0.0f);
                if (!tryGetRuntimeShadowBounds(shadowIndex, worldMin, worldMax)) {
@@ -14222,7 +14763,6 @@ void Renderer::RenderShadowMap(Scene& scene, const Camera* camera)
                }
                glm::vec3 meshCenterWS = 0.5f * (worldMin + worldMax);
                float radius = 0.5f * glm::length(worldMax - worldMin);
-               const bool isSkinnedCaster = meshPtr->HasSkinning();
                if (isSkinnedCaster && tryGetShadowRagdollBounds(d, meshPtr.get(), worldMin, worldMax)) {
                   meshCenterWS = 0.5f * (worldMin + worldMax);
                   radius = 0.5f * glm::length(worldMax - worldMin);
@@ -14287,6 +14827,10 @@ void Renderer::RenderShadowMap(Scene& scene, const Camera* camera)
                   if (!IsPresentationVisible(d) || !d->Active || !d->Mesh || !d->Mesh->mesh) continue;
                   std::shared_ptr<Mesh> meshPtr = d->Mesh->mesh; if (!meshPtr) continue;
                   if (!HasRenderableVertexSource(*this, d, meshPtr.get())) continue;
+                  const bool isSkinnedCaster = meshPtr->HasSkinning();
+                  if (isSkinnedCaster && shouldSkipSkinnedShadowForMainView(shadowIndex)) {
+                     continue;
+                  }
 
                   // Fine spatial gate per light: skip casters outside influence sphere.
                   glm::vec3 worldMin(0.0f);
@@ -14305,7 +14849,6 @@ void Renderer::RenderShadowMap(Scene& scene, const Camera* camera)
                   }
                   glm::vec3 meshCenterWS = 0.5f * (worldMin + worldMax);
                   float radius = 0.5f * glm::length(worldMax - worldMin);
-                  const bool isSkinnedCaster = meshPtr->HasSkinning();
                   if (isSkinnedCaster && tryGetShadowRagdollBounds(d, meshPtr.get(), worldMin, worldMax)) {
                      meshCenterWS = 0.5f * (worldMin + worldMax);
                      radius = 0.5f * glm::length(worldMax - worldMin);
@@ -14700,9 +15243,7 @@ void Renderer::BindShadowUniforms()
       bgfx::setTexture(8, s_PointShadowMap, s_pointDummy, pointShadowSamplerFlags);
    }
 
-   const uint32_t skyboxSamplerFlags =
-      BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP | BGFX_SAMPLER_W_CLAMP |
-      BGFX_SAMPLER_MIN_ANISOTROPIC | BGFX_SAMPLER_MAG_ANISOTROPIC;
+   const uint32_t skyboxSamplerFlags = cm::rendering::GetClampTextureSamplerFlags(env, true);
    if (env.UseSkybox && env.SkyboxTexture && env.SkyboxTexture->IsValid()) {
       bgfx::setTexture(9, s_Skybox, env.SkyboxTexture->GetHandle(), skyboxSamplerFlags);
    } else {

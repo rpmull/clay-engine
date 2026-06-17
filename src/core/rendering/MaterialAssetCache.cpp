@@ -111,5 +111,10 @@ void Invalidate(const std::string& assetPath)
     s_cache.erase(key);
 }
 
-} // namespace MaterialAssetCache
+void Clear()
+{
+    std::lock_guard<std::mutex> guard(s_mutex);
+    s_cache.clear();
+}
 
+} // namespace MaterialAssetCache

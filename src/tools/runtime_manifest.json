@@ -1,0 +1,16 @@
+{
+  "description": "Runtime files required for standalone game builds. Claymore.exe is renamed to ProjectName.exe automatically.",
+  "binaries": [
+    "nethost.dll"
+  ],
+  "managed": [
+    "ClaymoreEngine.dll",
+    "ClaymoreEngine.runtimeconfig.json",
+    "ClaymoreEngine.deps.json"
+  ],
+  "skip_patterns": [
+    "*.pdb",
+    "assimp*",
+    "*.xml"
+  ]
+}

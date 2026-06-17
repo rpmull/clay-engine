@@ -122,6 +122,19 @@ extern "C"
             *outX = *outY = *outZ = 0.0f;
             return;
         }
+        // For bone entities, resolve the world position from the skeleton's animated
+        // pose buffer when available. Bones are pose-driven (their AoS transform is
+        // not animated per-frame in play mode), so this yields the actual animated
+        // world position and decouples script bone reads from the generic transform
+        // propagation. Falls back to the AoS WorldMatrix for non-bones / no palette.
+        glm::mat4 boneWorld;
+        if (data->BoneIndex >= 0 && Scene::Get().TryGetBoneWorldMatrix(entityID, boneWorld))
+        {
+            *outX = boneWorld[3].x;
+            *outY = boneWorld[3].y;
+            *outZ = boneWorld[3].z;
+            return;
+        }
         // Extract world position from the 4th column of WorldMatrix
         // This is the actual world-space position after parent transforms are applied
         glm::vec3 worldPos = glm::vec3(data->Transform.WorldMatrix[3]);

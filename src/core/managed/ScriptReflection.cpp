@@ -1,6 +1,183 @@
 #include "ScriptReflection.h"
 #include <glm/glm.hpp>
+#include <nlohmann/json.hpp>
+#include <algorithm>
 #include <sstream>
+
+namespace {
+
+using json = nlohmann::json;
+
+static bool IsStructuredList(const std::shared_ptr<ListPropertyValue>& list)
+{
+    if (!list) {
+        return false;
+    }
+
+    if (list->elementType == PropertyType::Struct ||
+        list->elementType == PropertyType::List ||
+        list->elementType == PropertyType::Dictionary) {
+        return true;
+    }
+
+    for (const PropertyValue& element : list->elements) {
+        if (std::holds_alternative<std::shared_ptr<StructPropertyValue>>(element) ||
+            std::holds_alternative<std::shared_ptr<ListPropertyValue>>(element) ||
+            std::holds_alternative<std::shared_ptr<DictionaryPropertyValue>>(element)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static json PropertyValueToJson(const PropertyValue& value);
+
+static json ListPropertyValueToJson(const std::shared_ptr<ListPropertyValue>& list)
+{
+    json array = json::array();
+    if (!list) {
+        return array;
+    }
+
+    for (const PropertyValue& element : list->elements) {
+        array.push_back(PropertyValueToJson(element));
+    }
+
+    return array;
+}
+
+static json StructPropertyValueToJson(const std::shared_ptr<StructPropertyValue>& value)
+{
+    json object = json::object();
+    if (!value) {
+        return object;
+    }
+
+    for (const auto& field : value->fields) {
+        object[field.first] = PropertyValueToJson(field.second);
+    }
+
+    return object;
+}
+
+static json DictionaryPropertyValueToJson(const std::shared_ptr<DictionaryPropertyValue>& value)
+{
+    json object = json::object();
+    if (!value) {
+        return object;
+    }
+
+    json entries = json::array();
+    for (const auto& entry : value->entries) {
+        entries.push_back({
+            { "key", PropertyValueToJson(entry.first) },
+            { "value", PropertyValueToJson(entry.second) }
+        });
+    }
+
+    object["entries"] = std::move(entries);
+    return object;
+}
+
+static json PropertyValueToJson(const PropertyValue& value)
+{
+    return std::visit([](const auto& typedValue) -> json {
+        using T = std::decay_t<decltype(typedValue)>;
+        if constexpr (std::is_same_v<T, int>) {
+            return typedValue;
+        } else if constexpr (std::is_same_v<T, float>) {
+            return typedValue;
+        } else if constexpr (std::is_same_v<T, bool>) {
+            return typedValue;
+        } else if constexpr (std::is_same_v<T, std::string>) {
+            return typedValue;
+        } else if constexpr (std::is_same_v<T, glm::vec3>) {
+            return json::array({ typedValue.x, typedValue.y, typedValue.z });
+        } else if constexpr (std::is_same_v<T, std::shared_ptr<ListPropertyValue>>) {
+            return ListPropertyValueToJson(typedValue);
+        } else if constexpr (std::is_same_v<T, std::shared_ptr<StructPropertyValue>>) {
+            return StructPropertyValueToJson(typedValue);
+        } else if constexpr (std::is_same_v<T, std::shared_ptr<DictionaryPropertyValue>>) {
+            return DictionaryPropertyValueToJson(typedValue);
+        } else {
+            return json();
+        }
+    }, value);
+}
+
+static PropertyValue JsonToPropertyValue(const json& value)
+{
+    if (value.is_boolean()) {
+        return value.get<bool>();
+    }
+
+    if (value.is_number_integer()) {
+        return value.get<int>();
+    }
+
+    if (value.is_number()) {
+        return value.get<float>();
+    }
+
+    if (value.is_string()) {
+        return value.get<std::string>();
+    }
+
+    if (value.is_array()) {
+        bool looksLikeVec3 = value.size() == 3;
+        if (looksLikeVec3) {
+            for (const auto& item : value) {
+                if (!item.is_number()) {
+                    looksLikeVec3 = false;
+                    break;
+                }
+            }
+        }
+
+        if (looksLikeVec3) {
+            return glm::vec3(value[0].get<float>(), value[1].get<float>(), value[2].get<float>());
+        }
+
+        auto list = std::make_shared<ListPropertyValue>();
+        for (const auto& item : value) {
+            list->elements.push_back(JsonToPropertyValue(item));
+        }
+        if (!list->elements.empty()) {
+            const PropertyValue& first = list->elements.front();
+            if (std::holds_alternative<std::shared_ptr<StructPropertyValue>>(first)) {
+                list->elementType = PropertyType::Struct;
+            } else if (std::holds_alternative<std::shared_ptr<ListPropertyValue>>(first)) {
+                list->elementType = PropertyType::List;
+            } else if (std::holds_alternative<std::shared_ptr<DictionaryPropertyValue>>(first)) {
+                list->elementType = PropertyType::Dictionary;
+            }
+        }
+        return list;
+    }
+
+    if (value.is_object()) {
+        if (value.size() == 1 && value.contains("entries") && value["entries"].is_array()) {
+            auto dict = std::make_shared<DictionaryPropertyValue>();
+            for (const auto& entry : value["entries"]) {
+                dict->entries.emplace_back(
+                    JsonToPropertyValue(entry.value("key", json())),
+                    JsonToPropertyValue(entry.value("value", json())));
+            }
+            return dict;
+        }
+
+        auto structValue = std::make_shared<StructPropertyValue>();
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            structValue->fields.emplace_back(it.key(), JsonToPropertyValue(it.value()));
+        }
+        return structValue;
+    }
+
+    return std::string();
+}
+
+} // namespace
 
 // Static member definition
 std::unordered_map<std::string, std::vector<PropertyInfo>> ScriptReflection::s_ScriptProperties;
@@ -15,6 +192,19 @@ void ScriptReflection::RegisterScriptProperty(const std::string& scriptClass, co
         it->type = property.type;
         it->defaultValue = property.defaultValue;
         it->currentValue = property.currentValue;
+        it->auxTypeName = property.auxTypeName;
+        it->enumMeta = property.enumMeta;
+        it->listElementType = property.listElementType;
+        it->listElementTypeName = property.listElementTypeName;
+        it->structFields = property.structFields;
+        it->dictKeyType = property.dictKeyType;
+        it->dictValueType = property.dictValueType;
+        it->dictKeyTypeName = property.dictKeyTypeName;
+        it->dictValueTypeName = property.dictValueTypeName;
+        it->dictKeyEnumMeta = property.dictKeyEnumMeta;
+        it->dictValueEnumMeta = property.dictValueEnumMeta;
+        it->populateFromResources = property.populateFromResources;
+        it->selectFromResources = property.selectFromResources;
         // Preserve existing getter/setter hooks if already wired
         if (!property.getter) { /* keep existing */ } else it->getter = property.getter;
         if (!property.setter) { /* keep existing */ } else it->setter = property.setter;
@@ -57,6 +247,7 @@ std::string ScriptReflection::PropertyTypeToString(PropertyType type) {
         case PropertyType::Struct: return "Struct";
         case PropertyType::ClayObject: return "ClayObject";
         case PropertyType::Mesh: return "Mesh";
+        case PropertyType::Dictionary: return "Dictionary";
         case PropertyType::DialogueLibrary: return "DialogueLibraryRef";
         case PropertyType::AnimatorController: return "AnimationController";
         case PropertyType::AnimatorControllerOverride: return "AnimationControllerOverride";
@@ -81,6 +272,7 @@ PropertyType ScriptReflection::StringToPropertyType(const std::string& typeStr) 
     if (typeStr == "Struct") return PropertyType::Struct;
     if (typeStr == "ClayObject") return PropertyType::ClayObject;
     if (typeStr == "Mesh") return PropertyType::Mesh;
+    if (typeStr == "Dictionary") return PropertyType::Dictionary;
     if (typeStr == "DialogueLibraryRef") return PropertyType::DialogueLibrary;
     if (typeStr == "AnimationController") return PropertyType::AnimatorController;
     if (typeStr == "AnimationControllerOverride") return PropertyType::AnimatorControllerOverride;
@@ -118,6 +310,7 @@ PropertyValue ScriptReflection::BoxToValue(void* boxed, PropertyType type)
             case PropertyType::Audio:    return std::string(); // empty GUID string
             case PropertyType::List:     return std::make_shared<ListPropertyValue>();
             case PropertyType::Struct:   return std::make_shared<StructPropertyValue>();
+            case PropertyType::Dictionary: return std::make_shared<DictionaryPropertyValue>();
         }
     }
 
@@ -149,6 +342,8 @@ PropertyValue ScriptReflection::BoxToValue(void* boxed, PropertyType type)
             return std::make_shared<ListPropertyValue>();
         case PropertyType::Struct:
             return std::make_shared<StructPropertyValue>();
+        case PropertyType::Dictionary:
+            return std::make_shared<DictionaryPropertyValue>();
     }
     // Fallback to int 0 if an unknown type ever slips through
     return 0;
@@ -192,8 +387,12 @@ std::string ScriptReflection::PropertyValueToString(const PropertyValue& value) 
             oss << v.x << "," << v.y << "," << v.z;
             return oss.str();
         } else if constexpr (std::is_same_v<T, std::shared_ptr<ListPropertyValue>>) {
-            // Serialize list as pipe-separated elements, each element as string
             if (!v || v->elements.empty()) return "";
+
+            if (IsStructuredList(v)) {
+                return ListPropertyValueToJson(v).dump();
+            }
+
             std::string result;
             for (size_t i = 0; i < v->elements.size(); ++i) {
                 if (i > 0) result += "|";
@@ -201,8 +400,9 @@ std::string ScriptReflection::PropertyValueToString(const PropertyValue& value) 
             }
             return result;
         } else if constexpr (std::is_same_v<T, std::shared_ptr<StructPropertyValue>>) {
-            // Struct serialization - not fully implemented
-            return "";
+            return StructPropertyValueToJson(v).dump();
+        } else if constexpr (std::is_same_v<T, std::shared_ptr<DictionaryPropertyValue>>) {
+            return DictionaryPropertyValueToJson(v).dump();
         }
         return "";
     }, value);
@@ -255,18 +455,79 @@ PropertyValue ScriptReflection::StringToPropertyValue(const std::string& str, Pr
         }
         
         case PropertyType::List: {
-            // Deserialize pipe-separated list - element type needs to come from property metadata
-            // For now, store as string list; actual element parsing happens during sync
             auto list = std::make_shared<ListPropertyValue>();
-            if (!str.empty()) {
-                std::istringstream iss(str);
-                std::string elem;
-                while (std::getline(iss, elem, '|')) {
-                    // Store elements as strings; managed side will interpret by element type
-                    list->elements.push_back(elem);
+            if (str.empty()) {
+                return list;
+            }
+
+            try {
+                size_t firstNonWhitespace = str.find_first_not_of(" \t\r\n");
+                if (firstNonWhitespace != std::string::npos &&
+                    (str[firstNonWhitespace] == '[' || str[firstNonWhitespace] == '{')) {
+                    json parsed = json::parse(str);
+                    if (parsed.is_array()) {
+                        for (const auto& element : parsed) {
+                            list->elements.push_back(JsonToPropertyValue(element));
+                        }
+
+                        if (!list->elements.empty()) {
+                            const PropertyValue& first = list->elements.front();
+                            if (std::holds_alternative<std::shared_ptr<StructPropertyValue>>(first)) {
+                                list->elementType = PropertyType::Struct;
+                            } else if (std::holds_alternative<std::shared_ptr<ListPropertyValue>>(first)) {
+                                list->elementType = PropertyType::List;
+                            } else if (std::holds_alternative<std::shared_ptr<DictionaryPropertyValue>>(first)) {
+                                list->elementType = PropertyType::Dictionary;
+                            }
+                        }
+                        return list;
+                    }
                 }
+            } catch (...) {
+            }
+
+            std::istringstream iss(str);
+            std::string elem;
+            while (std::getline(iss, elem, '|')) {
+                list->elements.push_back(elem);
             }
             return list;
+        }
+
+        case PropertyType::Struct: {
+            if (str.empty()) {
+                return std::make_shared<StructPropertyValue>();
+            }
+
+            try {
+                json parsed = json::parse(str);
+                if (parsed.is_object()) {
+                    PropertyValue value = JsonToPropertyValue(parsed);
+                    if (std::holds_alternative<std::shared_ptr<StructPropertyValue>>(value)) {
+                        return value;
+                    }
+                }
+            } catch (...) {
+            }
+
+            return std::make_shared<StructPropertyValue>();
+        }
+
+        case PropertyType::Dictionary: {
+            if (str.empty()) {
+                return std::make_shared<DictionaryPropertyValue>();
+            }
+
+            try {
+                json parsed = json::parse(str);
+                PropertyValue value = JsonToPropertyValue(parsed);
+                if (std::holds_alternative<std::shared_ptr<DictionaryPropertyValue>>(value)) {
+                    return value;
+                }
+            } catch (...) {
+            }
+
+            return std::make_shared<DictionaryPropertyValue>();
         }
         
         default:

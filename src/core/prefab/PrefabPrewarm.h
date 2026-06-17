@@ -14,6 +14,12 @@ void QueuePrefabGuid(const ClaymoreGUID& guid);
 // Process prewarm queue with a time budget (ms).
 void Update(double budgetMs = 2.0);
 
+// True while queued prewarm work remains.
+bool HasPendingWork();
+
+// Returns normalized progress for the current prewarm batch.
+float GetProgress();
+
 // Enable/disable the prewarm system.
 void SetEnabled(bool enabled);
 

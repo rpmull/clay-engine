@@ -19,7 +19,11 @@
 #include <algorithm>
 #include <filesystem>
 #include <cstring>
+#include <cstdlib>
 #include <cmath>
+#include <sstream>
+#include <string>
+#include <vector>
 #include <glm/glm.hpp>
 
 namespace shadergraph {
@@ -33,6 +37,130 @@ namespace {
     constexpr int kAttrMultiplier = 100000;
     constexpr int kInputOffset = 0;
     constexpr int kOutputOffset = 50000;
+
+    // ---- Color Ramp stop editing -----------------------------------------
+    struct RampStop {
+        float pos = 0.0f;
+        ImVec4 color = ImVec4(0.0f, 0.0f, 0.0f, 1.0f);
+    };
+
+    std::vector<RampStop> ParseRampStops(const std::string& s) {
+        std::vector<RampStop> stops;
+        std::stringstream ss(s);
+        std::string item;
+        while (std::getline(ss, item, ';')) {
+            if (item.empty()) continue;
+            size_t colon = item.find(':');
+            if (colon == std::string::npos) continue;
+            RampStop stop;
+            stop.pos = static_cast<float>(std::atof(item.substr(0, colon).c_str()));
+            std::stringstream cs(item.substr(colon + 1));
+            std::string comp;
+            float c[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            int ci = 0;
+            while (std::getline(cs, comp, ',') && ci < 4) {
+                c[ci++] = static_cast<float>(std::atof(comp.c_str()));
+            }
+            stop.color = ImVec4(c[0], c[1], c[2], c[3]);
+            stops.push_back(stop);
+        }
+        std::sort(stops.begin(), stops.end(),
+                  [](const RampStop& a, const RampStop& b) { return a.pos < b.pos; });
+        return stops;
+    }
+
+    std::string SerializeRampStops(std::vector<RampStop> stops) {
+        std::sort(stops.begin(), stops.end(),
+                  [](const RampStop& a, const RampStop& b) { return a.pos < b.pos; });
+        std::ostringstream out;
+        for (size_t i = 0; i < stops.size(); ++i) {
+            const RampStop& s = stops[i];
+            if (i) out << ';';
+            out << s.pos << ':' << s.color.x << ',' << s.color.y << ','
+                << s.color.z << ',' << s.color.w;
+        }
+        return out.str();
+    }
+
+    // Renders an interactive gradient editor for a ColorRamp node's "stops"
+    // property. Returns true if the stops were modified.
+    bool DrawColorRampEditor(ShaderNode* node) {
+        std::vector<RampStop> stops = ParseRampStops(node->GetProperty("stops", "0:0,0,0,1;1:1,1,1,1"));
+        if (stops.empty()) {
+            stops.push_back({0.0f, ImVec4(0, 0, 0, 1)});
+            stops.push_back({1.0f, ImVec4(1, 1, 1, 1)});
+        }
+        bool modified = false;
+
+        // Gradient preview bar.
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 barPos = ImGui::GetCursorScreenPos();
+        const float barW = ImGui::GetContentRegionAvail().x;
+        const float barH = 22.0f;
+        if (barW > 1.0f) {
+            for (size_t i = 0; i + 1 < stops.size(); ++i) {
+                float x0 = barPos.x + stops[i].pos * barW;
+                float x1 = barPos.x + stops[i + 1].pos * barW;
+                ImU32 c0 = ImGui::ColorConvertFloat4ToU32(stops[i].color);
+                ImU32 c1 = ImGui::ColorConvertFloat4ToU32(stops[i + 1].color);
+                dl->AddRectFilledMultiColor(ImVec2(x0, barPos.y), ImVec2(x1, barPos.y + barH),
+                                            c0, c1, c1, c0);
+            }
+            // Flat fill before first / after last stop.
+            if (!stops.empty()) {
+                dl->AddRectFilled(ImVec2(barPos.x, barPos.y),
+                                  ImVec2(barPos.x + stops.front().pos * barW, barPos.y + barH),
+                                  ImGui::ColorConvertFloat4ToU32(stops.front().color));
+                dl->AddRectFilled(ImVec2(barPos.x + stops.back().pos * barW, barPos.y),
+                                  ImVec2(barPos.x + barW, barPos.y + barH),
+                                  ImGui::ColorConvertFloat4ToU32(stops.back().color));
+            }
+            dl->AddRect(ImVec2(barPos.x, barPos.y), ImVec2(barPos.x + barW, barPos.y + barH),
+                        IM_COL32(0, 0, 0, 180));
+            // Stop markers.
+            for (const RampStop& s : stops) {
+                float x = barPos.x + s.pos * barW;
+                dl->AddTriangleFilled(ImVec2(x - 4, barPos.y + barH), ImVec2(x + 4, barPos.y + barH),
+                                      ImVec2(x, barPos.y + barH - 6), IM_COL32(255, 255, 255, 220));
+            }
+        }
+        ImGui::Dummy(ImVec2(barW, barH + 4.0f));
+
+        // Per-stop controls.
+        int removeIndex = -1;
+        for (size_t i = 0; i < stops.size(); ++i) {
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::SetNextItemWidth(70.0f);
+            if (ImGui::DragFloat("##pos", &stops[i].pos, 0.005f, 0.0f, 1.0f, "%.3f")) {
+                modified = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::ColorEdit4("##col", &stops[i].color.x,
+                                  ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar)) {
+                modified = true;
+            }
+            if (stops.size() > 1) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("X")) {
+                    removeIndex = static_cast<int>(i);
+                }
+            }
+            ImGui::PopID();
+        }
+        if (removeIndex >= 0) {
+            stops.erase(stops.begin() + removeIndex);
+            modified = true;
+        }
+        if (ImGui::SmallButton("+ Add Stop")) {
+            stops.push_back({0.5f, ImVec4(1, 1, 1, 1)});
+            modified = true;
+        }
+
+        if (modified) {
+            node->SetProperty("stops", SerializeRampStops(stops));
+        }
+        return modified;
+    }
 
     std::string NormalizeTextureAssetPath(const std::string& path) {
         if (path.empty()) {
@@ -462,8 +590,10 @@ void ShaderGraphPanel::DrawNodePalette(float width) {
     std::transform(searchStr.begin(), searchStr.end(), searchStr.begin(), ::tolower);
     
     // Category buttons
-    const char* categories[] = {"Input", "Math", "Vector", "Texture", "Output"};
-    for (const char* cat : categories) {
+    const char* categories[] = {"Input", "Math", "Vector", "Texture", "Utility", "Output"};
+    const int categoryCount = static_cast<int>(sizeof(categories) / sizeof(categories[0]));
+    for (int catIdx = 0; catIdx < categoryCount; ++catIdx) {
+        const char* cat = categories[catIdx];
         bool selected = (m_SelectedCategory == cat);
         if (selected) {
             ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]);
@@ -474,7 +604,8 @@ void ShaderGraphPanel::DrawNodePalette(float width) {
         if (selected) {
             ImGui::PopStyleColor();
         }
-        if (cat != categories[4]) ImGui::SameLine();
+        // Two buttons per row.
+        if (catIdx % 2 == 0 && catIdx + 1 < categoryCount) ImGui::SameLine();
     }
     
     ImGui::Separator();
@@ -998,10 +1129,18 @@ void ShaderGraphPanel::DrawPropertiesPanel(float width) {
                         if (ImGui::Selectable(propDef.options[i].c_str(), selected)) {
                             node->SetProperty(propDef.key, propDef.options[i]);
                             m_Modified = true;
+                            RefreshPreviewMaterial(true);
                         }
                         if (selected) ImGui::SetItemDefaultFocus();
                     }
                     ImGui::EndCombo();
+                }
+            } else if (propDef.key == "stops") {
+                // Custom interactive Color Ramp gradient editor.
+                ImGui::TextDisabled("%s", propDef.displayName.c_str());
+                if (DrawColorRampEditor(node)) {
+                    m_Modified = true;
+                    RefreshPreviewMaterial(true);
                 }
             } else {
                 // Text input

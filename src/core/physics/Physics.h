@@ -96,6 +96,14 @@ public:
     // layerMask: bitmask of layers to include (default: all layers)
     static bool RaycastPoints(const glm::vec3& from, const glm::vec3& to, RaycastHit& outHit, uint32_t layerMask = PhysicsLayerMask::All);
 
+    // Spherecast: sweep a sphere of the given radius from origin along direction up to maxDistance.
+    // Cheap shape cast (sphere vs world). A radius <= 0 degenerates to a Raycast.
+    // layerMask: bitmask of layers to include (default: all layers)
+    static bool Spherecast(const glm::vec3& origin, const glm::vec3& direction, float radius, float maxDistance, RaycastHit& outHit, uint32_t layerMask = PhysicsLayerMask::All);
+    // Spherecast between two points (swept sphere along a segment)
+    // layerMask: bitmask of layers to include (default: all layers)
+    static bool SpherecastPoints(const glm::vec3& from, const glm::vec3& to, float radius, RaycastHit& outHit, uint32_t layerMask = PhysicsLayerMask::All);
+
 private:
 	Physics() = default;
 	~Physics() = default;

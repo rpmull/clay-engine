@@ -114,6 +114,10 @@ struct AnimatorLayerState {
     std::unordered_set<int> _FiredEventIds;
     float _PrevEventStateTime = 0.0f;
     int _PrevEventStateId = -1;
+
+    // State enter/exit callback tracking (independent of script-event tracking above):
+    // last state id for which enter/exit callbacks were dispatched on this layer.
+    int _StateCallbackPrevStateId = -1;
     
     // Helpers
     bool IsCrossfading() const { 
@@ -159,6 +163,9 @@ struct AnimatorLayerState {
         if (clipDuration > 0.0f) {
             StateNormalized = fmod(time, clipDuration) / clipDuration;
             HasCompletedOneCycle = (time >= clipDuration);
+        } else {
+            StateNormalized = 0.0f;
+            HasCompletedOneCycle = false;
         }
         PrevStateNormalized = StateNormalized;
         CrossfadeTime = 0.0f;
@@ -213,6 +220,9 @@ public:
             m_Playback.StateNormalized = fmod(time, clipDuration) / clipDuration;
             // Track if we've already completed at least one cycle based on preserved time
             m_Playback.HasCompletedOneCycle = (time >= clipDuration);
+        } else {
+            m_Playback.StateNormalized = 0.0f;
+            m_Playback.HasCompletedOneCycle = false;
         }
         m_Playback.PrevStateNormalized = m_Playback.StateNormalized;
         // Clear crossfade state since we're now fully in the current state

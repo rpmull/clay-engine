@@ -74,13 +74,23 @@ public:
         }
     }
 
+    // Builds the display name for a clone. Idempotent: repeated cloning keeps a
+    // single "_Clone" suffix instead of accumulating "_Clone_Clone_..." names
+    // (which previously broke name-based material detection and bloated scenes).
+    static std::string MakeCloneName(const std::string& name) {
+        static const std::string kSuffix = "_Clone";
+        if (name.size() >= kSuffix.size() &&
+            name.compare(name.size() - kSuffix.size(), kSuffix.size(), kSuffix) == 0) {
+            return name;
+        }
+        return name + kSuffix;
+    }
+
     // Create a deep copy of this material with fresh bgfx handles
     virtual std::shared_ptr<Material> Clone() const {
-        auto clone = std::make_shared<Material>(m_Name + "_Clone", m_Program, m_StateFlags);
+        auto clone = std::make_shared<Material>(MakeCloneName(m_Name), m_Program, m_StateFlags);
         // Copy uniform values (clone will create fresh handles when SetUniform is called)
-        for (const auto& uniform : m_UniformsFlat) {
-            clone->SetUniform(uniform.propertyId, uniform.value);
-        }
+        CopyUniformValuesTo(*clone);
         return clone;
     }
 
@@ -161,6 +171,18 @@ protected:
     // Legacy string-based map (for backward compatibility)
     std::unordered_map<std::string, UniformData> m_Uniforms;
     
+    // Copies every generic vec4 uniform value to another material. Derived
+    // Clone() implementations must call this so uniforms that live outside the
+    // derived class's typed fields (e.g. u_psxParams/u_toonParams/u_psxEmission
+    // on PSX materials, u_ColorTint/u_TintParams on all PBR-family materials)
+    // survive cloning. Losing them silently converted PSX clones into plain PBR
+    // materials, which broke per-entity overrides and serialization.
+    void CopyUniformValuesTo(Material& destination) const {
+        for (const auto& uniform : m_UniformsFlat) {
+            destination.SetUniform(uniform.propertyId, uniform.value);
+        }
+    }
+
     // Helper to ensure ID lookup array is large enough
     void EnsureUniformIndexCapacity(uint32_t id) const {
         if (id >= m_UniformIndexByID.size()) {

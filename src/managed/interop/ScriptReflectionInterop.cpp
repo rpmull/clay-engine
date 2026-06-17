@@ -1,7 +1,83 @@
 #include "ScriptReflectionInterop.h"
+#include <nlohmann/json.hpp>
+#include <iostream>
 #include <sstream>
 
 // SetManagedFieldPtr is now defined in core/managed/ScriptInterop.cpp
+
+namespace {
+
+using json = nlohmann::json;
+
+static PropertyInfo ParseStructFieldMetadata(const json& fieldJson)
+{
+    PropertyInfo info;
+    info.name = fieldJson.value("name", std::string());
+    info.type = static_cast<PropertyType>(fieldJson.value("type", 0));
+    info.defaultValue = ScriptReflection::BoxToValue(nullptr, info.type);
+    info.currentValue = info.defaultValue;
+
+    if (fieldJson.contains("aux") && fieldJson["aux"].is_string()) {
+        info.auxTypeName = fieldJson["aux"].get<std::string>();
+    }
+
+    if (fieldJson.contains("enumNames") && fieldJson["enumNames"].is_array()) {
+        for (const auto& name : fieldJson["enumNames"]) {
+            if (name.is_string()) {
+                info.enumMeta.names.push_back(name.get<std::string>());
+            }
+        }
+    }
+
+    if (fieldJson.contains("enumValues") && fieldJson["enumValues"].is_array()) {
+        for (const auto& value : fieldJson["enumValues"]) {
+            if (value.is_number_integer()) {
+                info.enumMeta.values.push_back(value.get<int>());
+            }
+        }
+    }
+
+    if (info.type == PropertyType::List) {
+        info.listElementType = static_cast<PropertyType>(fieldJson.value("listElementType", 0));
+        if (fieldJson.contains("listElementTypeName") && fieldJson["listElementTypeName"].is_string()) {
+            info.listElementTypeName = fieldJson["listElementTypeName"].get<std::string>();
+        }
+    }
+
+    info.populateFromResources = fieldJson.value("populateFromResources", false);
+    info.selectFromResources = fieldJson.value("selectFromResources", false);
+
+    if (fieldJson.contains("structFields") && fieldJson["structFields"].is_array()) {
+        for (const auto& nested : fieldJson["structFields"]) {
+            info.structFields.push_back(ParseStructFieldMetadata(nested));
+        }
+    }
+
+    return info;
+}
+
+static void ApplyStructFieldMetadata(PropertyInfo& info, const char* structFieldsJson)
+{
+    if (!structFieldsJson || !*structFieldsJson) {
+        return;
+    }
+
+    try {
+        json parsed = json::parse(structFieldsJson);
+        if (!parsed.is_array()) {
+            return;
+        }
+
+        for (const auto& fieldJson : parsed) {
+            info.structFields.push_back(ParseStructFieldMetadata(fieldJson));
+        }
+    } catch (const std::exception& ex) {
+        std::cerr << "[ScriptReflectionInterop] Failed to parse structFieldsJson for "
+                  << info.name << ": " << ex.what() << std::endl;
+    }
+}
+
+} // namespace
 
 // Helper to split a pipe-separated string
 static std::vector<std::string> SplitPipe(const char* str) {
@@ -91,8 +167,7 @@ void RegisterScriptPropertyExtended(const char* className,
         // The inspector will use property.enumMeta for rendering enum list elements
     }
 
-    // Handle struct fields (structFieldsJson parsing would go here)
-    // For now, struct fields are registered separately as nested properties
+    ApplyStructFieldMetadata(info, structFieldsJson);
     
     // Mark if this field is auto-populated from resources
     info.populateFromResources = populateFromResources;

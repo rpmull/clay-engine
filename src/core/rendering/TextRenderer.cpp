@@ -264,9 +264,18 @@ bool TextRenderer::SetFont(const std::string& ttfPath, float basePixelSize) {
     auto it = m_FontCache.find(key);
     if (it == m_FontCache.end()) {
         CachedFont newFont;
-        uint16_t w = std::max<uint16_t>(m_AtlasWidth ? m_AtlasWidth : 1024, 1024);
-        uint16_t h = std::max<uint16_t>(m_AtlasHeight ? m_AtlasHeight : 1024, 1024);
-        if (!BakeFont(resolvedPath, w, h, normalizedSize, newFont)) {
+        // Auto-size the atlas to the bake resolution. We pack 96 glyphs (ASCII
+        // 32..127); a square atlas of side ~ sqrt(96) * pixelSize * slack fits
+        // them with room for stb_truetype's padding. This lets world-space text
+        // bake at a high (supersampled) resolution without overflowing a fixed
+        // 1024 atlas, which would make stbtt_PackFontRange fail and the text
+        // vanish. Screen-space text keeps baking near its 1:1 size, so its
+        // atlas stays small.
+        uint16_t needed = static_cast<uint16_t>(
+            std::min(4096.0f, std::ceil(std::sqrt(96.0f) * normalizedSize * 1.35f)));
+        uint16_t dim = std::max<uint16_t>(m_AtlasWidth ? m_AtlasWidth : 1024, 1024);
+        while (dim < needed && dim < 4096) dim = static_cast<uint16_t>(dim << 1);
+        if (!BakeFont(resolvedPath, dim, dim, normalizedSize, newFont)) {
             return false;
         }
         auto inserted = m_FontCache.emplace(std::move(key), std::move(newFont));
@@ -410,9 +419,15 @@ void TextRenderer::SubmitStringWorldOutline(const TextRendererComponent& tc,
         ? (m_Baked.ascentPx + m_Baked.descentPx + m_Baked.lineGapPx) * pixelScale * unitScale
         : (tc.PixelSize * 1.1f * unitScale);
     const float alignFactor = AlignmentFactor(tc.TextAlignment);
-    const float localExpand = outlinePixels * scale;
-    const float uExpand = outlinePixels / float(m_Baked.width);
-    const float vExpand = outlinePixels / float(m_Baked.height);
+    // outlinePixels is a thickness in *logical* pixels. The atlas may be baked at
+    // a supersampled resolution (basePixelSize > PixelSize), so convert the
+    // thickness into baked-atlas pixels before deriving the world-space quad
+    // expansion and the UV dilation radius. This keeps the outline a constant
+    // logical thickness regardless of the bake resolution.
+    const float atlasOutline = (pixelScale > 1.0e-4f) ? (outlinePixels / pixelScale) : outlinePixels;
+    const float localExpand = atlasOutline * scale;
+    const float uExpand = atlasOutline / float(m_Baked.width);
+    const float vExpand = atlasOutline / float(m_Baked.height);
 
     auto measureLine = [&](const char* begin, const char* end) -> float {
         float lineWidth = 0.0f;
@@ -474,8 +489,8 @@ void TextRenderer::SubmitStringWorldOutline(const TextRendererComponent& tc,
     bgfx::setTransform(mtx);
     const float textParams[4] = {
         1.0f,
-        outlinePixels / float(m_Baked.width),
-        outlinePixels / float(m_Baked.height),
+        atlasOutline / float(m_Baked.width),
+        atlasOutline / float(m_Baked.height),
         0.0f
     };
     if (bgfx::isValid(m_TextParams)) bgfx::setUniform(m_TextParams, textParams);
@@ -860,7 +875,20 @@ void TextRenderer::RenderTexts(Scene& scene,
 
         // Draw world-space texts here; screen-space texts are handled in the UI pass
         if (tc.WorldSpace) {
-            if (!SetFont(tc.FontPath, tc.PixelSize)) continue;
+            // World-space text is mapped into the scene at a fixed units-per-pixel
+            // ratio, so its on-screen size depends on camera distance, not on
+            // PixelSize. Baking the atlas at PixelSize (as screen text does) then
+            // magnifies a low-resolution bitmap when the camera is close, which
+            // looks jagged. Bake at a supersampled resolution instead: the glyph
+            // layout divides by the baked basePixelSize, so the rendered size is
+            // unchanged while each glyph carries far more texels. (Bilinear
+            // sampling + the auto-sized atlas above keep it crisp.)
+            constexpr float kWorldTextSupersample = 4.0f;
+            constexpr float kWorldTextMaxBakePx = 128.0f;
+            const float worldBakePx = std::max(
+                tc.PixelSize,
+                std::min(tc.PixelSize * kWorldTextSupersample, kWorldTextMaxBakePx));
+            if (!SetFont(tc.FontPath, worldBakePx)) continue;
             if (!bgfx::isValid(m_Atlas)) continue;
             const float worldOpacity = std::max(0.0f, std::min(1.0f, tc.Opacity));
             const uint32_t mainColor = ApplyOpacityToAbgr(tc.ColorAbgr, worldOpacity);

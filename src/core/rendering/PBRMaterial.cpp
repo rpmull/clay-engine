@@ -1,6 +1,7 @@
 #include "PBRMaterial.h"
 #include "TextureLoader.h"
 #include "MaterialCache.h"
+#include "TextureSamplerFlags.h"
 #include "core/ecs/Scene.h"
 #include <filesystem>
 
@@ -81,7 +82,7 @@ PBRMaterial::~PBRMaterial() {
 }
 
 std::shared_ptr<Material> PBRMaterial::Clone() const {
-    auto clone = std::make_shared<PBRMaterial>(GetName() + "_Clone", GetProgram(), GetStateFlags());
+    auto clone = std::make_shared<PBRMaterial>(MakeCloneName(GetName()), GetProgram(), GetStateFlags());
     
     // Copy textures (handles are shared, not owned by the material)
     clone->m_AlbedoTex = m_AlbedoTex;
@@ -114,13 +115,21 @@ std::shared_ptr<Material> PBRMaterial::Clone() const {
     clone->m_ReceiveShadowsOverride = m_ReceiveShadowsOverride;
     clone->m_ReceiveShadows = m_ReceiveShadows;
     
-    // Sync uniforms
+    // Copy ALL generic vec4 uniforms first (u_ColorTint, u_TintParams, and the
+    // PSX family: u_psxParams/u_psxWorld/u_toonParams/u_posterize/
+    // u_psxShadowParams/u_psxEmission). Without this, cloning a PSX material
+    // silently dropped its PSX uniforms, breaking type detection, per-entity
+    // property-block overrides, and scene serialization of PSX parameters.
+    CopyUniformValuesTo(*clone);
+
+    // Sync uniforms managed by typed PBR fields (overwrites the generic copies
+    // for those uniforms with identical values derived from the copied fields)
     clone->SyncScalarUniforms();
     clone->SyncUVUniform();
     clone->SyncTextureUsageUniform();
     clone->m_LastTextureCacheGeneration = GetTextureCacheGeneration();
     clone->m_PathBackedTexturesDirty = false;
-    
+
     return clone;
 }
 
@@ -417,8 +426,20 @@ void PBRMaterial::BindUniforms() const
    static bgfx::TextureHandle s_defaultWhite = BGFX_INVALID_HANDLE;
    static bgfx::TextureHandle s_defaultMR    = BGFX_INVALID_HANDLE;
    static bgfx::TextureHandle s_defaultNrm   = BGFX_INVALID_HANDLE;
+   static uint64_t s_defaultTextureGeneration = 0;
    auto ensureDefaults = []()
    {
+       const uint64_t generation = GetTextureCacheGeneration();
+       if (s_defaultTextureGeneration != generation) {
+           // Cached fallback textures are owned by the global texture cache. When that
+           // cache is invalidated (project switch, texture cap change, hot reload),
+           // these raw handles may become stale even though their idx is non-invalid.
+           s_defaultWhite = BGFX_INVALID_HANDLE;
+           s_defaultMR = BGFX_INVALID_HANDLE;
+           s_defaultNrm = BGFX_INVALID_HANDLE;
+           s_defaultTextureGeneration = generation;
+       }
+
        if (!bgfx::isValid(s_defaultWhite)) {
            TextureSpecifier spec; spec.Path = "assets/debug/white.png";
            s_defaultWhite = AcquireTextureHandle(spec, TextureColorSpace::Linear);
@@ -434,22 +455,8 @@ void PBRMaterial::BindUniforms() const
    };
    ensureDefaults();
 
-   // Apply scene-selected filtering to material textures
-   uint32_t samplerFlags = 0;
-   {
-       // Default to linear filtering; allow point based on scene setting
-       auto& scene = Scene::Get();
-       auto mode = scene.GetDefaultShaderPreset(); // keep; but we need filter from Environment
-   }
-   {
-       // Read from Environment
-       const Environment& env = Scene::Get().GetEnvironment();
-       if (env.TextureFilter == Environment::TextureFilterMode::Point) {
-           samplerFlags |= BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT | BGFX_SAMPLER_MIP_POINT;
-       } else {
-           samplerFlags |= BGFX_SAMPLER_MIN_ANISOTROPIC | BGFX_SAMPLER_MAG_ANISOTROPIC; // fallback to linear if unsupported
-       }
-   }
+   const uint32_t samplerFlags =
+      cm::rendering::GetTextureSamplerFlags(Scene::Get().GetEnvironment());
 
    bgfx::setTexture(0, u_AlbedoSampler, bgfx::isValid(m_AlbedoTex) ? m_AlbedoTex : s_defaultWhite, samplerFlags);
    bgfx::setTexture(1, u_MetallicRoughnessSampler, bgfx::isValid(m_MetallicRoughnessTex) ? m_MetallicRoughnessTex : s_defaultMR, samplerFlags);

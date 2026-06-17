@@ -36,6 +36,7 @@
 #include <cstring>
 #include "core/prefab/PrefabAsset.h"
 #include "core/prefab/PrefabAPI.h"
+#include "core/prefab/RuntimePrefabInstantiator.h"
 #include "editor/prefab/PrefabEditorAPI.h"
 #include "core/resourcelayer/ImposterManager.h"
 #include "core/resources/ResourceManifest.h"
@@ -483,7 +484,11 @@ FileNode ProjectPanel::BuildFileTree(const std::string& path) {
       for (auto& entry : fs::directory_iterator(path)) {
          // Hide generated folders from project browser
          std::string entryName = entry.path().filename().string();
-         if (entryName == ".bin" || entryName == ".library" || entryName == ".git" || entryName == ".vs") {
+         std::transform(entryName.begin(), entryName.end(), entryName.begin(),
+            [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+         if (entryName == "bin" || entryName == "obj" ||
+             entryName == ".bin" || entryName == ".library" ||
+             entryName == ".git" || entryName == ".vs") {
             continue;
          }
          node.children.push_back(BuildFileTree(entry.path().string()));
@@ -2501,9 +2506,22 @@ bool ProjectPanel::StartPrefabSnapshotCapture() {
         fillData->Transform.TransformDirty = true;
     }
 
-    // Instantiate the prefab
-    m_PrefabSnapshot.prefabRoot = InstantiatePrefabFromPathBlocking(m_PrefabSnapshot.prefabPath, *m_PrefabSnapshot.scene);
-    if (m_PrefabSnapshot.prefabRoot == INVALID_ENTITY_ID) {
+    // Instantiate the prefab from the prepared binary cache when available.
+    m_PrefabSnapshot.prefabRoot = INVALID_ENTITY_ID;
+    if (BinaryAssetCache::GetAssetType(m_PrefabSnapshot.prefabPath) == BinaryAssetCache::AssetType::Prefab &&
+        BinaryAssetCache::Instance().EnsureBinary(m_PrefabSnapshot.prefabPath)) {
+        const std::string binaryPath = BinaryAssetCache::Instance().GetBinaryPath(m_PrefabSnapshot.prefabPath);
+        if (!binaryPath.empty()) {
+            runtime::RuntimePrefabInstantiator::Preload(binaryPath);
+            m_PrefabSnapshot.prefabRoot =
+                runtime::RuntimePrefabInstantiator::InstantiateBlocking(binaryPath, *m_PrefabSnapshot.scene);
+        }
+    }
+    if (m_PrefabSnapshot.prefabRoot == INVALID_ENTITY_ID || m_PrefabSnapshot.prefabRoot == (EntityID)0) {
+        m_PrefabSnapshot.prefabRoot =
+            InstantiatePrefabFromPathBlocking(m_PrefabSnapshot.prefabPath, *m_PrefabSnapshot.scene);
+    }
+    if (m_PrefabSnapshot.prefabRoot == INVALID_ENTITY_ID || m_PrefabSnapshot.prefabRoot == (EntityID)0) {
         Logger::LogError("[ProjectPanel] Failed to instantiate prefab for snapshot: " + m_PrefabSnapshot.prefabPath);
         m_PrefabSnapshot.scene.reset();
         m_PrefabSnapshot.camera.reset();

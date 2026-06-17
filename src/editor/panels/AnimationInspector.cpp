@@ -25,6 +25,18 @@
 
 using cm::animation::AnimationClip;
 
+namespace {
+const char* RootMotionModeLabel(cm::animation::RootMotionMode mode)
+{
+    switch (mode) {
+        case cm::animation::RootMotionMode::None: return "None";
+        case cm::animation::RootMotionMode::InPlace: return "In-Place";
+        case cm::animation::RootMotionMode::ApplyToEntity: return "Apply To Entity";
+        default: return "Unknown";
+    }
+}
+}
+
 AnimationInspectorPanel::AnimationInspectorPanel(UILayer* uiLayer)
     : m_UILayer(uiLayer)
 {
@@ -353,6 +365,15 @@ void AnimationInspectorPanel::DrawImportSettingsChip()
         if (m_CurrentAsset)
         {
             const auto& rm = m_CurrentAsset->meta.rootMotion;
+            const auto desiredRootMotion = m_ImportSettings.ToRootMotionSettings();
+            if (rm != desiredRootMotion)
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 196, 64, 255));
+                ImGui::TextWrapped(
+                    "Baked runtime clip still uses %s root motion. Save Settings will update the .anim metadata; full reimport is still required for axis or rig changes.",
+                    RootMotionModeLabel(rm.Mode));
+                ImGui::PopStyleColor();
+            }
             if (rm.TotalDistanceXZ > 0.01f || rm.TotalDistanceY > 0.01f)
             {
                 ImGui::TextDisabled("Baked: XZ=%.2fm Y=%.2fm", rm.TotalDistanceXZ, rm.TotalDistanceY);
@@ -384,17 +405,26 @@ void AnimationInspectorPanel::DrawImportSettingsChip()
         
         if (!canReimport && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Source file not found. Reimport requires the original FBX/glTF file.");
-        
         ImGui::SameLine();
         
         // Save settings without reimport
         ImGui::BeginDisabled(!m_ImportSettingsDirty);
         if (ImGui::Button("Save Settings"))
         {
-            if (AnimationImportSettings::SaveToMeta(m_CurrentClipPath, m_ImportSettings))
+            bool saved = AnimationImportSettings::SaveToMeta(m_CurrentClipPath, m_ImportSettings);
+            if (saved && m_CurrentAsset)
+                saved = SaveBakedRootMotionSettings();
+            if (saved)
                 m_ImportSettingsDirty = false;
         }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Saves the sidecar import settings. Root motion settings are also baked into the current .anim asset; axis correction and rig-retarget changes still require reimport.");
         ImGui::EndDisabled();
+        
+        if (!canReimport && m_CurrentAsset)
+        {
+            ImGui::TextDisabled("Source file missing. Save Settings will still bake root motion metadata into this .anim asset.");
+        }
         
         // Calculate root motion from current animation (without reimport)
         if (m_ImportSettings.RootMotionMode == cm::animation::RootMotionMode::ApplyToEntity)
@@ -486,6 +516,48 @@ void AnimationInspectorPanel::ReimportAnimation()
     {
         std::cerr << "[AnimationInspector] Reimport failed for: " << m_CurrentClipPath << std::endl;
     }
+}
+
+bool AnimationInspectorPanel::SaveBakedRootMotionSettings()
+{
+    if (m_CurrentClipPath.empty() || !m_CurrentAsset)
+        return false;
+
+    m_CurrentAsset->meta.rootMotion = m_ImportSettings.ToRootMotionSettings();
+    m_CurrentAsset->meta.rootMotion.TotalDistanceXZ = 0.0f;
+    m_CurrentAsset->meta.rootMotion.TotalDistanceY = 0.0f;
+
+    if (m_CurrentAsset->meta.rootMotion.Mode == cm::animation::RootMotionMode::ApplyToEntity)
+    {
+        AnimationRootMotion rootMotion;
+        if (CalculateRootMotion(rootMotion))
+        {
+            m_CurrentAsset->meta.rootMotion.TotalDistanceXZ = rootMotion.TotalDistanceXZ;
+            m_CurrentAsset->meta.rootMotion.TotalDistanceY = rootMotion.TotalDistanceY;
+        }
+    }
+
+    if (!cm::animation::SaveAnimationAsset(*m_CurrentAsset, m_CurrentClipPath))
+    {
+        std::cerr << "[AnimationInspector] Failed to save baked root motion metadata for: "
+                  << m_CurrentClipPath << std::endl;
+        return false;
+    }
+
+    std::string binaryPath = BinaryAssetCache::Instance().GetBinaryPath(m_CurrentClipPath);
+    if (!binaryPath.empty() &&
+        !BinaryAssetCache::Instance().BuildAnimationBinary(m_CurrentClipPath, binaryPath))
+    {
+        std::cerr << "[AnimationInspector] Warning: failed to refresh animation binary cache for: "
+                  << m_CurrentClipPath << std::endl;
+    }
+
+    cm::animation::ClearAnimationAssetCache();
+    Scene::Get().InvalidateAllAnimatorAssetCaches();
+    LoadClip(m_CurrentClipPath);
+    std::cout << "[AnimationInspector] Updated baked root motion metadata: "
+              << m_CurrentClipPath << std::endl;
+    return true;
 }
 
 bool AnimationInspectorPanel::CalculateRootMotion(AnimationRootMotion& outRootMotion)

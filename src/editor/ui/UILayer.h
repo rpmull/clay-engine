@@ -158,7 +158,7 @@ public:
     bool IsPrefabEditModeActive() const;
     
     // Blocking overlay helpers
-    void BeginBlockingOverlay(const std::string& label);
+    void BeginBlockingOverlay(const std::string& label, float progress = -1.0f);
     void EndBlockingOverlay();
 
     bool HasTerrainSelection();
@@ -255,14 +255,21 @@ private:
     // Overlay state
     bool m_BlockingOverlayActive = false;
     std::string m_BlockingOverlayLabel;
+    float m_BlockingOverlayProgress = -1.0f;
     // Async play toggle state
     bool m_BeginPlayRequested = false;
+    enum class PlayModeStartPhase {
+        Idle = 0,
+        Prewarming = 1
+    };
     struct PlayModeStartOptions {
         bool binaryOnly = false;
         bool useTempPak = false;
         PlayWindowMode windowMode = PlayWindowMode::Editor;
     };
     PlayModeStartOptions m_PendingPlayOptions{};
+    PlayModeStartPhase m_PlayModeStartPhase = PlayModeStartPhase::Idle;
+    std::shared_ptr<Scene> m_PendingPlayBaseScene;
     bool m_RuntimePreviewActive = false;
     bool m_ExternalRuntimePreviewActive = false;
     void* m_ExternalRuntimeProcessHandle = nullptr;

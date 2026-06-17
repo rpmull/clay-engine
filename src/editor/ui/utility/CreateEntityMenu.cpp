@@ -301,6 +301,14 @@ bool DrawCreateEntityMenuItems(Scene* context, EntityID* selectedEntityOut, Enti
             *selectedEntityOut = e.GetID();
             created = true;
         }
+        if (ImGui::MenuItem("Spot")) {
+            auto e = context->CreateEntity("Spot Light");
+            if (auto* d = context->GetEntityData(e.GetID())) {
+                d->Light = std::make_unique<LightComponent>(LightType::Spot, glm::vec3(1.0f), 1.0f);
+            }
+            *selectedEntityOut = e.GetID();
+            created = true;
+        }
         ImGui::EndMenu();
     }
 

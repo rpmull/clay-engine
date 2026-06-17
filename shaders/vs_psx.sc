@@ -6,6 +6,7 @@ $output v_worldPos, v_normal, v_texcoord0, v_viewDir
 uniform vec4 u_psxParams; // x=jitter_amp_px, y=affine_factor [0..1], z=light_influence [0..1], w=normalPerturbAmp
 uniform vec4 u_psxWorld;  // x=vertexWorldAmp (meters), y=tileSize (meters), z=unused, w=unused
 uniform vec4 u_cameraPos;
+uniform vec4 u_UVTransform; // xy=scale, zw=offset (matches PBR; defaults to (1,1,0,0))
 uniform mat4 u_normalMat; // transpose(inverse(mat3(model)))
 
 void main()
@@ -30,15 +31,18 @@ void main()
     vec4 clip = mul(u_viewProj, worldPos);
     float px = max(u_psxParams.x, 0.0); // pixels
     if (px > 0.0) {
+        // Preserve the original clip-space W sign so vertices near/behind the camera
+        // do not flip NDC quadrants and explode sparse geometry like large quads.
+        float safeW = (clip.w < 0.0 ? -1.0 : 1.0) * max(abs(clip.w), 1e-6);
         // project to ndc
-        vec2 ndc = clip.xy / max(clip.w, 1e-6);
+        vec2 ndc = clip.xy / safeW;
         // assume 1080p-ish scaling; bgfx doesn't expose resolution here, so leave in NDC units via a heuristic
         float step = max(px / 540.0, 1e-6);
         ndc = floor(ndc / step + 0.5) * step;
         clip.xy = ndc * clip.w;
     }
 
-    v_texcoord0.xy = a_texcoord0.xy;
+    v_texcoord0.xy = a_texcoord0.xy * u_UVTransform.xy + u_UVTransform.zw;
     v_viewDir = normalize(u_cameraPos.xyz - worldPos.xyz);
     gl_Position = clip;
 }

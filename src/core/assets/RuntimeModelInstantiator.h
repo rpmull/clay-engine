@@ -57,7 +57,8 @@ private:
                                      EntityID existingRoot);
     
     // Apply materials from manifest to entity - creates actual Material objects
-    static void ApplyMaterials(EntityData* data, 
+    static void ApplyMaterials(Scene& scene,
+                               EntityData* data, 
                                const std::vector<RuntimeMaterialSlot>& materials,
                                IAssetResolver* resolver,
                                bool skinned);

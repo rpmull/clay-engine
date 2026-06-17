@@ -15,6 +15,7 @@
 #include "editor/pipeline/AssetLibrary.h"
 #include "core/resources/ResourceManifest.h"
 #include "core/assets/AssetReference.h"
+#include "core/physics/PhysicsLayerManager.h"
 #include "editor/pipeline/RuntimeModelManifestWriter.h"
 #include "core/vfs/VirtualFS.h"
 
@@ -495,8 +496,16 @@ BuildExporter::ValidationResult BuildExporter::ValidateBuild(const Options& opts
             "vs_depth.bin", "fs_depth.bin"
         };
         for (const auto& shader : essentialShaders) {
-            if (!fs::exists(compiledDir / shader)) {
+            fs::path shaderPath = compiledDir / shader;
+            if (!fs::exists(shaderPath)) {
                 result.AddWarning("Essential shader missing: " + shader);
+                continue;
+            }
+
+            std::error_code shaderEc;
+            const uintmax_t shaderSize = fs::file_size(shaderPath, shaderEc);
+            if (shaderEc || shaderSize == 0) {
+                result.AddError("Essential shader is empty or unreadable: " + shaderPath.string());
             }
         }
     }
@@ -1120,6 +1129,11 @@ bool BuildExporter::ExportProject(const Options& opts, ProgressCallback progress
         json manifest;
         manifest["entryScene"] = entrySceneVPath;
         if (!filteredAssetMap.empty()) manifest["assetMap"] = filteredAssetMap;
+
+        // Project physics layers (ordered; index = layer bit). The runtime must
+        // register the same name->index mapping the scenes were authored against,
+        // otherwise PhysicsLayerName lookups resolve to -1 in the exported build.
+        manifest["physicsLayers"] = PhysicsLayers::PhysicsLayerManager::Get().GetAllLayers();
         
         // Include enabled modules configuration for runtime loading
         const auto& mods = Project::GetModules();

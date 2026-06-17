@@ -34,6 +34,31 @@ __declspec(dllexport) bool Physics_RaycastPoints(
     float* hitDistance,
     int* hitEntityId);
 
+// Spherecast: sweep a sphere of 'radius' from origin along direction up to maxDistance
+// layerMask: bitmask of layers to include (0xFFFFFFFF = all)
+__declspec(dllexport) bool Physics_Spherecast(
+    float originX, float originY, float originZ,
+    float dirX, float dirY, float dirZ,
+    float radius,
+    float maxDistance,
+    uint32_t layerMask,
+    float* hitPointX, float* hitPointY, float* hitPointZ,
+    float* hitNormalX, float* hitNormalY, float* hitNormalZ,
+    float* hitDistance,
+    int* hitEntityId);
+
+// Spherecast between two points (swept sphere along a segment)
+// layerMask: bitmask of layers to include (0xFFFFFFFF = all)
+__declspec(dllexport) bool Physics_SpherecastPoints(
+    float fromX, float fromY, float fromZ,
+    float toX, float toY, float toZ,
+    float radius,
+    uint32_t layerMask,
+    float* hitPointX, float* hitPointY, float* hitPointZ,
+    float* hitNormalX, float* hitNormalY, float* hitNormalZ,
+    float* hitDistance,
+    int* hitEntityId);
+
 // Layer management
 __declspec(dllexport) uint32_t Physics_RegisterLayer(const char* name);
 __declspec(dllexport) int32_t Physics_GetLayerIndex(const char* name);
@@ -51,6 +76,10 @@ using Physics_Raycast_fn = bool(*)(float, float, float, float, float, float, flo
     float*, float*, float*, float*, float*, float*, float*, int*);
 using Physics_RaycastPoints_fn = bool(*)(float, float, float, float, float, float, uint32_t,
     float*, float*, float*, float*, float*, float*, float*, int*);
+using Physics_Spherecast_fn = bool(*)(float, float, float, float, float, float, float, float, uint32_t,
+    float*, float*, float*, float*, float*, float*, float*, int*);
+using Physics_SpherecastPoints_fn = bool(*)(float, float, float, float, float, float, float, uint32_t,
+    float*, float*, float*, float*, float*, float*, float*, int*);
 using Physics_RegisterLayer_fn = uint32_t(*)(const char*);
 using Physics_GetLayerIndex_fn = int32_t(*)(const char*);
 using Physics_GetLayerMask_fn = uint32_t(*)(const char*);
@@ -61,13 +90,15 @@ extern Physics_SetGravity_fn Physics_SetGravityPtr;
 extern Physics_GetGravity_fn Physics_GetGravityPtr;
 extern Physics_Raycast_fn Physics_RaycastPtr;
 extern Physics_RaycastPoints_fn Physics_RaycastPointsPtr;
+extern Physics_Spherecast_fn Physics_SpherecastPtr;
+extern Physics_SpherecastPoints_fn Physics_SpherecastPointsPtr;
 extern Physics_RegisterLayer_fn Physics_RegisterLayerPtr;
 extern Physics_GetLayerIndex_fn Physics_GetLayerIndexPtr;
 extern Physics_GetLayerMask_fn Physics_GetLayerMaskPtr;
 extern Physics_GetLayerCount_fn Physics_GetLayerCountPtr;
 
 // Number of function pointers (must match managed side)
-constexpr int kPhysicsInteropCount = 8;
+constexpr int kPhysicsInteropCount = 10;
 
 // Setup physics interop with managed runtime
 void SetupPhysicsInterop(const std::wstring& assemblyPath);

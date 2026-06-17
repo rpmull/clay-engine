@@ -1196,8 +1196,20 @@ void RuntimeWorld::SyncQueuedTransformsFromScene(Scene& scene) {
         return;
     }
 
+    // PERF: this fallback runs whenever the pending-transform bitset is drained,
+    // which happens on every UpdateTransforms pass after the first one in a frame
+    // (there are several passes per frame). Previously it called syncTransformEntity
+    // for *every* entity -- two hash lookups each (m_SceneToIndex + GetEntityData) --
+    // even though almost nothing is dirty on the repeated passes. Read the AoS dirty
+    // flag directly from the map iterator (no lookup) and only invoke the full sync
+    // for entities that are actually dirty. This keeps the fallback a single cheap
+    // bool check per entity instead of O(total entities) hash lookups -- important
+    // because deep bone skeletons inflate the entity count (~80 bone entities per
+    // character) and that cost is paid several times per frame.
     for (const auto& [sceneEntity, data] : scene.m_Entities) {
-        (void)data;
+        if (!data.Transform.TransformDirty) {
+            continue;
+        }
         syncTransformEntity(sceneEntity);
     }
 }
@@ -1422,10 +1434,16 @@ void RuntimeWorld::SyncEntityFromScene(Scene& scene, EntityID sceneEntity, bool&
         light.Type = data->Light->Type;
         light.Color = data->Light->Color;
         light.Intensity = data->Light->Intensity;
+        light.Range = data->Light->Range;
+        light.SpotInnerAngleDegrees = data->Light->SpotInnerAngleDegrees;
+        light.SpotOuterAngleDegrees = data->Light->SpotOuterAngleDegrees;
         if (!m_Lights[index].Enabled ||
             m_Lights[index].Type != light.Type ||
             !NearlyEqual(m_Lights[index].Color, light.Color) ||
-            !NearlyEqual(m_Lights[index].Intensity, light.Intensity)) {
+            !NearlyEqual(m_Lights[index].Intensity, light.Intensity) ||
+            !NearlyEqual(m_Lights[index].Range, light.Range) ||
+            !NearlyEqual(m_Lights[index].SpotInnerAngleDegrees, light.SpotInnerAngleDegrees) ||
+            !NearlyEqual(m_Lights[index].SpotOuterAngleDegrees, light.SpotOuterAngleDegrees)) {
             m_Lights[index] = light;
             lightChanged = true;
         }
@@ -1738,12 +1756,25 @@ void RuntimeWorld::WriteBackSceneTransforms(Scene& scene) {
 void RuntimeWorld::UpdateTransforms(Scene& scene) {
     ScopedTimer transformTimer("RuntimeWorld/UpdateTransforms");
     Profiler::Get().AddCounter("RuntimeWorld/TransformPhaseSyncRequests", 1);
-    if (m_SceneOrder.empty() || !scene.IsRuntimeWorldFrameSyncLocked()) {
+    // PERF: only do a full O(N) SyncFromScene when there is real structural/component
+    // sync work (entities added/removed, or non-transform component dirty bits). In
+    // steady state -- where only transforms move (physics/nav) -- the per-frame sync
+    // lock is never set (it is gated on structural work in Scene::Update), so this used
+    // to fall through to a full SyncFromScene on EVERY transform pass (~3x/frame),
+    // re-reading all N entities (heavily bone-inflated for skeletal characters).
+    // Transform-only changes are captured by the pending-transform bitset, so the
+    // incremental SyncQueuedTransforms (O(moving entities)) is sufficient and correct.
+    // A mid-frame component change sets structural work, so the next pass still performs
+    // a full sync the same frame -- no deferral / no 1-frame-lag regression.
+    if (scene.HasPendingRuntimeWorldStructuralSyncWork()) {
+        Profiler::Get().AddCounter("RuntimeWorld/TransformDeferredStructuralSyncs", 1);
+    }
+    const bool needsFullStructuralSync =
+        m_SceneOrder.empty() ||
+        (!scene.IsRuntimeWorldFrameSyncLocked() && scene.HasPendingRuntimeWorldStructuralSyncWork());
+    if (needsFullStructuralSync) {
         SyncFromScene(scene, RuntimeSyncReason::SceneUpdate, false);
     } else {
-        if (scene.HasPendingRuntimeWorldStructuralSyncWork()) {
-            Profiler::Get().AddCounter("RuntimeWorld/TransformDeferredStructuralSyncs", 1);
-        }
         SyncQueuedTransformsFromScene(scene);
     }
     uint64_t transformAnchorCount = 0;
@@ -1847,6 +1878,12 @@ void RuntimeWorld::UpdateTransforms(Scene& scene) {
 
                     m_RecomputedThisPass[index] = 1u;
                     ++transformVisitedCount;
+                    // A light whose world transform changed must be re-extracted.
+                    // Children recomputed via ancestor movement are never marked
+                    // dirty individually, so flag it here to refresh LightVersion.
+                    if (m_Entities[index].HasLight) {
+                        m_LightWorldDirtyFromHierarchy = true;
+                    }
                     if (externalOverride) {
                         m_ExternalWorldDirty[index] = 0u;
                         ClearDirty(index, RuntimeDirtyBits::TransformWorld);
@@ -1884,6 +1921,13 @@ void RuntimeWorld::UpdateTransforms(Scene& scene) {
 
     m_TaskGraph.Execute();
     CompactTransformStageCandidates();
+    // If a light moved because an ancestor moved, bump LightVersion so the next
+    // light extraction rebuilds the list with the updated world position. Done on
+    // the main thread after the transform tasks have finished.
+    if (m_LightWorldDirtyFromHierarchy) {
+        m_Stats.LightVersion = ++m_GlobalVersion;
+        m_LightWorldDirtyFromHierarchy = false;
+    }
     Profiler::Get().SetCounter("RuntimeWorld/TransformAnchors", transformAnchorCount);
     Profiler::Get().SetCounter("RuntimeWorld/TransformVisited", transformVisitedCount);
     m_Stats.TaskCount = m_TaskGraph.GetLastStats().size();
@@ -2468,6 +2512,9 @@ void RuntimeWorld::BuildRenderWorld(Scene& scene, uint32_t activeLayerMask, bool
                             entry.Type = m_Lights[index].Type;
                             entry.Color = m_Lights[index].Color;
                             entry.Intensity = m_Lights[index].Intensity;
+                            entry.Range = m_Lights[index].Range;
+                            entry.SpotInnerAngleDegrees = m_Lights[index].SpotInnerAngleDegrees;
+                            entry.SpotOuterAngleDegrees = m_Lights[index].SpotOuterAngleDegrees;
                             entry.Position = glm::vec3(m_WorldMatrices[index][3]);
                             entry.Direction = LightDirectionFromWorldMatrix(m_WorldMatrices[index]);
                             lightChunk.push_back(entry);
@@ -2517,6 +2564,9 @@ void RuntimeWorld::BuildRenderWorld(Scene& scene, uint32_t activeLayerMask, bool
                         entry.Type = m_Lights[index].Type;
                         entry.Color = m_Lights[index].Color;
                         entry.Intensity = m_Lights[index].Intensity;
+                        entry.Range = m_Lights[index].Range;
+                        entry.SpotInnerAngleDegrees = m_Lights[index].SpotInnerAngleDegrees;
+                        entry.SpotOuterAngleDegrees = m_Lights[index].SpotOuterAngleDegrees;
                         entry.Position = glm::vec3(m_WorldMatrices[index][3]);
                         entry.Direction = LightDirectionFromWorldMatrix(m_WorldMatrices[index]);
                         lights.push_back(entry);

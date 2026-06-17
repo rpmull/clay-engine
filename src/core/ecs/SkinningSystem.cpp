@@ -331,6 +331,12 @@ static bool CanBootstrapGpuSharedSkeletonSourceForGpuMorph(
 	return paletteBoneCount <= SkinningComponent::MaxDirectVertexBones;
 }
 
+// Minimum number of LOD-relevant instances sharing a batch key before GPU crowd
+// morph activates. Restored to the original author value of 8 after profiling
+// (world.scene) showed the relevant gate is the render-state check
+// (Skinning/GpuMorphRenderStateBlocked), not batch size
+// (Skinning/GpuMorphBatchTooSmall == 0), and that NPC morph weights are ~0 so no
+// per-frame morph work exists to move. This is a tuning knob for morph-heavy crowds.
 constexpr uint32_t kGpuMorphCrowdMinBatchSize = 8;
 
 static uint64_t HashCombineStable(uint64_t seed, uint64_t value)
@@ -395,7 +401,20 @@ static bool TryBuildGpuMorphCrowdBatchKey(
 	};
 
 	uint64_t key = 1469598103934665603ULL;
-	key = HashCombineStable(key, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(meshPtr)));
+	// CROWD-BATCH FIX: key on stable mesh *content* identity rather than the
+	// per-instance Dynamic Mesh pointer. Identical-prefab NPCs each own a distinct
+	// Dynamic Mesh clone (so blendshape morph targets can be written per instance),
+	// so hashing the pointer gave every instance a unique batch key -> each batch
+	// size 1 < kGpuMorphCrowdMinBatchSize -> GPU morph never activated
+	// (0 active / N eligible). Content identity lets instances of the same source
+	// mesh share a key and form a crowd batch, while the geometry signature +
+	// vertex/index counts + bone-remap hash still strongly distinguish different
+	// meshes. (The shared material pointer below already separates batches by
+	// appearance, which is the desired behavior.)
+	key = HashCombineStable(key, static_cast<uint64_t>(meshPtr->numVertices));
+	key = HashCombineStable(key, static_cast<uint64_t>(meshPtr->numIndices));
+	key = HashCombineStable(key, meshPtr->GetCachedSkinningBoneRemapHash());
+	key = HashCombineStable(key, meshPtr->SkinnedLayout ? 1ull : 0ull);
 	key = HashCombineStable(key, blendShapes->GetGeometrySignature(meshPtr->Vertices.size()));
 	key = HashCombineStable(key, meshComponent.ShowBackfaces ? 1ull : 0ull);
 
@@ -937,9 +956,15 @@ void SkinningSystem::Update(Scene& scene, float dt)
 			bgfx::isValid(ShaderManager::Instance().LoadProgram("vs_depth_skinned_morph", "fs_point_shadow_depth")) &&
 			bgfx::isValid(ShaderManager::Instance().LoadProgram("vs_depth_skinned_morph_instanced", "fs_point_shadow_depth"));
 	}
+	// PERF: ArmorFit lives on armor *mesh* entities (renderable), never on bones.
+	// Scanning scene.GetEntities() walked the entire bone-inflated entity list every
+	// frame just to build a set that is empty unless modular armor is equipped. Iterate
+	// the cached renderable-mesh list (O(meshes), excludes bones) with the same
+	// all-entities fallback the rest of this function already uses when the runtime
+	// bridge isn't populated. Same established pattern as the cached camera/light lists.
 	std::unordered_set<EntityID> cpuMorphConsumerMeshEntities;
-	for (const auto& ent : scene.GetEntities()) {
-		EntityData* data = scene.GetEntityData(ent.GetID());
+	for (EntityID entId : *renderableMeshEntityIds) {
+		EntityData* data = scene.GetEntityData(entId);
 		if (!data || !data->ArmorFit || data->ArmorFit->BodyEntity == INVALID_ENTITY_ID) {
 			continue;
 		}
@@ -1726,7 +1751,11 @@ void SkinningSystem::Update(Scene& scene, float dt)
 					g.skel->RuntimeBoneGlobalsValid &&
 					g.skel->RuntimeBoneGlobals.size() >= boneCount;
 				if (canReuseRuntimeGlobals) {
-					const size_t chunkPose = 64;
+					// PERF: run the per-group pose palette inline (no job dispatch). boneCount is
+				// small (~tens), and the outer group loop is serial, so dispatching a 1-2 chunk
+				// parallel_for here per group per frame is pure barrier overhead. Setting chunk
+				// >= boneCount takes parallel_for's inline fast-path (total <= chunk).
+				const size_t chunkPose = std::max<size_t>(boneCount, size_t{ 1 });
 					parallel_for(Jobs(), size_t{ 0 }, boneCount, chunkPose, [&](size_t s, size_t c) {
 						for (size_t i = s; i < s + c; ++i) {
 							g.skel->BonePalette[i] =
@@ -1785,7 +1814,11 @@ void SkinningSystem::Update(Scene& scene, float dt)
 					// skeleton root's space can bind this palette directly without any per-mesh
 					// matrix work, while offset meshes can derive their palette from the same
 					// shared data via a single skeleton-to-mesh matrix.
-					const size_t chunkPose = 64;
+					// PERF: run the per-group pose palette inline (no job dispatch). boneCount is
+				// small (~tens), and the outer group loop is serial, so dispatching a 1-2 chunk
+				// parallel_for here per group per frame is pure barrier overhead. Setting chunk
+				// >= boneCount takes parallel_for's inline fast-path (total <= chunk).
+				const size_t chunkPose = std::max<size_t>(boneCount, size_t{ 1 });
 					parallel_for(Jobs(), size_t{ 0 }, boneCount, chunkPose, [&](size_t s, size_t c) {
 						for (size_t i = s; i < s + c; ++i) {
 							g.skel->BonePalette[i] = invSkeletonWorld * boneWorld[i] * g.skel->InverseBindPoses[i];
@@ -1796,7 +1829,9 @@ void SkinningSystem::Update(Scene& scene, float dt)
 				}
 			}
 
-			const size_t meshChunkSize = (g.meshes.size() >= 32) ? size_t{ 8 } : size_t{ 1 };
+			// PERF: for small per-group mesh counts (the common case), run inline rather than
+			// dispatching one tiny job per mesh (chunk 1). Large groups still parallelize.
+			const size_t meshChunkSize = (g.meshes.size() >= 32) ? size_t{ 8 } : std::max<size_t>(g.meshes.size(), size_t{ 1 });
 			parallel_for(Jobs(), size_t{ 0 }, g.meshes.size(), meshChunkSize,
 				[&](size_t mStart, size_t mCount) {
 					for (size_t m = mStart; m < mStart + mCount; ++m) {

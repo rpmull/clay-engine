@@ -8,6 +8,8 @@ namespace ClaymoreEngine.Scripting.Scriptable
     [AttributeUsage(AttributeTargets.Class, Inherited = false, AllowMultiple = false)]
     public sealed class CreateAssetMenuAttribute : Attribute
     {
+        public int order;
+
         public string MenuPath { get; }
         public string FileName { get; }
         public int Order { get; }

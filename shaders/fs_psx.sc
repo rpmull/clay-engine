@@ -14,8 +14,10 @@ uniform vec4 u_posterize; // x=levels (0=off, >=1 quantization levels), yzw unus
 
 // Minimal lighting inputs (reuse PBR light uniforms for consistency)
 uniform vec4 u_lightColors[5];     // rgb=color, a=intensity
-uniform vec4 u_lightPositions[5];  // xyz=dir/pos, w=type (0=dir,1=point)
+uniform vec4 u_lightPositions[5];  // xyz=position, w=type (0=dir,1=point,2=spot)
+uniform vec4 u_lightDirections[5]; // xyz=forward/light direction
 uniform vec4 u_lightParams[5];     // x=range, y=const, z=linear, w=quadratic
+uniform vec4 u_lightSpotParams[5]; // x=inner cone cos, y=outer cone cos
 uniform vec4 u_ambientFog;         // xyz=ambient color, w=fog enabled flag
 uniform vec4 u_fogParams;          // x=fogDensity, yzw=fog color
 uniform vec4 u_cameraPos;
@@ -34,6 +36,8 @@ SAMPLER2D(s_pointShadowMap, 8);
 uniform vec4 u_pointShadowMeta[4];     // x=enabled, y=light slot, z=range, w=bias
 uniform vec4 u_pointShadowLightPos[4]; // xyz=light position
 uniform vec4 u_pointShadowAtlas;    // x=tileCols, y=tileRows, z=1/atlasW, w=1/atlasH
+uniform vec4 u_psxShadowParams;     // x=enable (0/1), y=strength (0..1) for unlit PSX shadow receive
+uniform vec4 u_psxEmission;         // xyz=emission color, w=emission strength (0=off)
 
 vec2 PointShadowFaceUV(vec3 dir, out int faceIndex) {
     vec3 ad = abs(dir);
@@ -71,6 +75,103 @@ float SamplePointShadow(vec3 worldPos, int shadowIdx) {
     vec2 atlasUV = (faceUV + tile) / vec2(u_pointShadowAtlas.x, u_pointShadowAtlas.y);
     float storedDepth = texture2D(s_pointShadowMap, atlasUV).r;
     return ((currentDepth - shadowMeta.w) <= storedDepth) ? 1.0 : 0.0;
+}
+
+float ComputeSpotAttenuation(int lightIndex, vec3 L) {
+    if (u_lightPositions[lightIndex].w < 1.5) {
+        return 1.0;
+    }
+    float innerCos = u_lightSpotParams[lightIndex].x;
+    float outerCos = u_lightSpotParams[lightIndex].y;
+    float theta = dot(normalize(u_lightDirections[lightIndex].xyz), -L);
+    float denom = max(innerCos - outerCos, 1e-4);
+    return clamp((theta - outerCos) / denom, 0.0, 1.0);
+}
+
+// Directional (cascaded) shadow factor in [0,1]. 1.0 = fully lit.
+// Mirrors the PBR shadow sampling so PSX casters/receivers match PBR.
+float ComputeDirectionalShadow(vec3 worldPos, vec3 N) {
+    if (!(u_shadowReceive.x > 0.5 && u_shadowParams.w > 0.0001 && u_shadowTexelSize.x > 0.0)) {
+        return 1.0;
+    }
+    int cascadeIndex = 0;
+    vec4 viewPos = mul(u_view, vec4(worldPos, 1.0));
+    float camDepth = max(-viewPos.z, 0.0);
+    int cascadeCount = int(u_CascadeSplits.w + 0.5);
+    if (cascadeCount > 1) {
+        if (camDepth > u_CascadeSplits.x) cascadeIndex = 1;
+        if (cascadeCount > 2 && camDepth > u_CascadeSplits.y) cascadeIndex = 2;
+        if (cascadeCount > 3 && camDepth > u_CascadeSplits.z) cascadeIndex = 3;
+        cascadeIndex = min(cascadeIndex, cascadeCount - 1);
+    }
+    mat4 LVP = (cascadeCount > 1) ? u_lightViewProjCSM[cascadeIndex] : u_lightViewProj;
+    vec4 lp = mul(LVP, vec4(worldPos, 1.0));
+    float invW = 1.0 / max(lp.w, 1.0e-6);
+    vec3 ndc = lp.xyz * invW;
+#if BGFX_SHADER_LANGUAGE_GLSL
+    float depth = ndc.z * 0.5 + 0.5;
+#else
+    float depth = ndc.z;
+#endif
+    vec2 uv = ndc.xy * 0.5 + 0.5;
+    bool insideShadowProjection =
+        uv.x >= 0.0 && uv.x <= 1.0 &&
+        uv.y >= 0.0 && uv.y <= 1.0 &&
+        depth >= 0.0 && depth <= 1.0;
+    if (!insideShadowProjection) {
+        return 1.0;
+    }
+    if (u_shadowTexelSize.w < 0.5) {
+        uv.y = 1.0 - uv.y;
+    }
+    vec2 shadowUvMin = u_shadowTexelSize.xy;
+    vec2 shadowUvMax = vec2(1.0, 1.0) - u_shadowTexelSize.xy;
+    if (cascadeCount > 1) {
+        vec2 scale = u_CascadeScaleBias[cascadeIndex].xy;
+        vec2 bias  = u_CascadeScaleBias[cascadeIndex].zw;
+        uv = uv * scale + bias;
+        shadowUvMin = bias + u_shadowTexelSize.xy;
+        shadowUvMax = bias + scale - u_shadowTexelSize.xy;
+        uv = clamp(uv, shadowUvMin, shadowUvMax);
+    }
+    vec3 toLight = normalize(-u_shadowLightDir.xyz);
+    float normalBias = u_shadowParams.y * (1.0 - max(dot(N, toLight), 0.0)) * max(u_shadowTexelSize.x, u_shadowTexelSize.y);
+    float bias = u_shadowParams.x + normalBias;
+    int taps = 1;
+    if (u_shadowParams.z > 0.01) {
+        taps = (u_shadowTexelSize.z > 12.5) ? 16 : (u_shadowTexelSize.z > 8.5 ? 9 : (u_shadowTexelSize.z > 2.5 ? 4 : 1));
+    }
+    float sum = 0.0;
+    float r = u_shadowParams.z;
+    if (taps == 1) {
+        sum = shadow2D(s_shadowMap, vec3(clamp(uv, shadowUvMin, shadowUvMax), depth - bias));
+    } else if (taps == 4) {
+        vec2 o = u_shadowTexelSize.xy * r;
+        sum += shadow2D(s_shadowMap, vec3(clamp(uv + vec2(-o.x, -o.y), shadowUvMin, shadowUvMax), depth - bias));
+        sum += shadow2D(s_shadowMap, vec3(clamp(uv + vec2( o.x, -o.y), shadowUvMin, shadowUvMax), depth - bias));
+        sum += shadow2D(s_shadowMap, vec3(clamp(uv + vec2(-o.x,  o.y), shadowUvMin, shadowUvMax), depth - bias));
+        sum += shadow2D(s_shadowMap, vec3(clamp(uv + vec2( o.x,  o.y), shadowUvMin, shadowUvMax), depth - bias));
+        sum *= 0.25;
+    } else if (taps == 9) {
+        vec2 o = u_shadowTexelSize.xy * r;
+        for (int y = -1; y <= 1; ++y) {
+            for (int x = -1; x <= 1; ++x) {
+                vec2 off = vec2(float(x), float(y)) * o;
+                sum += shadow2D(s_shadowMap, vec3(clamp(uv + off, shadowUvMin, shadowUvMax), depth - bias));
+            }
+        }
+        sum /= 9.0;
+    } else { // 16 taps
+        vec2 o = u_shadowTexelSize.xy * r;
+        for (int y = -2; y <= 1; ++y) {
+            for (int x = -2; x <= 1; ++x) {
+                vec2 off = vec2(float(x) + 0.5, float(y) + 0.5) * o;
+                sum += shadow2D(s_shadowMap, vec3(clamp(uv + off, shadowUvMin, shadowUvMax), depth - bias));
+            }
+        }
+        sum /= 16.0;
+    }
+    return sum;
 }
 
 void main()
@@ -127,87 +228,8 @@ void main()
         vec3 V = normalize(v_viewDir);
         vec3 lit = base.rgb * u_ambientFog.xyz;
 
-        // Shadow factor (hardware comparison + PCF)
-        float shadowFactor = 1.0;
-        if (u_shadowReceive.x > 0.5 && u_shadowParams.w > 0.0001 && u_shadowTexelSize.x > 0.0) {
-            int cascadeIndex = 0;
-            vec4 viewPos = mul(u_view, vec4(v_worldPos, 1.0));
-            float camDepth = max(-viewPos.z, 0.0);
-            int cascadeCount = int(u_CascadeSplits.w + 0.5);
-            if (cascadeCount > 1) {
-                if (camDepth > u_CascadeSplits.x) cascadeIndex = 1;
-                if (cascadeCount > 2 && camDepth > u_CascadeSplits.y) cascadeIndex = 2;
-                if (cascadeCount > 3 && camDepth > u_CascadeSplits.z) cascadeIndex = 3;
-                cascadeIndex = min(cascadeIndex, cascadeCount - 1);
-            }
-            mat4 LVP = (cascadeCount > 1) ? u_lightViewProjCSM[cascadeIndex] : u_lightViewProj;
-            vec4 lp = mul(LVP, vec4(v_worldPos, 1.0));
-            float invW = 1.0 / max(lp.w, 1.0e-6);
-            vec3 ndc = lp.xyz * invW;
-#if BGFX_SHADER_LANGUAGE_GLSL
-            float depth = ndc.z * 0.5 + 0.5;
-#else
-            float depth = ndc.z;
-#endif
-            vec2 uv = ndc.xy * 0.5 + 0.5;
-            bool insideShadowProjection =
-                uv.x >= 0.0 && uv.x <= 1.0 &&
-                uv.y >= 0.0 && uv.y <= 1.0 &&
-                depth >= 0.0 && depth <= 1.0;
-            if (insideShadowProjection) {
-                if (u_shadowTexelSize.w < 0.5) {
-                    uv.y = 1.0 - uv.y;
-                }
-                vec2 shadowUvMin = u_shadowTexelSize.xy;
-                vec2 shadowUvMax = vec2(1.0, 1.0) - u_shadowTexelSize.xy;
-                if (cascadeCount > 1) {
-                    vec2 scale = u_CascadeScaleBias[cascadeIndex].xy;
-                    vec2 bias  = u_CascadeScaleBias[cascadeIndex].zw;
-                    uv = uv * scale + bias;
-                    shadowUvMin = bias + u_shadowTexelSize.xy;
-                    shadowUvMax = bias + scale - u_shadowTexelSize.xy;
-                    uv = clamp(uv, shadowUvMin, shadowUvMax);
-                }
-                vec3 toLight = normalize(-u_shadowLightDir.xyz);
-                float normalBias = u_shadowParams.y * (1.0 - max(dot(N, toLight), 0.0)) * max(u_shadowTexelSize.x, u_shadowTexelSize.y);
-                float bias = u_shadowParams.x + normalBias;
-                int taps = 1;
-                if (u_shadowParams.z > 0.01) {
-                    taps = (u_shadowTexelSize.z > 12.5) ? 16 : (u_shadowTexelSize.z > 8.5 ? 9 : (u_shadowTexelSize.z > 2.5 ? 4 : 1));
-                }
-                float sum = 0.0;
-                float r = u_shadowParams.z;
-                if (taps == 1) {
-                    sum = shadow2D(s_shadowMap, vec3(clamp(uv, shadowUvMin, shadowUvMax), depth - bias));
-                } else if (taps == 4) {
-                    vec2 o = u_shadowTexelSize.xy * r;
-                    sum += shadow2D(s_shadowMap, vec3(clamp(uv + vec2(-o.x, -o.y), shadowUvMin, shadowUvMax), depth - bias));
-                    sum += shadow2D(s_shadowMap, vec3(clamp(uv + vec2( o.x, -o.y), shadowUvMin, shadowUvMax), depth - bias));
-                    sum += shadow2D(s_shadowMap, vec3(clamp(uv + vec2(-o.x,  o.y), shadowUvMin, shadowUvMax), depth - bias));
-                    sum += shadow2D(s_shadowMap, vec3(clamp(uv + vec2( o.x,  o.y), shadowUvMin, shadowUvMax), depth - bias));
-                    sum *= 0.25;
-                } else if (taps == 9) {
-                    vec2 o = u_shadowTexelSize.xy * r;
-                    for (int y = -1; y <= 1; ++y) {
-                        for (int x = -1; x <= 1; ++x) {
-                            vec2 off = vec2(float(x), float(y)) * o;
-                            sum += shadow2D(s_shadowMap, vec3(clamp(uv + off, shadowUvMin, shadowUvMax), depth - bias));
-                        }
-                    }
-                    sum /= 9.0;
-                } else { // 16 taps
-                    vec2 o = u_shadowTexelSize.xy * r;
-                    for (int y = -2; y <= 1; ++y) {
-                        for (int x = -2; x <= 1; ++x) {
-                            vec2 off = vec2(float(x) + 0.5, float(y) + 0.5) * o;
-                            sum += shadow2D(s_shadowMap, vec3(clamp(uv + off, shadowUvMin, shadowUvMax), depth - bias));
-                        }
-                    }
-                    sum /= 16.0;
-                }
-                shadowFactor = sum;
-            }
-        }
+        // Shadow factor (hardware comparison + PCF) — shared with the unlit path
+        float shadowFactor = ComputeDirectionalShadow(v_worldPos, N);
 
         // Simple Lambert + distance attenuation with optional toon banding
         for (int i = 0; i < 5; ++i) {
@@ -215,7 +237,7 @@ void main()
             vec3 L;
             float attenuation = 1.0;
             if (type < 0.5) {
-                L = normalize(-u_lightPositions[i].xyz);
+                L = normalize(-u_lightDirections[i].xyz);
             } else {
                 vec3 pos = u_lightPositions[i].xyz;
                 vec3 toL = pos - v_worldPos;
@@ -228,6 +250,10 @@ void main()
                 float linearT  = u_lightParams[i].z;
                 float quad     = u_lightParams[i].w;
                 attenuation = 1.0 / max(constant + linearT * dist + quad * dist * dist, 1e-4);
+                attenuation *= ComputeSpotAttenuation(i, L);
+                if (attenuation <= 0.0) {
+                    continue;
+                }
             }
 
             float NdotL = max(dot(N, L), 0.0);
@@ -243,7 +269,7 @@ void main()
             float sf = 1.0;
             if (type < 0.5) {
                 sf = mix(1.0, shadowFactor, shadowWeight);
-            } else {
+            } else if (type < 1.5) {
                 for (int shadowIdx = 0; shadowIdx < 4; ++shadowIdx) {
                     if (u_pointShadowMeta[shadowIdx].x > 0.5 && abs(float(i) - u_pointShadowMeta[shadowIdx].y) < 0.25) {
                         float pointShadowFactor = SamplePointShadow(v_worldPos, shadowIdx);
@@ -256,6 +282,25 @@ void main()
         }
 
         finalRgb = mix(base.rgb, lit, lightInfluence);
+    }
+
+    // PSX cast/receive shadows: apply the directional shadow to the unlit
+    // contribution so shadows show even when the material is unlit. The lit
+    // portion is already shadowed per-light above, so only the (1 - lightInfluence)
+    // unlit part is darkened here to avoid double-darkening.
+    if (u_psxShadowParams.x > 0.5) {
+        float psxShadow = ComputeDirectionalShadow(v_worldPos, normalize(v_normal));
+        float strength = clamp(u_psxShadowParams.y, 0.0, 1.0) * clamp(u_shadowReceive.x, 0.0, 1.0);
+        float shadowMul = mix(1.0, psxShadow, strength);
+        finalRgb *= mix(1.0, shadowMul, 1.0 - lightInfluence);
+    }
+
+    // Emission: additive self-illumination, modulated by the albedo so textured
+    // surfaces glow with their own colors. Applied after lighting/shadows so it
+    // stays visible in darkness, but before fog so distance still attenuates it.
+    float emissionStrength = max(u_psxEmission.w, 0.0);
+    if (emissionStrength > 0.0001) {
+        finalRgb += base.rgb * u_psxEmission.xyz * emissionStrength;
     }
 
     // Exponential fog (matches PBR fog behavior)

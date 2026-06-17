@@ -1,6 +1,9 @@
 #include "TextureLoader.h"
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
+#include <bimg/bimg.h>
+#include <bimg/decode.h>
+#include <bx/allocator.h>
 #include "core/vfs/FileSystem.h"
 #include "core/vfs/VirtualFS.h"
 #include <stdexcept>
@@ -28,6 +31,104 @@
 // Helper to convert color space enum to bgfx flags
 static uint64_t ColorSpaceToFlags(TextureColorSpace colorSpace) {
     return (colorSpace == TextureColorSpace::sRGB) ? BGFX_TEXTURE_SRGB : BGFX_TEXTURE_NONE;
+}
+
+static bx::DefaultAllocator s_textureAllocator;
+
+static bool IsGpuNativeTextureContainerData(const void* data, uint32_t sizeBytes)
+{
+    if (!data || sizeBytes < 4) {
+        return false;
+    }
+
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(data);
+    if (sizeBytes >= 4
+        && bytes[0] == 'D'
+        && bytes[1] == 'D'
+        && bytes[2] == 'S'
+        && bytes[3] == ' ') {
+        return true;
+    }
+
+    static const uint8_t kKtx1Signature[12] = {
+        0xAB, 0x4B, 0x54, 0x58, 0x20, 0x31, 0x31, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A
+    };
+    static const uint8_t kKtx2Signature[12] = {
+        0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A
+    };
+    if (sizeBytes >= 12
+        && (0 == std::memcmp(bytes, kKtx1Signature, sizeof(kKtx1Signature))
+            || 0 == std::memcmp(bytes, kKtx2Signature, sizeof(kKtx2Signature)))) {
+        return true;
+    }
+
+    return false;
+}
+
+static uint8_t ComputeMipSkip(uint32_t width, uint32_t height, uint8_t numMips, uint32_t maxDimension)
+{
+    if (maxDimension == 0 || numMips <= 1) {
+        return 0;
+    }
+
+    uint8_t skip = 0;
+    while (skip + 1 < numMips && std::max(width, height) > maxDimension) {
+        width = std::max<uint32_t>(1u, width >> 1);
+        height = std::max<uint32_t>(1u, height >> 1);
+        ++skip;
+    }
+    return skip;
+}
+
+static bgfx::TextureHandle TryLoadNativeTextureContainer(
+    const void* data,
+    uint32_t sizeBytes,
+    const std::string& debugName,
+    TextureColorSpace colorSpace,
+    uint32_t maxDimension)
+{
+    if (!IsGpuNativeTextureContainerData(data, sizeBytes)) {
+        return BGFX_INVALID_HANDLE;
+    }
+
+    bimg::ImageContainer* image = bimg::imageParse(&s_textureAllocator, data, sizeBytes);
+    if (nullptr == image) {
+        return BGFX_INVALID_HANDLE;
+    }
+
+    const uint64_t flags = ColorSpaceToFlags(colorSpace);
+    const bool valid2dTexture = !image->m_cubeMap
+        && image->m_depth <= 1
+        && bgfx::isTextureValid(
+            0,
+            false,
+            image->m_numLayers,
+            bgfx::TextureFormat::Enum(image->m_format),
+            flags);
+
+    if (!valid2dTexture) {
+        bimg::imageFree(image);
+        return BGFX_INVALID_HANDLE;
+    }
+
+    const uint8_t numMips = std::max<uint8_t>(1, image->m_numMips);
+    const uint8_t skip = ComputeMipSkip(image->m_width, image->m_height, numMips, maxDimension);
+    if (maxDimension > 0
+        && std::max(image->m_width, image->m_height) > maxDimension
+        && numMips <= 1) {
+        std::cerr << "[TextureLoader] WARNING: Native container '" << debugName
+                  << "' exceeds texture cap but has no mip chain to skip." << std::endl;
+    }
+
+    bimg::imageFree(image);
+
+    bgfx::TextureInfo info{};
+    const bgfx::Memory* mem = bgfx::copy(data, sizeBytes);
+    bgfx::TextureHandle handle = bgfx::createTexture(mem, flags, skip, &info);
+    if (bgfx::isValid(handle) && !debugName.empty()) {
+        bgfx::setName(handle, debugName.c_str(), static_cast<int32_t>(debugName.size()));
+    }
+    return handle;
 }
 
 static std::vector<uint8_t> GenerateNextMipRGBA8(const std::vector<uint8_t>& src, int srcW, int srcH, int dstW, int dstH)
@@ -107,6 +208,57 @@ static void UploadRGBA8TextureLevels(bgfx::TextureHandle handle, int width, int 
         curH = nextH;
         ++mipLevel;
     }
+}
+
+static void DownscaleRGBA8InPlace(std::vector<uint8_t>& rgba, int& width, int& height, uint32_t maxDimension)
+{
+    if (maxDimension == 0 || width <= 0 || height <= 0) {
+        return;
+    }
+
+    const int currentMax = std::max(width, height);
+    if (currentMax <= static_cast<int>(maxDimension)) {
+        return;
+    }
+
+    const float scale = static_cast<float>(maxDimension) / static_cast<float>(currentMax);
+    const int dstWidth = std::max(1, static_cast<int>(std::round(width * scale)));
+    const int dstHeight = std::max(1, static_cast<int>(std::round(height * scale)));
+    std::vector<uint8_t> resized(static_cast<size_t>(dstWidth) * static_cast<size_t>(dstHeight) * 4u, 0u);
+
+    const auto sampleChannel = [&](int sx, int sy, int channel) -> uint8_t {
+        const size_t idx = (static_cast<size_t>(sy) * static_cast<size_t>(width) + static_cast<size_t>(sx)) * 4u + static_cast<size_t>(channel);
+        return rgba[idx];
+    };
+
+    for (int y = 0; y < dstHeight; ++y) {
+        const float srcY = ((static_cast<float>(y) + 0.5f) * static_cast<float>(height) / static_cast<float>(dstHeight)) - 0.5f;
+        const int y0 = std::clamp(static_cast<int>(std::floor(srcY)), 0, height - 1);
+        const int y1 = std::min(y0 + 1, height - 1);
+        const float ty = std::clamp(srcY - static_cast<float>(y0), 0.0f, 1.0f);
+        for (int x = 0; x < dstWidth; ++x) {
+            const float srcX = ((static_cast<float>(x) + 0.5f) * static_cast<float>(width) / static_cast<float>(dstWidth)) - 0.5f;
+            const int x0 = std::clamp(static_cast<int>(std::floor(srcX)), 0, width - 1);
+            const int x1 = std::min(x0 + 1, width - 1);
+            const float tx = std::clamp(srcX - static_cast<float>(x0), 0.0f, 1.0f);
+            const size_t dstIndex = (static_cast<size_t>(y) * static_cast<size_t>(dstWidth) + static_cast<size_t>(x)) * 4u;
+            for (int channel = 0; channel < 4; ++channel) {
+                const float c00 = static_cast<float>(sampleChannel(x0, y0, channel));
+                const float c10 = static_cast<float>(sampleChannel(x1, y0, channel));
+                const float c01 = static_cast<float>(sampleChannel(x0, y1, channel));
+                const float c11 = static_cast<float>(sampleChannel(x1, y1, channel));
+                const float cx0 = c00 + (c10 - c00) * tx;
+                const float cx1 = c01 + (c11 - c01) * tx;
+                const float value = cx0 + (cx1 - cx0) * ty;
+                const float roundedValue = std::round(value);
+                resized[dstIndex + static_cast<size_t>(channel)] = static_cast<uint8_t>(std::clamp(roundedValue, 0.0f, 255.0f));
+            }
+        }
+    }
+
+    rgba = std::move(resized);
+    width = dstWidth;
+    height = dstHeight;
 }
 
 namespace {
@@ -237,9 +389,19 @@ void TextureLoader::ResetPathCaches() {
     }
 }
 
-bgfx::TextureHandle TextureLoader::Load2DFromEncodedMemory(const void* data, int sizeBytes, bool generateMips, TextureColorSpace colorSpace)
+bgfx::TextureHandle TextureLoader::Load2DFromEncodedMemory(const void* data, int sizeBytes, bool generateMips, TextureColorSpace colorSpace, uint32_t maxDimension)
 {
     if (!data || sizeBytes <= 0) return BGFX_INVALID_HANDLE;
+
+    if (bgfx::TextureHandle nativeHandle = TryLoadNativeTextureContainer(
+            data,
+            static_cast<uint32_t>(sizeBytes),
+            "memory",
+            colorSpace,
+            maxDimension);
+        bgfx::isValid(nativeHandle)) {
+        return nativeHandle;
+    }
     
     // Ensure consistent texture orientation - stbi's flip flag is global
     stbi_set_flip_vertically_on_load(false);
@@ -248,8 +410,11 @@ bgfx::TextureHandle TextureLoader::Load2DFromEncodedMemory(const void* data, int
     stbi_uc* pixels = stbi_load_from_memory(reinterpret_cast<const stbi_uc*>(data), sizeBytes, &width, &height, &channels, 4);
     if (!pixels) return BGFX_INVALID_HANDLE;
 
+    std::vector<uint8_t> rgba(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
+    std::memcpy(rgba.data(), pixels, rgba.size());
+    DownscaleRGBA8InPlace(rgba, width, height, maxDimension);
     uint64_t flags = ColorSpaceToFlags(colorSpace);
-    
+
     const bgfx::TextureHandle handle = bgfx::createTexture2D(
         static_cast<uint16_t>(width),
         static_cast<uint16_t>(height),
@@ -258,29 +423,16 @@ bgfx::TextureHandle TextureLoader::Load2DFromEncodedMemory(const void* data, int
         bgfx::TextureFormat::RGBA8,
         flags,
         nullptr);
-
-    std::vector<uint8_t> rgba(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
-    std::memcpy(rgba.data(), pixels, rgba.size());
     UploadRGBA8TextureLevels(handle, width, height, rgba, generateMips);
     stbi_image_free(pixels);
     return handle;
 }
 
-bgfx::TextureHandle TextureLoader::Load2DFromRGBA(const void* rgbaPixels, int width, int height, bool generateMips, uint32_t rowPitchBytes, TextureColorSpace colorSpace)
+bgfx::TextureHandle TextureLoader::Load2DFromRGBA(const void* rgbaPixels, int width, int height, bool generateMips, uint32_t rowPitchBytes, TextureColorSpace colorSpace, uint32_t maxDimension)
 {
     if (!rgbaPixels || width <= 0 || height <= 0) return BGFX_INVALID_HANDLE;
     if (rowPitchBytes == 0) rowPitchBytes = static_cast<uint32_t>(width) * 4;
-    
-    uint64_t flags = ColorSpaceToFlags(colorSpace);
-    
-    const bgfx::TextureHandle handle = bgfx::createTexture2D(
-        static_cast<uint16_t>(width),
-        static_cast<uint16_t>(height),
-        generateMips,
-        1,
-        bgfx::TextureFormat::RGBA8,
-        flags,
-        nullptr);
+
     std::vector<uint8_t> rgba(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
     const uint8_t* srcBytes = reinterpret_cast<const uint8_t*>(rgbaPixels);
     const uint32_t tightPitch = static_cast<uint32_t>(width) * 4u;
@@ -293,20 +445,31 @@ bgfx::TextureHandle TextureLoader::Load2DFromRGBA(const void* rgbaPixels, int wi
             std::memcpy(dstRow, srcRow, tightPitch);
         }
     }
+    DownscaleRGBA8InPlace(rgba, width, height, maxDimension);
+    uint64_t flags = ColorSpaceToFlags(colorSpace);
+
+    const bgfx::TextureHandle handle = bgfx::createTexture2D(
+        static_cast<uint16_t>(width),
+        static_cast<uint16_t>(height),
+        generateMips,
+        1,
+        bgfx::TextureFormat::RGBA8,
+        flags,
+        nullptr);
     UploadRGBA8TextureLevels(handle, width, height, rgba, generateMips);
     return handle;
 }
 
 // Convenience functions for explicit color space
-bgfx::TextureHandle TextureLoader::Load2DsRGB(const std::string& path, bool generateMips) {
-    return Load2D(path, generateMips, TextureColorSpace::sRGB);
+bgfx::TextureHandle TextureLoader::Load2DsRGB(const std::string& path, bool generateMips, uint32_t maxDimension) {
+    return Load2D(path, generateMips, TextureColorSpace::sRGB, maxDimension);
 }
 
-bgfx::TextureHandle TextureLoader::Load2DLinear(const std::string& path, bool generateMips) {
-    return Load2D(path, generateMips, TextureColorSpace::Linear);
+bgfx::TextureHandle TextureLoader::Load2DLinear(const std::string& path, bool generateMips, uint32_t maxDimension) {
+    return Load2D(path, generateMips, TextureColorSpace::Linear, maxDimension);
 }
 
-bgfx::TextureHandle TextureLoader::Load2D(const std::string& path, bool generateMips, TextureColorSpace colorSpace)
+bgfx::TextureHandle TextureLoader::Load2D(const std::string& path, bool generateMips, TextureColorSpace colorSpace, uint32_t maxDimension)
 {
     // Ensure consistent texture orientation - stbi's flip flag is global and other systems
     // (e.g. particle sprite loader) may have changed it. Explicitly set to no flip.
@@ -319,6 +482,15 @@ bgfx::TextureHandle TextureLoader::Load2D(const std::string& path, bool generate
     
     // Try VFS first (for PAK file access at runtime)
     if (VFS::Get() && VFS::Get()->ReadFile(resolvedPath, fileData)) {
+        if (bgfx::TextureHandle nativeHandle = TryLoadNativeTextureContainer(
+                fileData.data(),
+                static_cast<uint32_t>(fileData.size()),
+                resolvedPath,
+                colorSpace,
+                maxDimension);
+            bgfx::isValid(nativeHandle)) {
+            return nativeHandle;
+        }
         data = stbi_load_from_memory(fileData.data(), static_cast<int>(fileData.size()), &width, &height, &channels, 4);
         if (data) {
             std::cout << "[TextureLoader] Loaded from VFS: " << resolvedPath << std::endl;
@@ -327,6 +499,15 @@ bgfx::TextureHandle TextureLoader::Load2D(const std::string& path, bool generate
     
     // Fallback to FileSystem (local files)
     if (!data && FileSystem::Instance().ReadFile(resolvedPath, fileData)) {
+        if (bgfx::TextureHandle nativeHandle = TryLoadNativeTextureContainer(
+                fileData.data(),
+                static_cast<uint32_t>(fileData.size()),
+                resolvedPath,
+                colorSpace,
+                maxDimension);
+            bgfx::isValid(nativeHandle)) {
+            return nativeHandle;
+        }
         data = stbi_load_from_memory(fileData.data(), static_cast<int>(fileData.size()), &width, &height, &channels, 4);
     }
     
@@ -438,6 +619,20 @@ bgfx::TextureHandle TextureLoader::Load2D(const std::string& path, bool generate
                     stbi_uc* alt = nullptr;
                     std::vector<uint8_t> altData;
                     if (FileSystem::Instance().ReadFile(candidate, altData)) {
+                        if (bgfx::TextureHandle nativeHandle = TryLoadNativeTextureContainer(
+                                altData.data(),
+                                static_cast<uint32_t>(altData.size()),
+                                candidate,
+                                colorSpace,
+                                maxDimension);
+                            bgfx::isValid(nativeHandle)) {
+                            std::cout << "[TextureLoader] Fallback resolved by filename: '" << fname << "' -> " << candidate << "\n";
+                            {
+                                std::lock_guard<std::mutex> lock(s_pathAliasMutex);
+                                s_pathAliasCache[NormalizePathKey(path)] = candidate;
+                            }
+                            return nativeHandle;
+                        }
                         alt = stbi_load_from_memory(altData.data(), static_cast<int>(altData.size()), &width, &height, &channels, 4);
                     } else {
                         alt = stbi_load(candidate.c_str(), &width, &height, &channels, 4);
@@ -514,6 +709,9 @@ bgfx::TextureHandle TextureLoader::Load2D(const std::string& path, bool generate
     // sRGB textures are automatically converted to linear space by GPU when sampled
     uint64_t flags = ColorSpaceToFlags(colorSpace);
 
+    std::vector<uint8_t> rgba(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
+    std::memcpy(rgba.data(), data, rgba.size());
+    DownscaleRGBA8InPlace(rgba, width, height, maxDimension);
     bgfx::TextureHandle handle = bgfx::createTexture2D(
         static_cast<uint16_t>(width),
         static_cast<uint16_t>(height),
@@ -521,11 +719,7 @@ bgfx::TextureHandle TextureLoader::Load2D(const std::string& path, bool generate
         1,
         bgfx::TextureFormat::RGBA8,
         flags,
-        nullptr            /* no initial data */
-    );
-
-    std::vector<uint8_t> rgba(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
-    std::memcpy(rgba.data(), data, rgba.size());
+        nullptr);
     UploadRGBA8TextureLevels(handle, width, height, rgba, generateMips);
 
     stbi_image_free(data);

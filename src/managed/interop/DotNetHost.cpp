@@ -40,6 +40,7 @@ extern "C" {
 #include "managed/interop/TweenInterop.h"
 #include "managed/interop/NodeGraphInterop.h"
 #include "managed/interop/AnimationEventInterop.h"
+#include "managed/interop/AnimationStateInterop.h"
 #include "managed/interop/ResourceInterop.h"
 #include "managed/interop/DialogueInterop.h"
 #include "managed/interop/QuestInterop.h"
@@ -201,6 +202,7 @@ extern "C" void* Get_Prefab_InstantiateByGuidBlocking_Ptr();
 extern "C" void* Get_Prefab_InstantiateByGuidWithRoot_Ptr();
 extern "C" void* Get_Prefab_GetAsyncStatus_Ptr();
 extern "C" void* Get_Prefab_GetAssetNameByGuid_Ptr();
+extern "C" void* Get_Prefab_PreloadByGuid_Ptr();
 extern "C" void* Get_Mesh_InstantiateByGuid_Ptr();
 extern "C" void* Get_Mesh_InstantiateByGuidWithRoot_Ptr();
 extern "C" void* Get_Mesh_SetByGuid_Ptr();
@@ -1226,12 +1228,13 @@ bool LoadDotnetRuntime(const std::wstring& assemblyPath, const std::wstring& typ
   // Prefab interop bootstrap
   {
       
-      void* args[5];
+      void* args[6];
       args[0] = (void*)Get_Prefab_InstantiateByGuid_Ptr();
       args[1] = (void*)Get_Prefab_InstantiateByGuidBlocking_Ptr();
       args[2] = (void*)Get_Prefab_GetAsyncStatus_Ptr();
       args[3] = (void*)Get_Prefab_GetAssetNameByGuid_Ptr();
       args[4] = (void*)Get_Prefab_InstantiateByGuidWithRoot_Ptr();
+      args[5] = (void*)Get_Prefab_PreloadByGuid_Ptr();
 
       using PrefabInteropInitFn = void(*)(void**, int);
       PrefabInteropInitFn initPrefabFn = nullptr;
@@ -1244,7 +1247,7 @@ bool LoadDotnetRuntime(const std::wstring& assemblyPath, const std::wstring& typ
           (void**)&initPrefabFn
       );
       if (rcPrefab == 0 && initPrefabFn) {
-          initPrefabFn(args, 5);
+          initPrefabFn(args, 6);
       }
   }
 
@@ -1782,6 +1785,29 @@ bool LoadDotnetRuntime(const std::wstring& assemblyPath, const std::wstring& typ
            std::cout << "[Interop] Animation Event interop initialized successfully\n";
        } else {
            std::cerr << "[Interop] Failed to initialize Animation Event interop (hr=0x" << std::hex << rcAnimEvent << ")\n";
+       }
+   }
+
+   // Animation State interop bootstrap (OnStateEntered/OnStateExited callbacks)
+   {
+       void* animStateArgs[1];
+       animStateArgs[0] = (void*)Get_AnimState_SetCallback_Ptr();
+
+       using AnimStateInteropInitFn = void(*)(void**, int);
+       AnimStateInteropInitFn initAnimStateFn = nullptr;
+       int rcAnimState = load_assembly_and_get_function_pointer(
+           fullPath.c_str(),
+           L"ClaymoreEngine.AnimationStateInterop, ClaymoreEngine",
+           L"Initialize",
+           L"ClaymoreEngine.AnimationEventInteropInitDelegate, ClaymoreEngine",
+           nullptr,
+           (void**)&initAnimStateFn
+       );
+       if (rcAnimState == 0 && initAnimStateFn) {
+           initAnimStateFn(animStateArgs, 1);
+           std::cout << "[Interop] Animation State interop initialized successfully\n";
+       } else {
+           std::cerr << "[Interop] Failed to initialize Animation State interop (hr=0x" << std::hex << rcAnimState << ")\n";
        }
    }
    }

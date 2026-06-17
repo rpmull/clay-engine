@@ -76,7 +76,24 @@ public:
 
    EntityData* GetEntityData(EntityID id);
    Entity FindEntityByID(EntityID id);
-   
+
+   // Resolve a bone entity's world matrix from its skeleton's animated pose buffer
+   // (set via EntityData::BoneSkeletonEntity/BoneIndex). Returns false for non-bone
+   // entities or when the animated palette is unavailable, in which case callers
+   // should fall back to EntityData::Transform.WorldMatrix. This lets consumers read
+   // accurate bone world transforms without depending on per-frame generic transform
+   // propagation of the bone subtree.
+   bool TryGetBoneWorldMatrix(EntityID id, glm::mat4& outWorld);
+
+   // Stage 3 foundation: stamp the bone back-reference marker
+   // (EntityData::BoneSkeletonEntity / BoneIndex) on every entity in this
+   // skeleton's BoneEntities array, so bones are uniformly resolvable through the
+   // skeleton pose palette (see TryGetBoneWorldMatrix) regardless of which path
+   // created them (direct instantiate / model loader / prefab clone / deserialize).
+   // Idempotent and safe: a wrong/missing marker only ever falls back to the AoS
+   // transform. Call after a skeleton's BoneEntities are populated or rebound.
+   void RebindSkeletonBoneMarkers(EntityID skeletonRootId);
+
    /// Find entity by its GUID (returns INVALID_ENTITY_ID if not found)
    EntityID FindEntityByGUID(const ClaymoreGUID& guid) const;
    
@@ -219,11 +236,19 @@ public:
     // Returns true if the entity was a model child and was tracked for stable deletion
     bool QueueRemoveModelChild(EntityID id);
 
-    /// Reset all children and deep children of a model root to their model-default transforms
-    /// (from the latest import). Keeps the model root's transform unchanged.
+    /// Reset all children and deep children of a model root to their model-default
+    /// transforms, while preserving scene-added colliders and refreshing them
+    /// against the new child transforms. Keeps the model root's transform unchanged.
     /// Returns true on success. Editor-only; no-op in runtime builds.
     bool ResetModelChildrenToDefault(EntityID modelRootId);
-    
+
+    /// For a model root, resets every model child's materials, material parameters
+    /// and texture overrides back to the model's import settings. The defaults are
+    /// taken from a fresh instantiation of the model's .meta, so per-material import
+    /// overrides are honoured: materials with an override get it, the rest populate
+    /// like a normal (untampered) import. Editor-only; no-op in runtime builds.
+    bool ResetModelChildrenMaterialsToDefault(EntityID modelRootId);
+
     /// For a model root, vertically aligns each direct child subtree onto terrain.
     /// Uses each child subtree's world AABB min Y and samples terrain at AABB center X/Z.
     /// Returns true if at least one child was adjusted. Editor-only; no-op in runtime builds.

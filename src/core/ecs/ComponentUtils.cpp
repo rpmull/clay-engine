@@ -3,20 +3,18 @@
 #include "core/ecs/EntityData.h"
 #include "core/physics/area/AreaComponent.h"
 
-namespace {
-   void ApplyMeshBoundsToBoxCollider(ColliderComponent& collider, const EntityData& entityData) {
-      if (entityData.Mesh && entityData.Mesh->mesh)
-         {
-         const glm::vec3 localMin = entityData.Mesh->mesh->BoundsMin;
-         const glm::vec3 localMax = entityData.Mesh->mesh->BoundsMax;
-         collider.Size = glm::abs(localMax - localMin);
-         collider.Offset = (localMin + localMax) * 0.5f;
-         }
-      else {
-         collider.Size = glm::vec3(1.0f);
-         collider.Offset = glm::vec3(0.0f);
-         }
-   }
+void ApplyMeshBoundsToBoxCollider(ColliderComponent& collider, const EntityData& entityData) {
+   if (entityData.Mesh && entityData.Mesh->mesh)
+      {
+      const glm::vec3 localMin = entityData.Mesh->mesh->BoundsMin;
+      const glm::vec3 localMax = entityData.Mesh->mesh->BoundsMax;
+      collider.Size = glm::abs(localMax - localMin);
+      collider.Offset = (localMin + localMax) * 0.5f;
+      }
+   else {
+      collider.Size = glm::vec3(1.0f);
+      collider.Offset = glm::vec3(0.0f);
+      }
 }
 
 

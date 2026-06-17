@@ -241,6 +241,12 @@ bool ShaderImporter::RunShaderc(const ShaderImporterContext& ctx, const std::str
     std::cout << "[ShaderImporter] shaderc: " << cmd << std::endl;
     int rc = system(cmd.c_str());
     if (rc != 0) { err = "shaderc failed for " + inPath; return false; }
+    std::error_code fileEc;
+    const uintmax_t outSize = fs::file_size(outBin, fileEc);
+    if (fileEc || outSize == 0) {
+        err = "shaderc produced no usable output for " + inPath + " -> " + outBin;
+        return false;
+    }
     return true;
 }
 

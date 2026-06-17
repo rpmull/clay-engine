@@ -11,9 +11,23 @@
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <cctype>
 #include <unordered_set>
 
 namespace fs = std::filesystem;
+
+namespace {
+
+bool ShouldSkipWatchedDirectory(const fs::path& path)
+{
+    std::string name = path.filename().string();
+    std::transform(name.begin(), name.end(), name.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return name == "bin" || name == "obj" || name == ".bin" ||
+           name == ".library" || name == ".git" || name == ".vs";
+}
+
+} // namespace
 
 AssetWatcher::AssetWatcher(AssetPipeline& pipeline, const std::string& rootPath)
     : m_Pipeline(pipeline), m_RootPath(rootPath), m_Running(false) {
@@ -43,6 +57,8 @@ void AssetWatcher::WatchLoop() {
     
     // Track files that existed last iteration for deletion detection
     std::unordered_set<std::string> previousFiles;
+    std::string previousRootPath;
+    bool firstScan = true;
 
     while (m_Running) {
         try {
@@ -52,6 +68,13 @@ void AssetWatcher::WatchLoop() {
             if (rootPathSnapshot.empty() || !fs::exists(rootPathSnapshot)) {
                 std::this_thread::sleep_for(POLL_INTERVAL);
                 continue;
+            }
+            if (rootPathSnapshot != previousRootPath) {
+                previousRootPath = rootPathSnapshot;
+                previousFiles.clear();
+                firstScan = true;
+                std::lock_guard<std::mutex> lock(m_TimestampMutex);
+                m_FileTimestamps.clear();
             }
             
             // Periodically try to discover resources folder if not yet found
@@ -66,7 +89,22 @@ void AssetWatcher::WatchLoop() {
             // Track current files for deletion detection
             std::unordered_set<std::string> currentFiles;
             
-            for (auto& entry : fs::recursive_directory_iterator(rootPathSnapshot)) {
+            std::error_code iterEc;
+            fs::recursive_directory_iterator it(
+                rootPathSnapshot,
+                fs::directory_options::skip_permission_denied,
+                iterEc);
+            fs::recursive_directory_iterator end;
+
+            while (!iterEc && it != end) {
+                const auto entry = *it;
+                if (entry.is_directory(iterEc) && ShouldSkipWatchedDirectory(entry.path())) {
+                    it.disable_recursion_pending();
+                    ++it;
+                    continue;
+                }
+                ++it;
+
                 if (!entry.is_regular_file()) continue;
 
                 std::string filePath = entry.path().string();
@@ -79,7 +117,15 @@ void AssetWatcher::WatchLoop() {
 
                 auto lastWriteTime = fs::last_write_time(entry);
 
-                if (HasFileChanged(filePath, lastWriteTime)) {
+                bool changed = false;
+                if (firstScan) {
+                    std::lock_guard<std::mutex> lock(m_TimestampMutex);
+                    m_FileTimestamps[filePath] = lastWriteTime;
+                } else {
+                    changed = HasFileChanged(filePath, lastWriteTime);
+                }
+
+                if (changed) {
                     m_Pipeline.EnqueueAssetImport(filePath);
                     
                     // Invalidate binary cache for this asset so it gets rebuilt
@@ -119,17 +165,32 @@ void AssetWatcher::WatchLoop() {
                             size_t pos = vpath.find("assets/");
                             if (pos != std::string::npos) vpath = vpath.substr(pos);
                             // Infer AssetType from extension
-                            std::string lowerExt = ext; std::transform(lowerExt.begin(), lowerExt.end(), lowerExt.begin(), ::tolower);
-                            AssetType at = AssetType::Mesh;
+                            std::string lowerExt = ext;
+                            std::transform(lowerExt.begin(), lowerExt.end(), lowerExt.begin(),
+                                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                            AssetType at = AssetType::Unknown;
                             if (lowerExt == ".fbx" || lowerExt == ".gltf" || lowerExt == ".glb" || lowerExt == ".obj") at = AssetType::Mesh;
                             else if (lowerExt == ".png" || lowerExt == ".jpg" || lowerExt == ".jpeg" || lowerExt == ".tga") at = AssetType::Texture;
-                            else if (lowerExt == ".prefab" || (lowerExt == ".json" && vpath.find("/assets/prefabs/") != std::string::npos)) at = AssetType::Prefab;
+                            else if (lowerExt == ".sc" || lowerExt == ".glsl" || lowerExt == ".shader") at = AssetType::Shader;
+                            else if (lowerExt == ".mat") at = AssetType::Material;
+                            else if (lowerExt == ".prefab" || (lowerExt == ".json" && vpath.find("assets/prefabs/") != std::string::npos)) at = AssetType::Prefab;
+                            else if (lowerExt == ".anim") at = AssetType::Animation;
+                            else if (lowerExt == ".animctrl" || lowerExt == ".controller") at = AssetType::AnimatorController;
                             else if (lowerExt == ".ngraph") at = AssetType::NodeGraph;
+                            else if (lowerExt == ".navbin") at = AssetType::NavMesh;
                             else if (lowerExt == ".ttf" || lowerExt == ".otf") at = AssetType::Font;
+                            else if (lowerExt == ".wav" || lowerExt == ".mp3" || lowerExt == ".ogg" || lowerExt == ".flac") at = AssetType::Audio;
+                            else if (lowerExt == ".asset" || lowerExt == ".clayobj" || lowerExt == ".dlglib") at = AssetType::Scriptable;
                             else if (lowerExt == ".cs") at = AssetType::Script;
-                            // Register mapping and alias (RegisterAsset now dedupes silently)
-                            AssetLibrary::Instance().RegisterAsset(AssetReference(meta.guid, 0, static_cast<int32_t>(at)), at, vpath, entry.path().filename().string());
-                            AssetLibrary::Instance().RegisterPathAlias(meta.guid, filePath);
+                            if (at != AssetType::Unknown) {
+                                AssetReference ref = meta.reference.IsValid()
+                                    ? meta.reference
+                                    : AssetReference(meta.guid, 0, static_cast<int32_t>(at));
+                                if (ref.type == 0) ref.type = static_cast<int32_t>(at);
+                                // Register mapping and alias (RegisterAsset now dedupes silently)
+                                AssetLibrary::Instance().RegisterAsset(ref, at, vpath, entry.path().filename().string());
+                                AssetLibrary::Instance().RegisterPathAlias(meta.guid, filePath);
+                            }
                         }
                     }
                 } catch(...) { /* silent; watcher continues */ }
@@ -154,6 +215,7 @@ void AssetWatcher::WatchLoop() {
             
             // Update previous files for next iteration
             previousFiles = std::move(currentFiles);
+            firstScan = false;
         }
         catch (const std::exception& e) {
             std::cerr << "[AssetWatcher] Error: " << e.what() << std::endl;

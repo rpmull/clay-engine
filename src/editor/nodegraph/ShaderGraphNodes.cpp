@@ -1,8 +1,72 @@
 #include "ShaderGraphNodes.h"
 #include "ShaderGraphCodeGen.h"
 #include <sstream>
+#include <algorithm>
+#include <cstdlib>
+#include <cmath>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace shadergraph {
+
+// ---------------------------------------------------------------------------
+// Shared helpers for Color Ramp parsing / GLSL emission.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct ColorStop {
+    float pos = 0.0f;
+    glm::vec4 color = glm::vec4(1.0f);
+};
+
+// Format a float as a GLSL float literal that always carries a decimal point.
+inline std::string GlslFloat(float v) {
+    std::ostringstream ss;
+    ss.precision(6);
+    ss << std::fixed << v;
+    return ss.str();
+}
+
+inline std::string GlslVec4(const glm::vec4& c) {
+    return "vec4(" + GlslFloat(c.x) + ", " + GlslFloat(c.y) + ", " +
+           GlslFloat(c.z) + ", " + GlslFloat(c.w) + ")";
+}
+
+// Parse the "stops" property string: "pos:r,g,b,a;pos:r,g,b,a;..." (sorted).
+inline std::vector<ColorStop> ParseColorStops(const std::string& s) {
+    std::vector<ColorStop> stops;
+    std::stringstream ss(s);
+    std::string item;
+    while (std::getline(ss, item, ';')) {
+        if (item.empty()) continue;
+        size_t colon = item.find(':');
+        if (colon == std::string::npos) continue;
+        ColorStop stop;
+        stop.pos = static_cast<float>(std::atof(item.substr(0, colon).c_str()));
+        std::stringstream cs(item.substr(colon + 1));
+        std::string comp;
+        int ci = 0;
+        glm::vec4 c(0.0f, 0.0f, 0.0f, 1.0f);
+        while (std::getline(cs, comp, ',') && ci < 4) {
+            c[ci++] = static_cast<float>(std::atof(comp.c_str()));
+        }
+        stop.color = c;
+        stops.push_back(stop);
+    }
+    std::sort(stops.begin(), stops.end(),
+              [](const ColorStop& a, const ColorStop& b) { return a.pos < b.pos; });
+    return stops;
+}
+
+inline int HueModeToInt(const std::string& m) {
+    if (m == "Far") return 1;
+    if (m == "CW") return 2;
+    if (m == "CCW") return 3;
+    return 0;  // Near
+}
+
+} // namespace
 
 NodeRegistry& NodeRegistry::Instance() {
     static NodeRegistry instance;
@@ -964,6 +1028,160 @@ void RegisterSampleTexture2DNode(NodeRegistry& reg) {
     reg.Register(def);
 }
 
+// --- Utility / Color Nodes ---
+
+void RegisterFresnelNode(NodeRegistry& reg) {
+    NodeDefinition def;
+    def.typeId = {"Input", "Fresnel"};
+    def.displayName = "Fresnel";
+    def.category = NodeCategory::Input;
+    def.description = "View-angle (facing) factor, like Blender's Layer Weight";
+    def.inputs = {
+        {"Power", ShaderValueType::Float, glm::vec4(5.0f, 0.0f, 0.0f, 0.0f)}
+    };
+    def.outputs = {
+        {"Fac", ShaderValueType::Float},
+        {"Facing", ShaderValueType::Float}
+    };
+    def.codeGen = [](ShaderGraphCodeGen& gen, const ShaderNode& node) -> bool {
+        gen.RequireVarying("v_normal");
+        gen.RequireVarying("v_viewDir");
+        std::string power = gen.GetInputExpression(node, "Power");
+        std::string nV = gen.MakeVarName(node.id, "fresN");
+        std::string vV = gen.MakeVarName(node.id, "fresV");
+        std::string facing = gen.MakeVarName(node.id, "facing");
+        std::string fac = gen.MakeVarName(node.id, "fresnel");
+        gen.EmitLine("vec3 " + nV + " = normalize(v_normal);");
+        gen.EmitLine("vec3 " + vV + " = normalize(v_viewDir);");
+        gen.EmitLine("float " + facing + " = 1.0 - clamp(dot(" + nV + ", " + vV + "), 0.0, 1.0);");
+        gen.EmitLine("float " + fac + " = pow(" + facing + ", max(" + power + ", 0.0001));");
+        gen.SetOutputExpression(node, "Fac", fac);
+        gen.SetOutputExpression(node, "Facing", facing);
+        return true;
+    };
+    reg.Register(def);
+}
+
+void RegisterColorRampNode(NodeRegistry& reg) {
+    NodeDefinition def;
+    def.typeId = {"Utility", "ColorRamp"};
+    def.displayName = "Color Ramp";
+    def.category = NodeCategory::Utility;
+    def.description = "Map a 0..1 factor through a gradient of color stops";
+    def.inputs = {
+        {"Fac", ShaderValueType::Float, glm::vec4(0.5f, 0.0f, 0.0f, 0.0f)}
+    };
+    def.outputs = {
+        {"Color", ShaderValueType::Color4},
+        {"Alpha", ShaderValueType::Float}
+    };
+    def.properties = {
+        {"stops", "Stops", "0:0,0,0,1;1:1,1,1,1", {}},
+        {"interpolation", "Interpolation", "Linear", {"Linear", "Ease", "Constant"}},
+        {"color_mode", "Color Mode", "RGB", {"RGB", "HSV"}},
+        {"hue_mode", "Hue Path", "Near", {"Near", "Far", "CW", "CCW"}}
+    };
+    def.codeGen = [](ShaderGraphCodeGen& gen, const ShaderNode& node) -> bool {
+        std::string fac = gen.GetInputExpression(node, "Fac");
+        const std::string interp = node.GetProperty("interpolation", "Linear");
+        const std::string colorMode = node.GetProperty("color_mode", "RGB");
+        const int hueMode = HueModeToInt(node.GetProperty("hue_mode", "Near"));
+        const bool hsv = (colorMode == "HSV");
+        if (hsv) {
+            gen.RequireInclude("lib_shadergraph.sh");
+        }
+
+        std::vector<ColorStop> stops = ParseColorStops(node.GetProperty("stops", "0:0,0,0,1;1:1,1,1,1"));
+
+        std::string facVar = gen.MakeVarName(node.id, "fac");
+        std::string rampVar = gen.MakeVarName(node.id, "ramp");
+        gen.EmitLine("float " + facVar + " = clamp(" + fac + ", 0.0, 1.0);");
+
+        if (stops.empty()) {
+            gen.EmitLine("vec4 " + rampVar + " = vec4(" + facVar + ", " + facVar + ", " + facVar + ", 1.0);");
+        } else {
+            // Start at the first stop, then progressively blend toward each
+            // subsequent stop. Because each segment factor is exactly 0 below
+            // its range and exactly 1 above it, only one segment is ever
+            // partially active, so this reproduces a piecewise gradient (and
+            // keeps HSV blends correct: the accumulator equals the left stop
+            // exactly when its segment becomes active).
+            gen.EmitLine("vec4 " + rampVar + " = " + GlslVec4(stops.front().color) + ";");
+            for (size_t i = 0; i + 1 < stops.size(); ++i) {
+                const ColorStop& a = stops[i];
+                const ColorStop& b = stops[i + 1];
+                const std::string lo = GlslFloat(a.pos);
+                const std::string hi = GlslFloat(b.pos);
+                const std::string denom = GlslFloat(std::max(b.pos - a.pos, 1.0e-5f));
+                std::string factor;
+                if (interp == "Constant") {
+                    factor = "step(" + hi + ", " + facVar + ")";
+                } else if (interp == "Ease") {
+                    factor = "smoothstep(" + lo + ", " + hi + ", " + facVar + ")";
+                } else {
+                    factor = "clamp((" + facVar + " - " + lo + ") / " + denom + ", 0.0, 1.0)";
+                }
+                std::string fVar = gen.MakeVarName(node.id, "t" + std::to_string(i));
+                gen.EmitLine("float " + fVar + " = " + factor + ";");
+                if (hsv) {
+                    gen.EmitLine(rampVar + " = vec4(sg_mixHSV(" + rampVar + ".rgb, " +
+                                 GlslVec4(b.color) + ".rgb, " + fVar + ", " + std::to_string(hueMode) +
+                                 "), mix(" + rampVar + ".a, " + GlslFloat(b.color.w) + ", " + fVar + "));");
+                } else {
+                    gen.EmitLine(rampVar + " = mix(" + rampVar + ", " + GlslVec4(b.color) + ", " + fVar + ");");
+                }
+            }
+        }
+
+        gen.SetOutputExpression(node, "Color", rampVar);
+        gen.SetOutputExpression(node, "Alpha", rampVar + ".a");
+        return true;
+    };
+    reg.Register(def);
+}
+
+void RegisterHueSaturationValueNode(NodeRegistry& reg) {
+    NodeDefinition def;
+    def.typeId = {"Utility", "HueSaturationValue"};
+    def.displayName = "Hue Saturation Value";
+    def.category = NodeCategory::Utility;
+    def.description = "Shift hue, scale saturation and value of a color";
+    def.inputs = {
+        {"Hue", ShaderValueType::Float, glm::vec4(0.5f, 0.0f, 0.0f, 0.0f)},
+        {"Saturation", ShaderValueType::Float, glm::vec4(1.0f, 0.0f, 0.0f, 0.0f)},
+        {"Value", ShaderValueType::Float, glm::vec4(1.0f, 0.0f, 0.0f, 0.0f)},
+        {"Fac", ShaderValueType::Float, glm::vec4(1.0f, 0.0f, 0.0f, 0.0f)},
+        {"Color", ShaderValueType::Color4, glm::vec4(1.0f)}
+    };
+    def.outputs = {
+        {"Color", ShaderValueType::Color4}
+    };
+    def.codeGen = [](ShaderGraphCodeGen& gen, const ShaderNode& node) -> bool {
+        gen.RequireInclude("lib_shadergraph.sh");
+        std::string hue = gen.GetInputExpression(node, "Hue");
+        std::string sat = gen.GetInputExpression(node, "Saturation");
+        std::string val = gen.GetInputExpression(node, "Value");
+        std::string fac = gen.GetInputExpression(node, "Fac");
+        std::string color = gen.GetInputExpression(node, "Color");
+
+        std::string base = gen.MakeVarName(node.id, "hsvIn");
+        std::string hsv = gen.MakeVarName(node.id, "hsv");
+        std::string rgb = gen.MakeVarName(node.id, "hsvRgb");
+        std::string outv = gen.MakeVarName(node.id, "hsvOut");
+        gen.EmitLine("vec4 " + base + " = " + color + ";");
+        gen.EmitLine("vec3 " + hsv + " = sg_rgb2hsv(" + base + ".rgb);");
+        gen.EmitLine(hsv + ".x = fract(" + hsv + ".x + (" + hue + " - 0.5));");
+        gen.EmitLine(hsv + ".y = clamp(" + hsv + ".y * " + sat + ", 0.0, 1.0);");
+        gen.EmitLine(hsv + ".z = " + hsv + ".z * " + val + ";");
+        gen.EmitLine("vec3 " + rgb + " = sg_hsv2rgb(" + hsv + ");");
+        gen.EmitLine("vec4 " + outv + " = vec4(mix(" + base + ".rgb, " + rgb +
+                     ", clamp(" + fac + ", 0.0, 1.0)), " + base + ".a);");
+        gen.SetOutputExpression(node, "Color", outv);
+        return true;
+    };
+    reg.Register(def);
+}
+
 // --- Output/Master Nodes ---
 
 void RegisterUnlitMasterNode(NodeRegistry& reg) {
@@ -1169,7 +1387,12 @@ void RegisterAllBuiltins(NodeRegistry& reg) {
     
     // Texture nodes
     RegisterSampleTexture2DNode(reg);
-    
+
+    // Utility / color nodes
+    RegisterFresnelNode(reg);
+    RegisterColorRampNode(reg);
+    RegisterHueSaturationValueNode(reg);
+
     // Output nodes
     RegisterUnlitMasterNode(reg);
     RegisterPBRMasterNode(reg);

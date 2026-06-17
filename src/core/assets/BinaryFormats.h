@@ -16,7 +16,7 @@ constexpr uint32_t PREFAB_MAGIC = 'P' | ('R' << 8) | ('F' << 16) | ('B' << 24); 
 constexpr uint32_t ANIM_CTRL_MAGIC = 'A' | ('C' << 8) | ('T' << 16) | ('B' << 24); // 'ACTB'
 
 // Current format versions
-constexpr uint32_t SCENE_VERSION = 30;  // v30 persists tint-mask inline PBR state
+constexpr uint32_t SCENE_VERSION = 33;  // v33 persists skybox source configuration in environment payloads
 constexpr uint32_t MATERIAL_VERSION = 1;
 constexpr uint32_t PREFAB_VERSION = 30;  // v30 persists tint-mask inline PBR state
 constexpr uint32_t ANIM_CTRL_VERSION = 1;

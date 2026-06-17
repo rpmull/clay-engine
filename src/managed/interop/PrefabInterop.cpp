@@ -43,6 +43,14 @@ static int Prefab_GetAsyncStatus(int entityId)
     return static_cast<int>(status);
 }
 
+static int Prefab_PreloadByGuid(unsigned long long hi, unsigned long long lo)
+{
+    ClaymoreGUID g{};
+    g.high = hi;
+    g.low = lo;
+    return runtime::RuntimePrefabInstantiator::PreloadByGuid(g) ? 1 : 0;
+}
+
 static const char* Prefab_GetAssetNameByGuid(unsigned long long hi, unsigned long long lo)
 {
     ClaymoreGUID guid{};
@@ -121,5 +129,8 @@ extern "C" void* Get_Prefab_GetAssetNameByGuid_Ptr()
     return (void*)&Prefab_GetAssetNameByGuid;
 }
 
-
+extern "C" void* Get_Prefab_PreloadByGuid_Ptr()
+{
+    return (void*)&Prefab_PreloadByGuid;
+}
 

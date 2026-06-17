@@ -948,6 +948,9 @@ size_t WriteComponentBinary(ComponentWriteContext& ctx, const EntityData* data, 
             ctx.Write(type);
             ctx.Write(color, 12);
             ctx.Write(l.Intensity);
+            ctx.Write(l.Range);
+            ctx.Write(l.SpotInnerAngleDegrees);
+            ctx.Write(l.SpotOuterAngleDegrees);
             ctx.Write(static_cast<uint8_t>(l.PointShadowsEnabled ? 1 : 0));
             break;
         }
@@ -1199,9 +1202,10 @@ size_t WriteComponentBinary(ComponentWriteContext& ctx, const EntityData* data, 
             ctx.Write(cc.EnableWalkStairs ? uint8_t(1) : uint8_t(0));
             uint32_t layerNameIdx = ctx.AddString(cc.PhysicsLayerName);
             ctx.Write(layerNameIdx);
+            ctx.Write(cc.CollisionMask);
             break;
         }
-        
+
         case ComponentTypeId::Terrain: {
             const auto& t = *data->Terrain;
             uint32_t assetPathIdx = ctx.AddString(t.AssetPath);

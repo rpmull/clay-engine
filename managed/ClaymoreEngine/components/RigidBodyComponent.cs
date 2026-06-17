@@ -142,6 +142,18 @@ namespace ClaymoreEngine
             return LayerMask.Includes(CollisionMask, layerName);
         }
 
+        /// <summary>
+        /// Sets the physics layer this body belongs to (the layer it is filtered by
+        /// in raycasts, spherecasts and contacts). Keeps the collider and body layer
+        /// in sync. The layer must already be registered (see PhysicsLayer.Register).
+        /// </summary>
+        /// <param name="layerName">The registered physics layer name, e.g. "Ignore".</param>
+        /// <returns>True if the layer was found and applied.</returns>
+        public bool SetPhysicsLayer(string layerName)
+        {
+            return ComponentInterop.SetRigidBodyPhysicsLayer(entity.EntityID, layerName);
+        }
+
         public Vector3 LinearVelocity
         {
             get

@@ -53,6 +53,30 @@ namespace ClaymoreEngine
          return GetComponent<T>(entity);
       }
 
+      public static T AddScript<T>(this Entity entity) where T : ScriptComponent
+      {
+         T existing = ScriptRegistry.Get<T>(entity.EntityID);
+         if (existing != null)
+         {
+            return existing;
+         }
+
+         string scriptName = typeof(T).FullName ?? typeof(T).Name;
+         if (string.IsNullOrEmpty(scriptName))
+         {
+            Console.WriteLine("[EntityExtensions] Script type name is null/empty.");
+            return null;
+         }
+
+         ComponentInterop.AddScript?.Invoke(entity.EntityID, scriptName);
+         T script = ScriptRegistry.Get<T>(entity.EntityID);
+         if (script == null)
+         {
+            Console.WriteLine($"[EntityExtensions] Failed to add script '{scriptName}' to entity {entity.EntityID}.");
+         }
+         return script;
+      }
+
       public static T GetComponent<T>(this Entity entity) where T : ComponentBase, new()
       {
          var key = (entity.EntityID, typeof(T));

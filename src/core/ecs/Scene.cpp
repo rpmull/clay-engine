@@ -22,6 +22,7 @@
 #include "core/ecs/SkinningSystem.h"
 #include "core/ecs/SoftbodySystem.h"
 #include "core/ecs/InstancerSystem.h"
+#include "core/ecs/ComponentUtils.h"
 #include "core/world/PortalSystem.h"
 #include "core/world/RuntimeWorld.h"
 #include "core/utils/DebugModelDump.h"
@@ -127,8 +128,11 @@ namespace {
 
    class CharacterControllerBodyFilter final : public JPH::BodyFilter {
    public:
-      CharacterControllerBodyFilter(JPH::PhysicsSystem* system, JPH::ObjectLayer characterLayer)
-         : m_System(system), m_CharacterLayer(characterLayer) {}
+      CharacterControllerBodyFilter(JPH::PhysicsSystem* system, JPH::ObjectLayer characterLayer,
+                                    uint32_t characterCollisionMask = 0xFFFFFFFFu)
+         : m_System(system)
+         , m_CharacterLayer(characterLayer)
+         , m_CharacterCollisionMask(characterCollisionMask) {}
 
       bool ShouldCollide(const JPH::BodyID& inBodyID) const override {
          if (!m_System) {
@@ -140,12 +144,18 @@ namespace {
       }
 
       bool ShouldCollideLocked(const JPH::Body& inBody) const override {
+         // The character only collides with bodies whose object layer is enabled in its
+         // own collision mask (symmetric with how a rigidbody's mask gates the character).
+         if (!CollisionMaskIncludesLayer(m_CharacterCollisionMask, inBody.GetObjectLayer())) {
+            return false;
+         }
          return PhysicsBodyAllowsCharacterLayer(inBody, m_CharacterLayer);
       }
 
    private:
       JPH::PhysicsSystem* m_System = nullptr;
       JPH::ObjectLayer m_CharacterLayer = 0;
+      uint32_t m_CharacterCollisionMask = 0xFFFFFFFFu;
    };
 
    void ApplyPendingRigidBodyCommands(RigidBodyComponent& rigidBody) {
@@ -1129,9 +1139,21 @@ static PreparedModelInstance BuildInstanceFromMeta(const nlohmann::json& meta,
             for (const auto& matJson : entry["materials"])
             {
                MaterialSource matSource = material_serialization::FromJson(matJson);
-               
-               // Apply material preset overrides if defined
-               const MeshMaterialPreset* preset = importSettings.FindPreset(meshInst.Name, materialSlot);
+
+               // Resolve the slot's material name (prefer slotNames, fall back to the
+               // material's own "name") so shared, name-keyed overrides can match.
+               std::string slotMatName;
+               if (entry.contains("slotNames") && entry["slotNames"].is_array() &&
+                   materialSlot < static_cast<int>(entry["slotNames"].size()) &&
+                   entry["slotNames"][materialSlot].is_string())
+               {
+                  slotMatName = entry["slotNames"][materialSlot].get<std::string>();
+               }
+               if (slotMatName.empty())
+                  slotMatName = matJson.value("name", std::string());
+
+               // Apply material preset overrides if defined (per-mesh first, then shared-by-name)
+               const MeshMaterialPreset* preset = importSettings.ResolvePreset(meshInst.Name, materialSlot, slotMatName);
                if (preset)
                {
                   if (preset->UseCustomMaterial && !preset->MaterialAssetPath.empty())
@@ -1365,12 +1387,28 @@ static SkeletonBuildResult BuildSkeletonEntities(Scene& scene,
 
    MarkSkeletonForDumpDebug(skeletonComp, instance);
 
-   // Create bone entities
+   // Create bone entities.
+   // PERF: bones are internal child entities looked up by index, never by a
+   // root-unique name, so the O(N) MakeUniqueName scan + per-entity dirty/
+   // hierarchy invalidation that CreateEntity performs is pure churn here.
+   // Spawning one ~100-bone skeleton through CreateEntity is O(bones x sceneEntities)
+   // and dominates spawn cost as the scene grows. Use the batched fast path and
+   // invalidate once after the loop instead of per bone.
    for (size_t i = 0; i < preparedSkeleton.BoneNames.size(); ++i)
    {
-      Entity boneEnt = scene.CreateEntity(preparedSkeleton.BoneNames[i]);
+      Entity boneEnt = scene.CreateEntityExactFast(preparedSkeleton.BoneNames[i]);
       skeletonComp.BoneEntities[i] = boneEnt.GetID();
+      // Back-reference: tag this entity as bone `i` of skeleton `skeletonRootID`
+      // so consumers can resolve its world matrix from the animated pose buffer.
+      if (auto* boneRefData = scene.GetEntityData(boneEnt.GetID()))
+      {
+         boneRefData->BoneSkeletonEntity = skeletonRootID;
+         boneRefData->BoneIndex = static_cast<int>(i);
+      }
    }
+   // Batched equivalent of the per-entity bookkeeping CreateEntity would have done.
+   scene.MarkDirty();
+   scene.InvalidateHierarchyCache();
 
    for (size_t i = 0; i < skeletonComp.BoneEntities.size(); ++i)
    {
@@ -2603,8 +2641,13 @@ bool Scene::HasPendingTransformUpdates() const {
 }
 
 void Scene::SyncCameraComponentsFromTransforms() {
-   const float rw = static_cast<float>(Renderer::Get().GetWidth());
-   float rh = static_cast<float>(Renderer::Get().GetHeight());
+   const Environment& env = GetEnvironment();
+   const float rw = env.HasFixedRenderResolution()
+      ? static_cast<float>(env.RenderResolutionWidth)
+      : static_cast<float>(Renderer::Get().GetWidth());
+   float rh = env.HasFixedRenderResolution()
+      ? static_cast<float>(env.RenderResolutionHeight)
+      : static_cast<float>(Renderer::Get().GetHeight());
    if (rh <= 0.0f) {
       rh = 1.0f;
    }
@@ -3148,8 +3191,10 @@ bool Scene::QueueRemoveModelChild(EntityID id) {
 
 #if !defined(CLAYMORE_RUNTIME)
 ///-----------------------------------------------------------------------------------------
-/// ResetModelChildrenToDefault: Reset all children of a model root to model-default transforms.
-/// Keeps the model root's transform unchanged. Uses latest import from cache.
+/// ResetModelChildrenToDefault: Reset all children of a model root to model-default
+/// transforms while preserving scene-added colliders and refreshing them against
+/// the new transforms. Keeps the model root's transform unchanged.
+/// Uses latest import from cache.
 ///-----------------------------------------------------------------------------------------
 bool Scene::ResetModelChildrenToDefault(EntityID modelRootId) {
     auto* rootData = GetEntityData(modelRootId);
@@ -3209,14 +3254,46 @@ bool Scene::ResetModelChildrenToDefault(EntityID modelRootId) {
         return false;
     }
 
-    // Build path -> default transform map from the fresh instance (children only, not root)
-    std::unordered_map<std::string, TransformComponent> pathToDefault;
+    struct ModelChildDefaultState {
+        TransformComponent Transform;
+        bool HasCollider = false;
+        ColliderComponent Collider;
+    };
+
+    auto copyColliderAuthoring = [](const ColliderComponent& src, ColliderComponent& dst) {
+        dst.ShapeType = src.ShapeType;
+        dst.Offset = src.Offset;
+        dst.Size = src.Size;
+        dst.Radius = src.Radius;
+        dst.Height = src.Height;
+        dst.MeshPath = src.MeshPath;
+        dst.IsTrigger = src.IsTrigger;
+        dst.PhysicsLayer = src.PhysicsLayer;
+        dst.PhysicsLayerName = src.PhysicsLayerName;
+        dst.Shape = nullptr;
+        dst._RuntimeOwnedByRigidBody = false;
+        dst._LastShapeType = ColliderShape::Box;
+        dst._LastSize = glm::vec3(-1.0f);
+        dst._LastRadius = -1.0f;
+        dst._LastHeight = -1.0f;
+        dst._LastOffset = glm::vec3(-9999.0f);
+        dst._LastWorldScale = glm::vec3(-1.0f);
+    };
+
+    // Build path -> default child state map from the fresh instance (children only, not root)
+    std::unordered_map<std::string, ModelChildDefaultState> pathToDefault;
     std::function<void(EntityID, const std::string&)> collectDefaults = [&](EntityID id, const std::string& parentPath) {
         auto* d = GetEntityData(id);
         if (!d) return;
         std::string path = parentPath.empty() ? d->Name : (parentPath + "/" + d->Name);
-        pathToDefault[path] = d->Transform;
-        pathToDefault[ModelNodeIdentity::NormalizePath(path)] = d->Transform;
+        ModelChildDefaultState state;
+        state.Transform = d->Transform;
+        if (d->Collider) {
+            state.HasCollider = true;
+            copyColliderAuthoring(*d->Collider, state.Collider);
+        }
+        pathToDefault[path] = state;
+        pathToDefault[ModelNodeIdentity::NormalizePath(path)] = state;
         for (EntityID c : d->Children) collectDefaults(c, path);
     };
     for (EntityID c : GetEntityData(tempRoot)->Children) {
@@ -3248,8 +3325,10 @@ bool Scene::ResetModelChildrenToDefault(EntityID modelRootId) {
         return s;
     };
 
-    // Apply default transforms to all children (skip nested model roots)
-    int applied = 0;
+    // Apply default transforms and refresh colliders on all children (skip nested model roots)
+    int transformApplied = 0;
+    int colliderApplied = 0;
+    std::vector<EntityID> colliderRefreshIds;
     std::function<void(EntityID)> applyToChildren = [&](EntityID id) {
         auto* d = GetEntityData(id);
         if (!d) return;
@@ -3269,18 +3348,268 @@ bool Scene::ResetModelChildrenToDefault(EntityID modelRootId) {
                 it = pathToDefault.find(ModelNodeIdentity::NormalizePath(path));
             }
             if (it != pathToDefault.end()) {
-                cd->Transform = it->second;
+                cd->Transform = it->second.Transform;
                 MarkTransformDirty(c);
-                applied++;
+                ++transformApplied;
+
+                bool colliderChanged = false;
+                if (it->second.HasCollider) {
+                    if (!cd->Collider) {
+                        cd->Collider = std::make_unique<ColliderComponent>();
+                    }
+                    copyColliderAuthoring(it->second.Collider, *cd->Collider);
+                    colliderChanged = true;
+                } else {
+                    if (!cd->Collider) {
+                        if (cd->RigidBody) {
+                            EnsureCollider(cd->RigidBody.get(), cd);
+                            colliderChanged = true;
+                        } else if (cd->StaticBody) {
+                            EnsureCollider(cd->StaticBody.get(), cd);
+                            colliderChanged = true;
+                        }
+                    }
+
+                    // Preserve scene-added box colliders, but re-fit them to the current mesh
+                    // bounds so reset fixes import-scale changes instead of keeping stale sizes.
+                    if (cd->Collider && cd->Collider->ShapeType == ColliderShape::Box) {
+                        ApplyMeshBoundsToBoxCollider(*cd->Collider, *cd);
+                        colliderChanged = true;
+                    }
+                }
+
+                if (cd->Collider) {
+                    colliderRefreshIds.push_back(c);
+                }
+                if (colliderChanged) {
+                    ++colliderApplied;
+                }
             }
             applyToChildren(c);
         }
     };
     applyToChildren(modelRootId);
 
-    MarkDirty();
-    std::cout << "[Scene] Reset " << applied << " model child transform(s) to default" << std::endl;
-    return true;
+    if (!colliderRefreshIds.empty()) {
+        UpdateTransforms();
+
+        if (m_IsPlaying) {
+            for (EntityID entityId : colliderRefreshIds) {
+                DestroyPhysicsBody(entityId);
+
+                auto* data = GetEntityData(entityId);
+                if (!data || !data->Collider || data->CharacterController) {
+                    continue;
+                }
+
+                glm::vec3 wscale(1.0f);
+                glm::vec3 wpos, wskew;
+                glm::vec4 wpersp;
+                glm::quat wrot;
+                glm::decompose(data->Transform.WorldMatrix, wscale, wrot, wpos, wskew, wpersp);
+                data->Collider->BuildShape(
+                    data->Mesh && data->Mesh->mesh ? data->Mesh->mesh.get() : nullptr,
+                    glm::abs(wscale));
+                if (data->Collider->Shape) {
+                    CreatePhysicsBody(entityId, data->Transform, *data->Collider);
+                }
+            }
+        }
+    }
+
+    if (transformApplied > 0 || colliderApplied > 0) {
+        MarkDirty();
+    }
+    std::cout << "[Scene] Reset " << transformApplied
+              << " model child transform(s) and " << colliderApplied
+              << " collider reset/refit(s)" << std::endl;
+    return transformApplied > 0 || colliderApplied > 0;
+}
+
+/// ResetModelChildrenMaterialsToDefault: Reset all children of a model root to the
+/// material/parameter/texture state defined by the model's import settings. The
+/// authoritative defaults are taken from a fresh instantiation of the model .meta,
+/// which already applies per-material import overrides -- so overridden materials
+/// get their override while the rest populate like a normal import.
+bool Scene::ResetModelChildrenMaterialsToDefault(EntityID modelRootId) {
+    auto* rootData = GetEntityData(modelRootId);
+    if (!rootData) return false;
+    if (rootData->ModelAssetGuid.high == 0 && rootData->ModelAssetGuid.low == 0) return false;
+
+    std::string modelPath = AssetLibrary::Instance().GetPathForGUID(rootData->ModelAssetGuid);
+    if (modelPath.empty()) {
+        std::cerr << "[Scene] ResetModelChildrenMaterialsToDefault: No path for model GUID" << std::endl;
+        return false;
+    }
+
+    // Resolve to absolute and handle .meta path (GetPathForGUID often returns .meta)
+    auto resolveToAbsolute = [](const std::string& path) -> std::string {
+        if (path.empty()) return {};
+        std::filesystem::path p(path);
+        if (p.is_absolute()) return p.string();
+        try {
+            std::filesystem::path base = Project::GetProjectDirectory();
+            if (!base.empty()) return (base / p).string();
+        } catch (...) {}
+        return p.string();
+    };
+
+    std::string cacheKey = modelPath;
+    std::string ext;
+    {
+        std::filesystem::path p(modelPath);
+        ext = p.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    }
+    if (ext == ".meta") {
+        std::string metaContent;
+        if (FileSystem::Instance().ReadTextFile(modelPath, metaContent)) {
+            try {
+                json meta = json::parse(metaContent);
+                std::string source = meta.value("source", std::string());
+                if (!source.empty()) cacheKey = resolveToAbsolute(source);
+            } catch (...) {}
+        }
+        if (cacheKey == modelPath) cacheKey = resolveToAbsolute(modelPath);
+    } else {
+        cacheKey = resolveToAbsolute(modelPath);
+    }
+
+    BuiltModelPaths built{};
+    if (!HasModelCache(cacheKey, built)) {
+        std::cerr << "[Scene] ResetModelChildrenMaterialsToDefault: No cache for " << modelPath << std::endl;
+        return false;
+    }
+
+    // Instantiate a fresh model. Its material state is exactly the import result,
+    // including any per-material import overrides.
+    EntityID tempRoot = InstantiateModelFast(built.metaPath, glm::vec3(0.0f), true);
+    if (tempRoot == INVALID_ENTITY_ID || tempRoot == (EntityID)0) {
+        std::cerr << "[Scene] ResetModelChildrenMaterialsToDefault: Failed to instantiate model" << std::endl;
+        return false;
+    }
+
+    struct ModelChildMaterialState {
+        bool HasMesh = false;
+        std::shared_ptr<Material> material;
+        std::vector<std::shared_ptr<Material>> materials;
+        std::vector<std::string> MaterialSlotNames;
+        std::vector<std::string> MaterialAssetPaths;
+        std::vector<bool> OwnedMaterialSlots;
+        std::vector<binary::InlineMaterialData> InlineMaterials;
+        std::vector<binary::ShaderGraphMaterialData> ShaderGraphMaterials;
+        std::vector<MaterialPropertyBlock> SlotPropertyBlocks;
+        std::vector<MaterialSource> MaterialSources;
+        MaterialPropertyBlock PropertyBlock;
+        std::unordered_map<std::string, std::string> PropertyBlockTexturePaths;
+        std::vector<std::unordered_map<std::string, std::string>> SlotPropertyBlockTexturePaths;
+    };
+
+    auto snapshotMaterials = [](const MeshComponent& src, ModelChildMaterialState& dst) {
+        dst.HasMesh = true;
+        dst.material = src.material;
+        dst.materials = src.materials;
+        dst.MaterialSlotNames = src.MaterialSlotNames;
+        dst.MaterialAssetPaths = src.MaterialAssetPaths;
+        dst.OwnedMaterialSlots = src.OwnedMaterialSlots;
+        dst.InlineMaterials = src.InlineMaterials;
+        dst.ShaderGraphMaterials = src.ShaderGraphMaterials;
+        dst.SlotPropertyBlocks = src.SlotPropertyBlocks;
+        dst.MaterialSources = src.MaterialSources;
+        dst.PropertyBlock = src.PropertyBlock;
+        dst.PropertyBlockTexturePaths = src.PropertyBlockTexturePaths;
+        dst.SlotPropertyBlockTexturePaths = src.SlotPropertyBlockTexturePaths;
+    };
+    auto applyMaterials = [](MeshComponent& dst, const ModelChildMaterialState& s) {
+        dst.material = s.material;
+        dst.materials = s.materials;
+        dst.MaterialSlotNames = s.MaterialSlotNames;
+        dst.MaterialAssetPaths = s.MaterialAssetPaths;
+        dst.OwnedMaterialSlots = s.OwnedMaterialSlots;
+        dst.InlineMaterials = s.InlineMaterials;
+        dst.ShaderGraphMaterials = s.ShaderGraphMaterials;
+        dst.SlotPropertyBlocks = s.SlotPropertyBlocks;
+        dst.MaterialSources = s.MaterialSources;
+        dst.PropertyBlock = s.PropertyBlock;
+        dst.PropertyBlockTexturePaths = s.PropertyBlockTexturePaths;
+        dst.SlotPropertyBlockTexturePaths = s.SlotPropertyBlockTexturePaths;
+    };
+
+    // Build path -> default material state map from the fresh instance.
+    std::unordered_map<std::string, ModelChildMaterialState> pathToDefault;
+    std::function<void(EntityID, const std::string&)> collectDefaults = [&](EntityID id, const std::string& parentPath) {
+        auto* d = GetEntityData(id);
+        if (!d) return;
+        std::string path = parentPath.empty() ? d->Name : (parentPath + "/" + d->Name);
+        ModelChildMaterialState state;
+        if (d->Mesh) snapshotMaterials(*d->Mesh, state);
+        pathToDefault[path] = state;
+        pathToDefault[ModelNodeIdentity::NormalizePath(path)] = state;
+        for (EntityID c : d->Children) collectDefaults(c, path);
+    };
+    for (EntityID c : GetEntityData(tempRoot)->Children) {
+        collectDefaults(c, "");
+    }
+
+    // The snapshots hold shared_ptr refs to the fresh materials, so removing the
+    // temp instance won't free them before we re-assign them onto the live children.
+    RemoveEntity(tempRoot);
+
+    auto relPathOf = [this](EntityID root, EntityID node) -> std::string {
+        std::vector<std::string> parts;
+        EntityID cur = node;
+        while (cur != INVALID_ENTITY_ID) {
+            auto* d = GetEntityData(cur);
+            if (!d) break;
+            parts.push_back(d->Name);
+            if (cur == root) break;
+            cur = d->Parent;
+        }
+        if (parts.empty()) return std::string();
+        std::reverse(parts.begin(), parts.end());
+        if (!parts.empty()) parts.erase(parts.begin());
+        std::string s;
+        for (size_t i = 0; i < parts.size(); ++i) {
+            if (i > 0) s += "/";
+            s += parts[i];
+        }
+        return s;
+    };
+
+    int applied = 0;
+    std::function<void(EntityID)> applyToChildren = [&](EntityID id) {
+        auto* d = GetEntityData(id);
+        if (!d) return;
+        // Skip nested model roots - they have their own model identity.
+        if (id != modelRootId && d->ModelAssetGuid.high != 0 && d->ModelAssetGuid.low != 0) return;
+        for (EntityID c : d->Children) {
+            auto* cd = GetEntityData(c);
+            if (!cd) continue;
+            if (cd->ModelAssetGuid.high != 0 || cd->ModelAssetGuid.low != 0) {
+                applyToChildren(c);  // recurse into nested model but don't reset it
+                continue;
+            }
+            std::string path = relPathOf(modelRootId, c);
+            if (!path.empty()) {
+                auto it = pathToDefault.find(path);
+                if (it == pathToDefault.end()) {
+                    it = pathToDefault.find(ModelNodeIdentity::NormalizePath(path));
+                }
+                if (it != pathToDefault.end() && it->second.HasMesh && cd->Mesh) {
+                    applyMaterials(*cd->Mesh, it->second);
+                    ++applied;
+                }
+            }
+            applyToChildren(c);
+        }
+    };
+    applyToChildren(modelRootId);
+
+    if (applied > 0) {
+        MarkDirty();
+    }
+    std::cout << "[Scene] Reset materials on " << applied << " model child mesh(es)" << std::endl;
+    return applied > 0;
 }
 
 bool Scene::AlignModelRootChildrenToTerrain(EntityID modelRootId) {
@@ -3413,6 +3742,7 @@ bool Scene::AlignModelRootChildrenToTerrain(EntityID modelRootId) {
 }
 #else
 bool Scene::ResetModelChildrenToDefault(EntityID) { return false; }
+bool Scene::ResetModelChildrenMaterialsToDefault(EntityID) { return false; }
 bool Scene::AlignModelRootChildrenToTerrain(EntityID) { return false; }
 #endif
 
@@ -3698,7 +4028,10 @@ void Scene::BeginLoadTracking(const std::string& path, bool async) {
     m_LoadHoldDuration = 0.0f;
     m_LoadHoldStartProgress = 0.0f;
     m_LoadingHold = false;
-    m_DeferScriptOnCreate = async;
+    // Play-mode loads need the same gate even for synchronous scene loads:
+    // scripts can spawn prefabs in OnCreate/first input frames, and those
+    // prefabs must be prewarmed before script execution starts.
+    m_DeferScriptOnCreate = async || m_IsPlaying;
     m_RestoreDeferredScriptInit = false;
     m_PrevDeferredScriptInit = DeferredScriptInit::g_EnableDeferredScriptInit;
     if (m_DeferScriptOnCreate) {
@@ -3847,10 +4180,12 @@ bool Scene::LoadSceneImmediate(const std::string& path, bool async)
         return false;
     }
 
+    prefab::QueueScenePrefabs(*this);
+
     if (m_DeferScriptOnCreate) {
         m_LoadScriptsTotal = DeferredScriptInit::GetPendingCount();
         m_LoadScriptsReady = true;
-        if (m_LoadScriptsTotal == 0) {
+        if (m_LoadScriptsTotal == 0 && !prefab::HasPendingWork()) {
             FinalizeLoadTracking(true);
         }
     } else {
@@ -3878,9 +4213,22 @@ void Scene::StartAsyncLoadJob(const std::string& path) {
         scenePath = p.string();
     }
     if (Assets::ShouldLoadBinary()) {
-        std::string binPath = Assets::GetBinaryPath(path);
-        if (!binPath.empty()) {
-            scenePath = binPath;
+        bool resolvedPreparedBinary = false;
+        if (IAssetResolver* resolver = Assets::GetResolver()) {
+            if (resolver->IsBinaryCurrent(path)) {
+                std::string binPath = resolver->GetBinaryPath(path);
+                if (!binPath.empty()) {
+                    scenePath = binPath;
+                    resolvedPreparedBinary = true;
+                }
+            }
+        }
+        const bool requirePreparedBinary =
+            Assets::GetLoadMode() == AssetLoadMode::PlayMode && !FileSystem::Instance().IsPakMounted();
+        if (requirePreparedBinary &&
+            !resolvedPreparedBinary &&
+            std::filesystem::path(path).extension() != ".sceneb") {
+            scenePath.clear();
         }
     }
     m_AsyncLoadJob->binaryPath = scenePath;
@@ -3991,11 +4339,12 @@ void Scene::TickAsyncLoadJob() {
     
     if (binary::EntityBinaryLoader::IsStreamingComplete(job.stream)) {
         PostLoadFixups();
+        prefab::QueueScenePrefabs(*this);
         m_LoadProgress = 0.85f;
         if (m_DeferScriptOnCreate) {
             m_LoadScriptsTotal = DeferredScriptInit::GetPendingCount();
             m_LoadScriptsReady = true;
-            if (m_LoadScriptsTotal == 0) {
+            if (m_LoadScriptsTotal == 0 && !prefab::HasPendingWork()) {
                 FinalizeLoadTracking(true);
             }
         } else {
@@ -4182,67 +4531,75 @@ EntityID Scene::InstantiateAsset(const std::string& path, const glm::vec3& posit
    std::string ext = fs::path(path).extension().string();
    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 
-   if (ext == ".fbx" || ext == ".obj" || ext == ".gltf")
-   {
-      return InstantiateModel(path, position);
-   }
-   else if (ext == ".prefab") {
-      // Support both legacy single-entity and subtree prefab formats
-      // .prefab is authoring JSON
-      EntityID rootId = InstantiatePrefabFromPath(path, *this);
-      if (rootId == INVALID_ENTITY_ID) {
-         std::cerr << "[Scene] Failed to load prefab: " << path << std::endl;
+   auto finalizePrefabInstance = [&](EntityID rootId) -> EntityID {
+      if (rootId == INVALID_ENTITY_ID || rootId == (EntityID)0) {
          return INVALID_ENTITY_ID;
       }
       if (auto* d = GetEntityData(rootId)) {
          d->Transform.Position = position;
-         // Record source so scene serialization can emit a compact prefab reference
+         // Record source so scene serialization can emit a compact prefab reference.
          try {
             std::string norm = path;
-            for (char& c : norm)
-            {
+            for (char& c : norm) {
                if (c == '\\') c = '/';
             }
-            std::error_code ec; fs::path rel = fs::relative(norm, Project::GetProjectDirectory(), ec);
+            std::error_code ec;
+            fs::path rel = fs::relative(norm, Project::GetProjectDirectory(), ec);
             std::string vpath = ec ? norm : rel.string();
-            for (char& c : vpath)
-            {
+            for (char& c : vpath) {
                if (c == '\\') c = '/';
             }
             size_t pos = vpath.find("assets/");
-            if (pos != std::string::npos)
-            {
+            if (pos != std::string::npos) {
                vpath = vpath.substr(pos);
             }
             d->PrefabSource = vpath;
+         } catch (...) {
          }
-         catch (...) {}
          MarkTransformDirty(rootId);
       }
       return rootId;
+   };
+
+   auto instantiatePrefab = [&]() -> EntityID {
+      std::string binaryPath;
+      if (IAssetResolver* resolver = Assets::GetResolver()) {
+         if (resolver->IsBinaryCurrent(path)) {
+            binaryPath = resolver->GetBinaryPath(path);
+         }
+      } else {
+         binaryPath = Assets::GetBinaryPath(path);
+      }
+      if (!binaryPath.empty()) {
+         runtime::RuntimePrefabInstantiator::Preload(binaryPath);
+         EntityID rootId =
+            runtime::RuntimePrefabInstantiator::InstantiateBlocking(binaryPath, *this);
+         if (rootId != INVALID_ENTITY_ID && rootId != (EntityID)0) {
+            return rootId;
+         }
+      }
+      return InstantiatePrefabFromPath(path, *this);
+   };
+
+   if (ext == ".fbx" || ext == ".obj" || ext == ".gltf" || ext == ".glb")
+   {
+      return InstantiateModel(path, position);
+   }
+   else if (ext == ".prefab") {
+      EntityID rootId = instantiatePrefab();
+      if (rootId == INVALID_ENTITY_ID) {
+         std::cerr << "[Scene] Failed to load prefab: " << path << std::endl;
+         return INVALID_ENTITY_ID;
+      }
+      return finalizePrefabInstance(rootId);
    }
    else if (ext == ".json") {
-      // New authoring prefab format
-      EntityID rootId = InstantiatePrefabFromPath(path, *this);
-      if (rootId == -1 || rootId == 0) {
+      EntityID rootId = instantiatePrefab();
+      if (rootId == INVALID_ENTITY_ID || rootId == (EntityID)0) {
          std::cerr << "[Scene] Failed to instantiate authoring prefab: " << path << std::endl;
-         return -1;
+         return INVALID_ENTITY_ID;
       }
-      if (auto* d = GetEntityData(rootId)) {
-         d->Transform.Position = position;
-         // Record source so scene serialization can emit a compact prefab reference
-         try {
-            std::string norm = path; for (char& c : norm) if (c == '\\') c = '/';
-            std::error_code ec; fs::path rel = fs::relative(norm, Project::GetProjectDirectory(), ec);
-            std::string vpath = ec ? norm : rel.string();
-            for (char& c : vpath) if (c == '\\') c = '/';
-            size_t pos = vpath.find("assets/"); if (pos != std::string::npos) vpath = vpath.substr(pos);
-            d->PrefabSource = vpath;
-         }
-         catch (...) {}
-         MarkTransformDirty(rootId);
-      }
-      return rootId;
+      return finalizePrefabInstance(rootId);
    }
    else if (ext == ".png" || ext == ".jpg" || ext == ".jpeg") {
       // Create a simple textured quad
@@ -4917,6 +5274,78 @@ static bool TryGetAnimatedAttachmentBoneWorldMatrix(Scene& scene,
    return true;
 }
 
+bool Scene::TryGetBoneWorldMatrix(EntityID id, glm::mat4& outWorld)
+{
+   EntityData* data = GetEntityData(id);
+   if (!data || data->BoneSkeletonEntity == INVALID_ENTITY_ID || data->BoneIndex < 0)
+   {
+      return false;
+   }
+
+   EntityData* skeletonData = GetEntityData(data->BoneSkeletonEntity);
+   if (!skeletonData || !skeletonData->Skeleton)
+   {
+      return false;
+   }
+
+   SkeletonComponent& skeleton = *skeletonData->Skeleton;
+   const size_t boneIndex = static_cast<size_t>(data->BoneIndex);
+   // Only use the pose buffer when the animated palette is current. When it is not
+   // (e.g. editor not playing, or ragdoll-driven skeletons that clear the flag),
+   // callers fall back to the propagated AoS transform, preserving existing behavior.
+   if (!skeleton.AnimatedPosePaletteValid ||
+       boneIndex >= skeleton.BoneCount ||
+       boneIndex >= skeleton.InverseBindPoses.size() ||
+       boneIndex >= skeleton.BonePalette.size())
+   {
+      return false;
+   }
+
+   glm::mat4 bindGlobal(1.0f);
+   if (boneIndex < skeleton.BindPoseGlobals.size())
+   {
+      bindGlobal = skeleton.BindPoseGlobals[boneIndex];
+   }
+   else
+   {
+      bindGlobal = glm::inverse(skeleton.InverseBindPoses[boneIndex]);
+   }
+
+   // BonePalette[i] == animatedBoneGlobal * InverseBindPose, so
+   // BonePalette[i] * bindGlobal == animatedBoneGlobal (bone transform in skeleton
+   // space). World = skeletonRootWorld * animatedBoneGlobal. (Same derivation the
+   // bone-attachment path uses.)
+   const glm::mat4 skeletonLocalBone = skeleton.BonePalette[boneIndex] * bindGlobal;
+   outWorld = skeletonData->Transform.WorldMatrix * skeletonLocalBone;
+   return true;
+}
+
+void Scene::RebindSkeletonBoneMarkers(EntityID skeletonRootId)
+{
+   EntityData* skeletonData = GetEntityData(skeletonRootId);
+   if (!skeletonData || !skeletonData->Skeleton)
+   {
+      return;
+   }
+
+   const SkeletonComponent& skeleton = *skeletonData->Skeleton;
+   for (size_t i = 0; i < skeleton.BoneEntities.size(); ++i)
+   {
+      const EntityID boneId = skeleton.BoneEntities[i];
+      if (boneId == INVALID_ENTITY_ID || boneId == static_cast<EntityID>(-1) || boneId == 0)
+      {
+         continue;
+      }
+      EntityData* boneData = GetEntityData(boneId);
+      if (!boneData)
+      {
+         continue;
+      }
+      boneData->BoneSkeletonEntity = skeletonRootId;
+      boneData->BoneIndex = static_cast<int>(i);
+   }
+}
+
 bool Scene::ProcessBoneAttachments(BoneAttachmentProcessMode mode)
 {
    // Find entities with BoneAttachmentComponent and update their transforms
@@ -5359,6 +5788,19 @@ std::shared_ptr<Scene> Scene::RuntimeClone() {
          }
       }
 
+      // Reset audio source runtime state so PlayOnAwake re-triggers cleanly each
+      // time play starts (the deep copy carries over edit-time runtime fields).
+      if (data.AudioSource) {
+         data.AudioSource->Initialized = false;
+         data.AudioSource->IsPlaying = false;
+         data.AudioSource->IsPaused = false;
+         data.AudioSource->SoundHandle = INVALID_AUDIO_HANDLE;
+         data.AudioSource->PlayRequested = false;
+         data.AudioSource->StopRequested = false;
+         data.AudioSource->PauseRequested = false;
+         data.AudioSource->ResumeRequested = false;
+      }
+
       for (size_t i = 0; i < data.Scripts.size(); ++i) {
          auto& script = data.Scripts[i];
          if (script.Instance)
@@ -5536,58 +5978,8 @@ std::shared_ptr<Scene> Scene::RuntimeClone() {
                         break;
                     }
                     case PropertyType::List: {
-                        // Serialize list elements as pipe-separated string
-                        // Use static thread_local buffer to ensure string lifetime
                         static thread_local std::string listSerialBuffer;
-                        listSerialBuffer.clear();
-                        
-                        // Get the element type from reflection metadata for proper serialization
-                        PropertyType elemType = property.listElementType;
-                        
-                        // Handle different storage types for list values
-                        std::shared_ptr<ListPropertyValue> listPtr;
-                        
-                        if (std::holds_alternative<std::shared_ptr<ListPropertyValue>>(valueToApply)) {
-                            listPtr = std::get<std::shared_ptr<ListPropertyValue>>(valueToApply);
-                            // Update element type from ListPropertyValue if available and more specific
-                            if (listPtr && listPtr->elementType != PropertyType::Int) {
-                                elemType = listPtr->elementType;
-                            }
-                        } else if (std::holds_alternative<std::string>(valueToApply)) {
-                            // List was serialized as pipe-separated string - parse it
-                            const std::string& serialized = std::get<std::string>(valueToApply);
-                            if (!serialized.empty()) {
-                                listSerialBuffer = serialized; // Already in correct format
-                                SetManagedFieldPtr(handle, property.name.c_str(), (void*)listSerialBuffer.c_str());
-                                break;
-                            }
-                        }
-                        
-                        if (listPtr && !listPtr->elements.empty()) {
-                            for (size_t i = 0; i < listPtr->elements.size(); ++i) {
-                                if (i > 0) listSerialBuffer += "|";
-                                const PropertyValue& elem = listPtr->elements[i];
-                                // Serialize based on element type
-                                if (std::holds_alternative<int>(elem)) {
-                                    int val = std::get<int>(elem);
-                                    // For entity-like element types, -1 means "None"
-                                    // The managed side will handle creating Entity instances from IDs
-                                    listSerialBuffer += std::to_string(val);
-                                } else if (std::holds_alternative<float>(elem)) {
-                                    listSerialBuffer += std::to_string(std::get<float>(elem));
-                                } else if (std::holds_alternative<bool>(elem)) {
-                                    listSerialBuffer += std::get<bool>(elem) ? "true" : "false";
-                                } else if (std::holds_alternative<std::string>(elem)) {
-                                    // For ClayObject GUIDs - empty string means "None"
-                                    const std::string& str = std::get<std::string>(elem);
-                                    listSerialBuffer += str; // Can be empty for unassigned
-                                } else if (std::holds_alternative<glm::vec3>(elem)) {
-                                    const glm::vec3& v = std::get<glm::vec3>(elem);
-                                    listSerialBuffer += std::to_string(v.x) + "," + std::to_string(v.y) + "," + std::to_string(v.z);
-                                }
-                                // Skip unknown types (add empty placeholder to maintain indices)
-                            }
-                        }
+                        listSerialBuffer = ScriptReflection::PropertyValueToString(valueToApply);
                         SetManagedFieldPtr(handle, property.name.c_str(), (void*)listSerialBuffer.c_str());
                         break;
                     }
@@ -5635,7 +6027,13 @@ void Scene::InvalidateAllAnimatorAssetCaches() {
 void Scene::OnStop() {
    // Mark that we're stopping to prevent any scripts from trying to destroy entities
    m_IsBeingDestroyed = true;
-   
+
+   // Stop any sounds this scene started. Audio handles live in the global Audio
+   // system (not on the scene), so tearing the scene down won't stop them. OnStop
+   // is the shared exit-play teardown for every route (toolbar Stop, command,
+   // application), so stopping here covers them all.
+   Audio::StopAll();
+
    // Collect entity IDs first to avoid issues if entities are modified during iteration
    std::vector<EntityID> entityIds;
    entityIds.reserve(m_Entities.size());
@@ -5829,7 +6227,7 @@ int Scene::RecreateScriptInstances() {
                      break;
                   }
                   case PropertyType::List: {
-                     // Serialize list elements as pipe-separated string
+                     // Lists may serialize as legacy pipe strings or structured JSON.
                      static thread_local std::string listSerialBuffer;
                      listSerialBuffer = ScriptReflection::PropertyValueToString(valueToApply);
                      SetManagedFieldPtr(handle, property.name.c_str(), (void*)listSerialBuffer.c_str());
@@ -6075,45 +6473,7 @@ EntityID Scene::DuplicateEntity(EntityID srcRoot) {
                   }
                   case PropertyType::List: {
                      static thread_local std::string listSerialBuffer;
-                     listSerialBuffer.clear();
-
-                     PropertyType elemType = property.listElementType;
-                     std::shared_ptr<ListPropertyValue> listPtr;
-
-                     if (std::holds_alternative<std::shared_ptr<ListPropertyValue>>(valueToApply)) {
-                        listPtr = std::get<std::shared_ptr<ListPropertyValue>>(valueToApply);
-                        if (listPtr && listPtr->elementType != PropertyType::Int) {
-                           elemType = listPtr->elementType;
-                        }
-                     } else if (std::holds_alternative<std::string>(valueToApply)) {
-                        const std::string& serialized = std::get<std::string>(valueToApply);
-                        if (!serialized.empty()) {
-                           listSerialBuffer = serialized;
-                           SetManagedFieldPtr(handle, property.name.c_str(), (void*)listSerialBuffer.c_str());
-                           break;
-                        }
-                     }
-
-                     if (listPtr && !listPtr->elements.empty()) {
-                        for (size_t i = 0; i < listPtr->elements.size(); ++i) {
-                           if (i > 0) listSerialBuffer += "|";
-                           const PropertyValue& elem = listPtr->elements[i];
-                           if (std::holds_alternative<int>(elem)) {
-                              int val = std::get<int>(elem);
-                              listSerialBuffer += std::to_string(val);
-                           } else if (std::holds_alternative<float>(elem)) {
-                              listSerialBuffer += std::to_string(std::get<float>(elem));
-                           } else if (std::holds_alternative<bool>(elem)) {
-                              listSerialBuffer += std::get<bool>(elem) ? "true" : "false";
-                           } else if (std::holds_alternative<std::string>(elem)) {
-                              const std::string& str = std::get<std::string>(elem);
-                              listSerialBuffer += str;
-                           } else if (std::holds_alternative<glm::vec3>(elem)) {
-                              const glm::vec3& v = std::get<glm::vec3>(elem);
-                              listSerialBuffer += std::to_string(v.x) + "," + std::to_string(v.y) + "," + std::to_string(v.z);
-                           }
-                        }
-                     }
+                     listSerialBuffer = ScriptReflection::PropertyValueToString(valueToApply);
                      SetManagedFieldPtr(handle, property.name.c_str(), (void*)listSerialBuffer.c_str());
                      break;
                   }
@@ -6705,15 +7065,22 @@ void Scene::Update(float dt) {
    }
 
    if (m_Loading && m_DeferScriptOnCreate && m_LoadScriptsReady) {
-      static constexpr size_t kMaxScriptsPerFrame = 64;
-      size_t processed = DeferredScriptInit::ProcessDeferredScripts(kMaxScriptsPerFrame);
-      if (processed > 0 && m_LoadScriptsTotal > 0) {
-         m_LoadScriptsProcessed = std::min(m_LoadScriptsProcessed + processed, m_LoadScriptsTotal);
-         float ratio = static_cast<float>(m_LoadScriptsProcessed) / static_cast<float>(m_LoadScriptsTotal);
-         m_LoadProgress = 0.85f + (0.15f * ratio);
-      }
-      if (!DeferredScriptInit::HasPendingScripts()) {
-         FinalizeLoadTracking(true);
+      { ScopedTimer t("Prefab/PrewarmLoad"); prefab::Update(4.0); }
+      if (prefab::HasPendingWork()) {
+         const float prewarmRatio = prefab::GetProgress();
+         const float prewarmSpan = (m_LoadScriptsTotal > 0) ? 0.075f : 0.15f;
+         m_LoadProgress = 0.85f + (prewarmSpan * prewarmRatio);
+      } else {
+         static constexpr size_t kMaxScriptsPerFrame = 64;
+         size_t processed = DeferredScriptInit::ProcessDeferredScripts(kMaxScriptsPerFrame);
+         if (processed > 0 && m_LoadScriptsTotal > 0) {
+            m_LoadScriptsProcessed = std::min(m_LoadScriptsProcessed + processed, m_LoadScriptsTotal);
+            float ratio = static_cast<float>(m_LoadScriptsProcessed) / static_cast<float>(m_LoadScriptsTotal);
+            m_LoadProgress = 0.925f + (0.075f * ratio);
+         }
+         if (!DeferredScriptInit::HasPendingScripts()) {
+            FinalizeLoadTracking(true);
+         }
       }
    }
 
@@ -7268,31 +7635,40 @@ void Scene::Update(float dt) {
          }
          
          if (source.PlayRequested || (!source.Initialized && source.PlayOnAwake)) {
+            const bool explicitRequest = source.PlayRequested;
             std::string path = ResolveAudioSourcePath(source);
             if (!path.empty()) {
                // Stop any currently playing sound
                if (source.SoundHandle != INVALID_AUDIO_HANDLE) {
                   Audio::Stop(source.SoundHandle);
                }
-               
+
                float volume = source.Mute ? 0.0f : source.Volume;
-               
+
                if (source.Spatial) {
                   glm::vec3 pos = glm::vec3(data->Transform.WorldMatrix[3]);
-                  source.SoundHandle = Audio::Play3D(path, pos, volume, source.Loop, 
+                  source.SoundHandle = Audio::Play3D(path, pos, volume, source.Loop,
                                                       source.MinDistance, source.MaxDistance);
                   source.LastPosition = pos;
                } else {
                   source.SoundHandle = Audio::Play(path, volume, source.Loop);
                }
-               
+
                source.IsPlaying = (source.SoundHandle != INVALID_AUDIO_HANDLE);
                if (source.IsPlaying) {
                   Audio::SetPitch(source.SoundHandle, source.Pitch);
                }
             }
             source.PlayRequested = false;
-            source.Initialized = true;
+            // Latch the auto-play (PlayOnAwake) gate only once the sound has
+            // actually started. Otherwise a transient first-frame failure -- the
+            // audio engine, the asset, or the runtime-world audio-source list not
+            // being ready yet on the first play frame -- would set Initialized and
+            // permanently suppress PlayOnAwake. Keep retrying until it starts.
+            // An explicit Play() request is one-shot regardless of success.
+            if (explicitRequest || source.IsPlaying) {
+               source.Initialized = true;
+            }
          }
          
          // Update properties for playing sounds (volume, mute, pitch)
@@ -7625,11 +8001,16 @@ void Scene::Update(float dt) {
          if (targetId != INVALID_ENTITY_ID) {
             if (targetData) {
                const glm::vec3& posDelta = player._RootMotionOutput.PositionDelta;
-               glm::vec3 targetWorldPosition(0.0f);
-               glm::quat targetWorldRotation(1.0f, 0.0f, 0.0f, 0.0f);
-               DecomposeWorldTransform(targetData->Transform, targetWorldPosition, targetWorldRotation);
-               (void)targetWorldPosition;
-               const glm::vec3 steeredPosDelta = RotateRootMotionDeltaToWorldYaw(posDelta, targetWorldRotation);
+               glm::vec3 sourceWorldPosition(0.0f);
+               glm::quat sourceWorldRotation(1.0f, 0.0f, 0.0f, 0.0f);
+               DecomposeWorldTransform(animData.Transform, sourceWorldPosition, sourceWorldRotation);
+               (void)sourceWorldPosition;
+
+               // Root motion deltas are extracted in the animator entity's local/model space.
+               // When gameplay rotates a visual child (e.g. SkeletonRoot) while physics stays on
+               // the parent CharacterController, steer the motion using the animator's world yaw,
+               // then inject the resulting world-space delta into the chosen movement target.
+               const glm::vec3 steeredPosDelta = RotateRootMotionDeltaToWorldYaw(posDelta, sourceWorldRotation);
                
                // Convert position delta to velocity (delta / dt)
                glm::vec3 velocity = (dt > 0.0001f) ? (steeredPosDelta / dt) : glm::vec3(0.0f);
@@ -7641,8 +8022,14 @@ void Scene::Update(float dt) {
                   // This allows scripts to ALSO contribute velocity (e.g., for strafing)
                   cc.DesiredVelocity.x += velocity.x;
                   cc.DesiredVelocity.z += velocity.z;
-                  // Y velocity for root motion (jumps, climbing) - add to vertical velocity
-                  if (std::abs(velocity.y) > 0.001f) {
+                  // Root-motion clips that override gravity treat animation Y as authoritative,
+                  // which keeps climbing/bed-entry motion aligned with the authored keyframes.
+                  if (player._RootMotionOutput.OverrideGravity) {
+                     cc.VerticalVelocity = velocity.y;
+                     cc._RootMotionAppliedVertical = std::abs(velocity.y) > 0.001f;
+                  } else if (std::abs(velocity.y) > 0.001f) {
+                     // Otherwise root motion contributes on top of the controller's existing
+                     // vertical velocity so jumps/falls can still combine with animation.
                      cc.VerticalVelocity += velocity.y;
                      cc._RootMotionAppliedVertical = true;
                   }
@@ -7959,7 +8346,7 @@ void Scene::Update(float dt) {
                   eus.mWalkStairsStepUp = JPH::Vec3::sZero();
                }
 
-               CharacterControllerBodyFilter characterBodyFilter(Physics::GetSystem(), characterLayer);
+               CharacterControllerBodyFilter characterBodyFilter(Physics::GetSystem(), characterLayer, cc.CollisionMask);
                cc.Character->ExtendedUpdate(
                   dt,
                   JPH::Vec3(0.0f, gravity.y, 0.0f),

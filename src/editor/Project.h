@@ -41,6 +41,12 @@ struct EditorCustomPalette {
     ColorRGBA warning{0.90f, 0.60f, 0.29f, 1.00f};
 };
 
+struct ViewportResolutionPreset {
+    std::string label;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+
 enum class EditorColorScheme {
     Claymore = 0,
     Solarized,
@@ -100,6 +106,8 @@ public:
     static void SetEditorColorScheme(EditorColorScheme scheme) { s_EditorColorScheme = scheme; }
     static const EditorCustomPalette& GetEditorCustomPalette() { return s_EditorCustomPalette; }
     static void SetEditorCustomPalette(const EditorCustomPalette& palette) { s_EditorCustomPalette = palette; }
+    static const std::vector<ViewportResolutionPreset>& GetViewportResolutionPresets() { return s_ViewportResolutionPresets; }
+    static void SetViewportResolutionPresets(std::vector<ViewportResolutionPreset> presets) { s_ViewportResolutionPresets = std::move(presets); }
 
 private:
     static inline std::string s_ProjectName;
@@ -114,4 +122,5 @@ private:
     static inline bool s_ManagedScriptDebuggingEnabled = false;
     static inline EditorColorScheme s_EditorColorScheme = EditorColorScheme::Claymore;
     static inline EditorCustomPalette s_EditorCustomPalette{};
+    static inline std::vector<ViewportResolutionPreset> s_ViewportResolutionPresets;
 };

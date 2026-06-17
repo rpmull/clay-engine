@@ -9,11 +9,16 @@
 #include "core/serialization/SkelBinLoader.h"
 #include "core/ecs/AnimationComponents.h"
 #include "core/animation/AnimationPlayerComponent.h"
+#include "core/rendering/MaterialCache.h"
 #include "core/rendering/PBRMaterial.h"
 #include "core/rendering/SkinnedPBRMaterial.h"
 #include "core/rendering/TextureLoader.h"
 #include "core/rendering/ShaderManager.h"
+#include <algorithm>
+#include <cstring>
 #include <iostream>
+#include <mutex>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <cmath>
@@ -77,6 +82,154 @@ static bool IsDefaultTransform(const TransformComponent& t) {
            nearEq(t.RotationQ.x, 0.0f) && nearEq(t.RotationQ.y, 0.0f) && nearEq(t.RotationQ.z, 0.0f) &&
            nearEq(t.RotationQ.w, 1.0f);
 }
+
+namespace {
+std::mutex s_runtimeMaterialCacheMutex;
+std::unordered_map<std::string, std::weak_ptr<Material>> s_runtimeMaterialCache;
+
+uint32_t RuntimeMaterialFloatBits(float value)
+{
+    uint32_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value), "float size mismatch");
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+std::string BuildRuntimeMaterialCacheKey(const RuntimeMaterialSlot& slot, bool skinned)
+{
+    std::ostringstream key;
+    key << (skinned ? '1' : '0')
+        << '|' << slot.albedoGuid.high << ':' << slot.albedoGuid.low
+        << '|' << slot.normalGuid.high << ':' << slot.normalGuid.low
+        << '|' << slot.metallicRoughnessGuid.high << ':' << slot.metallicRoughnessGuid.low
+        << '|' << slot.aoGuid.high << ':' << slot.aoGuid.low
+        << '|' << slot.emissionGuid.high << ':' << slot.emissionGuid.low
+        << '|' << slot.displacementGuid.high << ':' << slot.displacementGuid.low
+        << '|' << RuntimeMaterialFloatBits(slot.metallic)
+        << '|' << RuntimeMaterialFloatBits(slot.roughness)
+        << '|' << RuntimeMaterialFloatBits(slot.normalScale)
+        << '|' << RuntimeMaterialFloatBits(slot.aoStrength)
+        << '|' << RuntimeMaterialFloatBits(slot.tint.x)
+        << '|' << RuntimeMaterialFloatBits(slot.tint.y)
+        << '|' << RuntimeMaterialFloatBits(slot.tint.z)
+        << '|' << RuntimeMaterialFloatBits(slot.tint.w)
+        << '|' << (slot.alphaBlend ? '1' : '0')
+        << '|' << (slot.alphaCutout ? '1' : '0')
+        << '|' << (slot.twoSided ? '1' : '0')
+        << '|' << (slot.hasTint ? '1' : '0')
+        << '|' << RuntimeMaterialFloatBits(slot.alphaCutoutThreshold);
+    return key.str();
+}
+
+bool IsEquivalentMaterialShared(const std::shared_ptr<Material>& material)
+{
+    return material &&
+        GetMaterialEquivalenceKey(material.get()).EquivalentSafe;
+}
+
+std::shared_ptr<Material> CreateSharedRuntimeMaterial(
+    Scene& scene,
+    const RuntimeMaterialSlot& slot,
+    IAssetResolver* resolver,
+    bool skinned)
+{
+    const std::string cacheKey = BuildRuntimeMaterialCacheKey(slot, skinned);
+    {
+        std::lock_guard<std::mutex> lock(s_runtimeMaterialCacheMutex);
+        auto it = s_runtimeMaterialCache.find(cacheKey);
+        if (it != s_runtimeMaterialCache.end()) {
+            if (auto existing = it->second.lock()) {
+                return existing;
+            }
+            s_runtimeMaterialCache.erase(it);
+        }
+    }
+
+    const std::string shaderVS = skinned ? "vs_pbr_skinned" : "vs_pbr";
+    const std::string shaderFS = skinned ? "fs_pbr_skinned" : "fs_pbr";
+    const bgfx::ProgramHandle program =
+        ShaderManager::Instance().LoadProgram(shaderVS, shaderFS);
+    if (!bgfx::isValid(program)) {
+        std::cerr << "[RuntimeModelInstantiator] Failed to load PBR shader program" << std::endl;
+        return nullptr;
+    }
+
+    std::shared_ptr<PBRMaterial> pbrMaterial =
+        skinned
+            ? std::static_pointer_cast<PBRMaterial>(
+                std::make_shared<SkinnedPBRMaterial>("RuntimeMaterial", program))
+            : std::make_shared<PBRMaterial>("RuntimeMaterial", program);
+    if (!pbrMaterial) {
+        return nullptr;
+    }
+
+    pbrMaterial->SetMetallic(slot.metallic);
+    pbrMaterial->SetRoughness(slot.roughness);
+    pbrMaterial->SetNormalScale(slot.normalScale);
+    pbrMaterial->SetAmbientOcclusion(slot.aoStrength);
+
+    if (slot.tint != glm::vec4(1.0f)) {
+        pbrMaterial->SetUniform("u_ColorTint", slot.tint);
+    }
+
+    auto setTextureFromGuid = [&](const ClaymoreGUID& guid, auto&& setter) {
+        if (!resolver || (guid.high == 0 && guid.low == 0)) {
+            return;
+        }
+        const std::string path = resolver->GetPathForGUID(guid);
+        if (!path.empty()) {
+            setter(path);
+        }
+    };
+
+    setTextureFromGuid(slot.albedoGuid, [&](const std::string& path) {
+        pbrMaterial->SetAlbedoTextureFromPath(path);
+    });
+    setTextureFromGuid(slot.normalGuid, [&](const std::string& path) {
+        pbrMaterial->SetNormalTextureFromPath(path);
+    });
+    setTextureFromGuid(slot.metallicRoughnessGuid, [&](const std::string& path) {
+        pbrMaterial->SetMetallicRoughnessTextureFromPath(path);
+    });
+    setTextureFromGuid(slot.aoGuid, [&](const std::string& path) {
+        pbrMaterial->SetAmbientOcclusionTextureFromPath(path);
+    });
+    setTextureFromGuid(slot.emissionGuid, [&](const std::string& path) {
+        pbrMaterial->SetEmissionTextureFromPath(path);
+    });
+    setTextureFromGuid(slot.displacementGuid, [&](const std::string& path) {
+        pbrMaterial->SetDisplacementTextureFromPath(path);
+    });
+
+    if (slot.alphaBlend && !slot.alphaCutout) {
+        pbrMaterial->m_StateFlags =
+            pbrMaterial->GetStateFlags() | BGFX_STATE_BLEND_ALPHA;
+    }
+
+    if (slot.twoSided) {
+        pbrMaterial->m_StateFlags =
+            pbrMaterial->GetStateFlags() &
+            ~(BGFX_STATE_CULL_CW | BGFX_STATE_CULL_CCW);
+    }
+
+    if (slot.alphaCutout) {
+        pbrMaterial->SetUniform(
+            "u_PBRScalar1",
+            glm::vec4(
+                pbrMaterial->GetEmissionStrength(),
+                slot.alphaCutoutThreshold,
+                0.0f,
+                0.0f));
+    }
+
+    std::shared_ptr<Material> shared = AcquireEquivalentMaterial(pbrMaterial);
+    {
+        std::lock_guard<std::mutex> lock(s_runtimeMaterialCacheMutex);
+        s_runtimeMaterialCache[cacheKey] = shared;
+    }
+    return shared;
+}
+} // namespace
 
 EntityID RuntimeModelInstantiator::Instantiate(const std::string& manifestPath, Scene& scene, 
                                                 const glm::vec3& position,
@@ -239,12 +392,18 @@ EntityID RuntimeModelInstantiator::CreateHierarchy(const RuntimeModelManifest& m
             // Set skeleton GUID
             skeleton.SkeletonGuid = manifest.modelGuid;
             
-            // Create bone entities
+            // Create bone entities.
+            // PERF: see Scene.cpp bone-creation note. Bones are index-addressed
+            // internal children; CreateEntity's O(N) unique-name scan and per-entity
+            // dirty/hierarchy invalidation make spawning a skeleton O(bones x
+            // sceneEntities). Use the batched fast path, invalidate once after.
             skeleton.BoneEntities.resize(skeleton.BoneNames.size(), INVALID_ENTITY_ID);
             for (size_t i = 0; i < skeleton.BoneNames.size(); ++i) {
-                Entity boneEnt = scene.CreateEntity(skeleton.BoneNames[i]);
+                Entity boneEnt = scene.CreateEntityExactFast(skeleton.BoneNames[i]);
                 skeleton.BoneEntities[i] = boneEnt.GetID();
             }
+            scene.MarkDirty();
+            scene.InvalidateHierarchyCache();
             
             // Set up bone parent hierarchy
             for (size_t i = 0; i < skeleton.BoneEntities.size(); ++i) {
@@ -274,7 +433,12 @@ EntityID RuntimeModelInstantiator::CreateHierarchy(const RuntimeModelManifest& m
                     scene.MarkTransformDirty(boneID);
                 }
             }
-            
+
+            // Stage 3 foundation: stamp the per-bone back-reference marker so these
+            // bones resolve their world matrix from the skeleton pose palette (parity
+            // with the Scene.cpp instantiation path; previously only that path set it).
+            scene.RebindSkeletonBoneMarkers(skeletonRootId);
+
             // Add AnimationPlayer to skeleton root
             skelRootData->AnimationPlayer = std::make_unique<cm::animation::AnimationPlayerComponent>();
         }
@@ -302,7 +466,7 @@ EntityID RuntimeModelInstantiator::CreateHierarchy(const RuntimeModelManifest& m
                     }
                     
                     // Apply materials (use node.skinned as authoritative, mesh might not know)
-                    ApplyMaterials(rootData, node.materials, resolver, node.skinned || meshSkinned);
+                    ApplyMaterials(scene, rootData, node.materials, resolver, node.skinned || meshSkinned);
                     
                     meshEntities.push_back(rootId);
                 }
@@ -367,7 +531,7 @@ EntityID RuntimeModelInstantiator::CreateHierarchy(const RuntimeModelManifest& m
                 }
                 
                 // Apply materials (create actual Material objects, not just InlineMaterials)
-                ApplyMaterials(childData, node.materials, resolver, useSkinning);
+                ApplyMaterials(scene, childData, node.materials, resolver, useSkinning);
                 
                 meshEntities.push_back(childId);
             }
@@ -439,122 +603,59 @@ EntityID RuntimeModelInstantiator::CreateHierarchy(const RuntimeModelManifest& m
 }
 
 // Helper to apply materials from manifest to entity - creates actual Material objects
-void RuntimeModelInstantiator::ApplyMaterials(EntityData* data, 
+void RuntimeModelInstantiator::ApplyMaterials(Scene& scene,
+                                               EntityData* data, 
                                                const std::vector<RuntimeMaterialSlot>& materials,
                                                IAssetResolver* resolver,
                                                bool skinned) {
     if (!data || !data->Mesh || materials.empty()) return;
     bool allSlotsTwoSided = true;
-    
-    // Resize materials vector to accommodate all slots
-    if (data->Mesh->materials.size() < materials.size()) {
-        data->Mesh->materials.resize(materials.size());
-    }
+
+    data->Mesh->materials.resize(materials.size());
     data->Mesh->MaterialSlotNames.assign(materials.size(), std::string());
-    
-    // Determine shaders based on skinned state
-    std::string shaderVS = skinned ? "vs_pbr_skinned" : "vs_pbr";
-    std::string shaderFS = skinned ? "fs_pbr_skinned" : "fs_pbr";
-    auto program = ShaderManager::Instance().LoadProgram(shaderVS, shaderFS);
-    
-    if (!bgfx::isValid(program)) {
-        std::cerr << "[RuntimeModelInstantiator] Failed to load PBR shader program" << std::endl;
-        return;
-    }
-    
+    data->Mesh->MaterialAssetPaths.assign(materials.size(), std::string());
+    data->Mesh->OwnedMaterialSlots.assign(materials.size(), false);
+    data->Mesh->MaterialSources.assign(materials.size(), MaterialSource{});
+    data->Mesh->SlotPropertyBlocks.assign(materials.size(), MaterialPropertyBlock{});
+    data->Mesh->SlotPropertyBlockTexturePaths.assign(materials.size(), {});
+    data->Mesh->material.reset();
+    data->Mesh->ShowBackfaces = false;
+
     for (size_t i = 0; i < materials.size(); ++i) {
         const auto& mat = materials[i];
-        
-        // Create the actual PBR material
-        std::shared_ptr<PBRMaterial> pbrMat;
-        if (skinned) {
-            pbrMat = std::make_shared<SkinnedPBRMaterial>("RuntimeMaterial", program);
-        } else {
-            pbrMat = std::make_shared<PBRMaterial>("RuntimeMaterial", program);
-        }
-        
-        // Set material properties
-        pbrMat->SetMetallic(mat.metallic);
-        pbrMat->SetRoughness(mat.roughness);
-        pbrMat->SetNormalScale(mat.normalScale);
-        pbrMat->SetAmbientOcclusion(mat.aoStrength);
-        
-        // Set color tint if not identity
-        if (mat.tint != glm::vec4(1.0f)) {
-            pbrMat->SetUniform("u_ColorTint", mat.tint);
-        }
-        
-        // Load textures from resolved paths
-        if (mat.albedoGuid.high != 0 || mat.albedoGuid.low != 0) {
-            std::string path = resolver->GetPathForGUID(mat.albedoGuid);
-            if (!path.empty()) {
-                pbrMat->SetAlbedoTextureFromPath(path);
-            }
-        }
-        if (mat.normalGuid.high != 0 || mat.normalGuid.low != 0) {
-            std::string path = resolver->GetPathForGUID(mat.normalGuid);
-            if (!path.empty()) {
-                pbrMat->SetNormalTextureFromPath(path);
-            }
-        }
-        if (mat.metallicRoughnessGuid.high != 0 || mat.metallicRoughnessGuid.low != 0) {
-            std::string path = resolver->GetPathForGUID(mat.metallicRoughnessGuid);
-            if (!path.empty()) {
-                pbrMat->SetMetallicRoughnessTextureFromPath(path);
-            }
-        }
-        if (mat.aoGuid.high != 0 || mat.aoGuid.low != 0) {
-            std::string path = resolver->GetPathForGUID(mat.aoGuid);
-            if (!path.empty()) {
-                pbrMat->SetAmbientOcclusionTextureFromPath(path);
-            }
-        }
-        if (mat.emissionGuid.high != 0 || mat.emissionGuid.low != 0) {
-            std::string path = resolver->GetPathForGUID(mat.emissionGuid);
-            if (!path.empty()) {
-                pbrMat->SetEmissionTextureFromPath(path);
-            }
-        }
-        if (mat.displacementGuid.high != 0 || mat.displacementGuid.low != 0) {
-            std::string path = resolver->GetPathForGUID(mat.displacementGuid);
-            if (!path.empty()) {
-                pbrMat->SetDisplacementTextureFromPath(path);
-            }
-        }
-        
-        // Set alpha blend state
-        if (mat.alphaBlend && !mat.alphaCutout) {
-            pbrMat->m_StateFlags = pbrMat->GetStateFlags() | BGFX_STATE_BLEND_ALPHA;
-        }
-        
-        // Set two-sided (disable culling)
-        if (mat.twoSided) {
-            pbrMat->m_StateFlags = pbrMat->GetStateFlags() & ~(BGFX_STATE_CULL_CW | BGFX_STATE_CULL_CCW);
-        } else {
+
+        std::shared_ptr<Material> sharedMaterial =
+            CreateSharedRuntimeMaterial(scene, mat, resolver, skinned);
+        data->Mesh->materials[i] = sharedMaterial;
+        data->Mesh->MaterialSlotNames[i] =
+            mat.name.empty() ? (std::string("Slot ") + std::to_string(i)) : mat.name;
+        data->Mesh->OwnedMaterialSlots[i] =
+            !IsEquivalentMaterialShared(sharedMaterial);
+
+        MaterialSource source = CaptureMaterialSource(sharedMaterial);
+        source.Name = data->Mesh->MaterialSlotNames[i];
+        source.Skinned = skinned;
+        source.AlphaBlend = mat.alphaBlend;
+        source.AlphaCutout = mat.alphaCutout;
+        source.AlphaCutoutThreshold = mat.alphaCutoutThreshold;
+        source.TwoSided = mat.twoSided;
+        source.HasTint = mat.hasTint || mat.tint != glm::vec4(1.0f);
+        source.ColorTint = mat.tint;
+        data->Mesh->MaterialSources[i] = source;
+
+        if (!mat.twoSided) {
             allSlotsTwoSided = false;
         }
-        
-        // Apply alpha cutout threshold (uses u_PBRScalar1.y)
-        if (mat.alphaCutout) {
-            float emissionStrength = 0.0f;
-            if (pbrMat) {
-                emissionStrength = pbrMat->GetEmissionStrength();
-            }
-            pbrMat->SetUniform("u_PBRScalar1", glm::vec4(emissionStrength, mat.alphaCutoutThreshold, 0.0f, 0.0f));
-        }
-        
-        // Store in materials vector
-        data->Mesh->materials[i] = pbrMat;
-        data->Mesh->MaterialSlotNames[i] = mat.name.empty() ? (std::string("Slot ") + std::to_string(i)) : mat.name;
-        
-        // Set primary material if this is slot 0
-        if (i == 0 && !data->Mesh->material) {
-            data->Mesh->material = pbrMat;
-        }
     }
-    if (allSlotsTwoSided) {
-        data->Mesh->ShowBackfaces = true;
+
+    if (!data->Mesh->materials.empty() && data->Mesh->materials[0]) {
+        data->Mesh->material = data->Mesh->materials[0];
     }
+    data->Mesh->ShowBackfaces = allSlotsTwoSided;
+    data->Mesh->UniqueMaterial = std::any_of(
+        data->Mesh->OwnedMaterialSlots.begin(),
+        data->Mesh->OwnedMaterialSlots.end(),
+        [](bool owned) { return owned; });
     
     std::cout << "[RuntimeModelInstantiator] Created " << materials.size() 
               << " materials for entity '" << data->Name << "'" << std::endl;

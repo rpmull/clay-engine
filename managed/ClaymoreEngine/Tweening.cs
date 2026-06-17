@@ -728,6 +728,12 @@ namespace ClaymoreEngine
 
         public static bool IsComponentAlive(ComponentBase? component)
             => component != null && IsEntityAlive(component.Entity.EntityID);
+
+        public static bool IsMaterialAlive(Material? material)
+            => material != null &&
+               material.Entity.IsValid &&
+               IsEntityAlive(material.Entity.EntityID) &&
+               material.IsValid;
     }
 
     internal static class TweenMath
@@ -1094,6 +1100,107 @@ namespace ClaymoreEngine
                 .SetTargetEntity(entityId)
                 .SetTargetAlivePredicate(() => TweenGuards.IsComponentAlive(material))
                 .SetReplaceKey((entityId, $"Material.Slot.{slot}.Vector4.{propertyName}"));
+        }
+    }
+
+    public static class MaterialSlotTweenExtensions
+    {
+        public static TweenHandle TweenUVOffset(this Material material, Vector2 targetOffset, float duration, Tween.Easing easing = Tween.Easing.Linear)
+        {
+            if (!TweenGuards.IsMaterialAlive(material))
+                return new NoOpTweenHandle();
+
+            int entityId = material.Entity.EntityID;
+            int slotIndex = material.SlotIndex;
+            return Tween.To(() => material.UVOffset, value => material.UVOffset = value, targetOffset, duration)
+                .SetEase(easing)
+                .SetTargetEntity(entityId)
+                .SetTargetAlivePredicate(() => TweenGuards.IsMaterialAlive(material))
+                .SetReplaceKey((entityId, $"Material.Slot.{slotIndex}.UVTransform"));
+        }
+
+        public static TweenHandle TweenUVScale(this Material material, Vector2 targetScale, float duration, Tween.Easing easing = Tween.Easing.Linear)
+        {
+            if (!TweenGuards.IsMaterialAlive(material))
+                return new NoOpTweenHandle();
+
+            int entityId = material.Entity.EntityID;
+            int slotIndex = material.SlotIndex;
+            return Tween.To(() => material.UVScale, value => material.UVScale = value, targetScale, duration)
+                .SetEase(easing)
+                .SetTargetEntity(entityId)
+                .SetTargetAlivePredicate(() => TweenGuards.IsMaterialAlive(material))
+                .SetReplaceKey((entityId, $"Material.Slot.{slotIndex}.UVTransform"));
+        }
+    }
+
+    public static class BlendShapeTweenExtensions
+    {
+        public static TweenHandle TweenWeight(this BlendShapeComponent blendShape, string shapeName, float targetWeight, float duration, Tween.Easing easing = Tween.Easing.Linear)
+        {
+            if (!TweenGuards.IsComponentAlive(blendShape) || string.IsNullOrWhiteSpace(shapeName) || !HasShape(blendShape, shapeName))
+                return new NoOpTweenHandle();
+
+            int entityId = blendShape.Entity.EntityID;
+            return Tween.To(() => blendShape.GetWeight(shapeName), value => blendShape.SetWeight(shapeName, value), targetWeight, duration)
+                .SetEase(easing)
+                .SetTargetEntity(entityId)
+                .SetTargetAlivePredicate(() => TweenGuards.IsComponentAlive(blendShape))
+                .SetReplaceKey((entityId, $"BlendShape.{shapeName}"));
+        }
+
+        private static bool HasShape(BlendShapeComponent blendShape, string shapeName)
+        {
+            foreach (string candidate in blendShape.GetShapeNames())
+            {
+                if (string.Equals(candidate, shapeName, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+
+            return false;
+        }
+    }
+
+    public static class UnifiedMorphTweenExtensions
+    {
+        public static TweenHandle TweenWeight(this UnifiedMorphComponent morph, string shapeName, float targetWeight, float duration, Tween.Easing easing = Tween.Easing.Linear)
+        {
+            if (!TryFindMorphIndex(morph, shapeName, out int index))
+                return new NoOpTweenHandle();
+
+            return TweenWeight(morph, index, targetWeight, duration, easing);
+        }
+
+        public static TweenHandle TweenWeight(this UnifiedMorphComponent morph, int index, float targetWeight, float duration, Tween.Easing easing = Tween.Easing.Linear)
+        {
+            if (!TweenGuards.IsComponentAlive(morph) || index < 0 || index >= morph.Count)
+                return new NoOpTweenHandle();
+
+            int entityId = morph.Entity.EntityID;
+            return Tween.To(() => morph.GetWeight(index), value => morph.SetUnifiedMorphByIndex(index, value), targetWeight, duration)
+                .SetEase(easing)
+                .SetTargetEntity(entityId)
+                .SetTargetAlivePredicate(() => TweenGuards.IsComponentAlive(morph))
+                .SetReplaceKey((entityId, $"UnifiedMorph.{index}"));
+        }
+
+        public static bool TryFindMorphIndex(this UnifiedMorphComponent morph, string shapeName, out int index)
+        {
+            index = -1;
+            if (!TweenGuards.IsComponentAlive(morph) || string.IsNullOrWhiteSpace(shapeName))
+                return false;
+
+            int count = morph.Count;
+            for (int i = 0; i < count; i++)
+            {
+                if (string.Equals(morph.GetName(i), shapeName, StringComparison.OrdinalIgnoreCase))
+                {
+                    index = i;
+                    return true;
+                }
+            }
+
+            return false;
         }
     }
 }

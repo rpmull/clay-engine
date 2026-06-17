@@ -7,6 +7,7 @@
 #include "core/ecs/UIComponents.h"
 #include "core/ecs/AnimationComponents.h"
 #include "core/physics/Physics.h"
+#include "core/physics/PhysicsLayerManager.h"
 #include "core/physics/area/AreaSystem.h"
 #include "core/animation/AnimationPlayerComponent.h"
 #include "core/animation/AnimatorRuntime.h"
@@ -14,6 +15,7 @@
 #include "core/animation/AnimatorControllerOverrideIO.h"
 #include "core/animation/AnimationAssetCache.h"
 #include "core/animation/AvatarMask.h"
+#include "core/managed/ScriptSystem.h"
 #include "core/assets/IAssetResolver.h"
 #include "core/rendering/PBRMaterial.h"
 #include "core/rendering/RuntimeShaderGraphMaterial.h"
@@ -55,6 +57,30 @@ namespace {
         thread_local int s_CurrentBuffer = 0;
         s_CurrentBuffer = (s_CurrentBuffer + 1) % kNumStringBuffers;
         return s_Buffers[s_CurrentBuffer];
+    }
+
+    bool ScriptClassMatches(const std::string& storedClassName, const char* requestedClassName)
+    {
+        if (!requestedClassName || !*requestedClassName) {
+            return false;
+        }
+
+        if (storedClassName == requestedClassName) {
+            return true;
+        }
+
+        const std::string requested(requestedClassName);
+        const size_t storedSeparator = storedClassName.find_last_of(".+");
+        const size_t requestedSeparator = requested.find_last_of(".+");
+        if (storedSeparator != std::string::npos && requestedSeparator != std::string::npos) {
+            return false;
+        }
+
+        const std::string storedSimple =
+            storedClassName.substr(storedSeparator == std::string::npos ? 0 : storedSeparator + 1);
+        const std::string requestedSimple =
+            requested.substr(requestedSeparator == std::string::npos ? 0 : requestedSeparator + 1);
+        return storedSimple == requestedSimple;
     }
 
     glm::ivec2 ComputeSuggestedWorldSpaceUICanvasSize(const EntityData* data)
@@ -402,6 +428,36 @@ namespace {
         return material;
     }
 
+    void CanonicalizeManagedMaterialSlot(EntityData& data, size_t slot)
+    {
+        if (!data.Mesh) {
+            return;
+        }
+
+        MeshComponent& mesh = *data.Mesh;
+        EnsureMaterialSlotStorage(mesh, slot);
+
+        std::shared_ptr<Material> material = TryGetManagedMaterialSlot(data, slot);
+        if (!material) {
+            SyncPrimaryMaterialReference(mesh);
+            SyncUniqueMaterialFlag(mesh);
+            return;
+        }
+
+        ClearSerializedMaterialSlotCache(mesh, slot);
+        if (slot < mesh.MaterialSources.size()) {
+            mesh.MaterialSources[slot] = CaptureMaterialSource(material);
+        }
+
+        material = AcquireEquivalentMaterial(material);
+        mesh.materials[slot] = material;
+        mesh.OwnedMaterialSlots[slot] =
+            !GetMaterialEquivalenceKey(material.get()).EquivalentSafe;
+
+        SyncUniqueMaterialFlag(mesh);
+        SyncPrimaryMaterialReference(mesh);
+    }
+
     ManagedMaterialKind GetManagedMaterialKind(const std::shared_ptr<Material>& material);
 
     bool IsCustomManagedMaterial(const std::shared_ptr<Material>& material)
@@ -495,7 +551,8 @@ namespace {
             glm::vec4 value(0.0f);
             if (pbr->TryGetUniform("u_psxParams", value) ||
                 pbr->TryGetUniform("u_psxWorld", value) ||
-                pbr->TryGetUniform("u_toonParams", value)) {
+                pbr->TryGetUniform("u_toonParams", value) ||
+                pbr->TryGetUniform("u_psxEmission", value)) {
                 return ManagedMaterialKind::PSX;
             }
             return ManagedMaterialKind::PBR;
@@ -758,6 +815,7 @@ namespace {
 using HasComponent_fn = bool(*)(int, const char*);
 using AddComponent_fn = void(*)(int, const char*);
 using RemoveComponent_fn = void(*)(int, const char*);
+using AddScript_fn = void(*)(int, const char*);
 
 using GetLightType_fn = int(*)(int);
 using SetLightType_fn = void(*)(int, int);
@@ -774,6 +832,7 @@ using GetRigidBodyUseGravity_fn = bool(*)(int);
 using SetRigidBodyUseGravity_fn = void(*)(int, bool);
 using GetRigidBodyCollisionMask_fn = uint32_t(*)(int);
 using SetRigidBodyCollisionMask_fn = void(*)(int, uint32_t);
+using SetRigidBodyPhysicsLayer_fn = bool(*)(int, const char*);
 using GetRigidBodyLinearVelocity_fn = void(*)(int, float*, float*, float*);
 using SetRigidBodyLinearVelocity_fn = void(*)(int, float, float, float);
 using GetRigidBodyAngularVelocity_fn = void(*)(int, float*, float*, float*);
@@ -822,6 +881,8 @@ using CC_GetVerticalVelocity_fn = float(*)(int);
 using CC_Jump_fn = void(*)(int, float);
 using CC_IsGrounded_fn = bool(*)(int);
 using CC_SetPosition_fn = void(*)(int, float, float, float);
+using CC_GetCollisionMask_fn = uint32_t(*)(int);
+using CC_SetCollisionMask_fn = void(*)(int, uint32_t);
 
 using GetCameraLayerMask_fn = unsigned int(*)(int);
 using SetCameraLayerMask_fn = void(*)(int, unsigned int);
@@ -1003,6 +1064,7 @@ ManagedLog_fn ManagedLogPtr = &ManagedLog;
 HasComponent_fn HasComponentPtr = &HasComponent;
 AddComponent_fn AddComponentPtr = &AddComponent;
 RemoveComponent_fn RemoveComponentPtr = &RemoveComponent;
+AddScript_fn AddScriptPtr = &AddScript;
 
 GetLightType_fn GetLightTypePtr = &GetLightType;
 SetLightType_fn SetLightTypePtr = &SetLightType;
@@ -1019,6 +1081,7 @@ GetRigidBodyUseGravity_fn GetRigidBodyUseGravityPtr = &GetRigidBodyUseGravity;
 SetRigidBodyUseGravity_fn SetRigidBodyUseGravityPtr = &SetRigidBodyUseGravity;
 GetRigidBodyCollisionMask_fn GetRigidBodyCollisionMaskPtr = &GetRigidBodyCollisionMask;
 SetRigidBodyCollisionMask_fn SetRigidBodyCollisionMaskPtr = &SetRigidBodyCollisionMask;
+SetRigidBodyPhysicsLayer_fn SetRigidBodyPhysicsLayerPtr = &SetRigidBodyPhysicsLayer;
 GetRigidBodyLinearVelocity_fn GetRigidBodyLinearVelocityPtr = &GetRigidBodyLinearVelocity;
 SetRigidBodyLinearVelocity_fn SetRigidBodyLinearVelocityPtr = &SetRigidBodyLinearVelocity;
 GetRigidBodyAngularVelocity_fn GetRigidBodyAngularVelocityPtr = &GetRigidBodyAngularVelocity;
@@ -1083,6 +1146,8 @@ CC_GetVerticalVelocity_fn CC_GetVerticalVelocityPtr = &CC_GetVerticalVelocity;
 CC_Jump_fn CC_JumpPtr = &CC_Jump;
 CC_IsGrounded_fn CC_IsGroundedPtr = &CC_IsGrounded;
 CC_SetPosition_fn CC_SetPositionPtr = &CC_SetPosition;
+CC_GetCollisionMask_fn CC_GetCollisionMaskPtr = &CC_GetCollisionMask;
+CC_SetCollisionMask_fn CC_SetCollisionMaskPtr = &CC_SetCollisionMask;
 
 GetCameraLayerMask_fn GetCameraLayerMaskPtr = &GetCameraLayerMask;
 SetCameraLayerMask_fn SetCameraLayerMaskPtr = &SetCameraLayerMask;
@@ -2717,16 +2782,32 @@ static void Material_SetMaterialVector4Slot(int entityId, int slot, const char* 
     if (!data || !data->Mesh || slot < 0 || !propertyName) return;
 
     const size_t slotIndex = static_cast<size_t>(slot);
+    const glm::vec4 value(x, y, z, w);
+
+    // No-op short circuit: if the slot's current material already holds this
+    // exact value, skip the editable-clone + canonicalize round trip. Scripts
+    // that re-apply the same value every frame previously cloned a material
+    // (fresh bgfx uniform handles) and re-hashed it on every call.
+    {
+        auto existing = TryGetManagedMaterialSlot(*data, slotIndex);
+        if (existing && !ShouldUseManagedSlotPropertyBlockOverride(existing)) {
+            glm::vec4 current(0.0f);
+            if (TryGetMaterialVector4(existing, propertyName, current) && current == value) {
+                return;
+            }
+        }
+    }
+
     auto material = EnsureEditableManagedMaterialSlot(*data, slotIndex);
     if (!material) {
         return;
     }
 
-    const glm::vec4 value(x, y, z, w);
     SetMaterialVector4Value(material, propertyName, value);
     if (IsCustomManagedMaterial(material)) {
         SetManagedSlotVectorOverride(*data->Mesh, slotIndex, propertyName, value);
     }
+    CanonicalizeManagedMaterialSlot(*data, slotIndex);
 }
 
 static void Material_GetMaterialVector4Slot(int entityId, int slot, const char* propertyName, float* x, float* y, float* z, float* w) {
@@ -2800,6 +2881,7 @@ static void Material_SetMaterialTexturePathSlot(int entityId, int slot, const ch
     if (IsCustomManagedMaterial(material) || !appliedToMaterial) {
         SetManagedSlotTextureOverride(*data->Mesh, slotIndex, propertyName, normalizedPath);
     }
+    CanonicalizeManagedMaterialSlot(*data, slotIndex);
 }
 
 static const char* Material_GetMaterialTexturePathSlot(int entityId, int slot, const char* propertyName) {
@@ -2858,7 +2940,15 @@ static void Material_SetPbrScalarSlot(int entityId, int slot, int scalarProperty
     auto* data = Scene::Get().GetEntityData(entityId);
     if (!data || !data->Mesh || slot < 0) return;
 
-    auto material = EnsureEditableManagedMaterialSlot(*data, static_cast<size_t>(slot));
+    const size_t slotIndex = static_cast<size_t>(slot);
+
+    // No-op short circuit: avoid clone + canonicalize when nothing changes.
+    if (Material_GetPbrScalarSlot(entityId, slot, scalarProperty) == value &&
+        std::dynamic_pointer_cast<PBRMaterial>(TryGetManagedMaterialSlot(*data, slotIndex))) {
+        return;
+    }
+
+    auto material = EnsureEditableManagedMaterialSlot(*data, slotIndex);
     auto pbr = std::dynamic_pointer_cast<PBRMaterial>(material);
     if (!pbr) {
         return;
@@ -2886,6 +2976,8 @@ static void Material_SetPbrScalarSlot(int entityId, int slot, int scalarProperty
     default:
         break;
     }
+
+    CanonicalizeManagedMaterialSlot(*data, slotIndex);
 }
 
 static void Material_GetPbrEmissionColorSlot(int entityId, int slot, float* x, float* y, float* z) {
@@ -2911,13 +3003,24 @@ static void Material_SetPbrEmissionColorSlot(int entityId, int slot, float x, fl
     auto* data = Scene::Get().GetEntityData(entityId);
     if (!data || !data->Mesh || slot < 0) return;
 
-    auto material = EnsureEditableManagedMaterialSlot(*data, static_cast<size_t>(slot));
+    const size_t slotIndex = static_cast<size_t>(slot);
+
+    // No-op short circuit: avoid clone + canonicalize when nothing changes.
+    if (auto existingPbr = std::dynamic_pointer_cast<PBRMaterial>(
+            TryGetManagedMaterialSlot(*data, slotIndex))) {
+        if (existingPbr->GetEmissionColor() == glm::vec3(x, y, z)) {
+            return;
+        }
+    }
+
+    auto material = EnsureEditableManagedMaterialSlot(*data, slotIndex);
     auto pbr = std::dynamic_pointer_cast<PBRMaterial>(material);
     if (!pbr) {
         return;
     }
 
     pbr->SetEmissionColor(glm::vec3(x, y, z));
+    CanonicalizeManagedMaterialSlot(*data, slotIndex);
 }
 
 static void Material_GetPbrUVTransformSlot(int entityId, int slot, float* scaleX, float* scaleY, float* offsetX, float* offsetY) {
@@ -2946,13 +3049,25 @@ static void Material_SetPbrUVTransformSlot(int entityId, int slot, float scaleX,
     auto* data = Scene::Get().GetEntityData(entityId);
     if (!data || !data->Mesh || slot < 0) return;
 
-    auto material = EnsureEditableManagedMaterialSlot(*data, static_cast<size_t>(slot));
+    const size_t slotIndex = static_cast<size_t>(slot);
+
+    // No-op short circuit: avoid clone + canonicalize when nothing changes.
+    if (auto existingPbr = std::dynamic_pointer_cast<PBRMaterial>(
+            TryGetManagedMaterialSlot(*data, slotIndex))) {
+        if (existingPbr->GetUVScale() == glm::vec2(scaleX, scaleY) &&
+            existingPbr->GetUVOffset() == glm::vec2(offsetX, offsetY)) {
+            return;
+        }
+    }
+
+    auto material = EnsureEditableManagedMaterialSlot(*data, slotIndex);
     auto pbr = std::dynamic_pointer_cast<PBRMaterial>(material);
     if (!pbr) {
         return;
     }
 
     pbr->SetUVTransform(glm::vec2(scaleX, scaleY), glm::vec2(offsetX, offsetY));
+    CanonicalizeManagedMaterialSlot(*data, slotIndex);
 }
 
 static bool Material_GetPbrReceiveShadowsOverrideSlot(int entityId, int slot) {
@@ -2968,13 +3083,24 @@ static void Material_SetPbrReceiveShadowsOverrideSlot(int entityId, int slot, bo
     auto* data = Scene::Get().GetEntityData(entityId);
     if (!data || !data->Mesh || slot < 0) return;
 
-    auto material = EnsureEditableManagedMaterialSlot(*data, static_cast<size_t>(slot));
+    const size_t slotIndex = static_cast<size_t>(slot);
+
+    // No-op short circuit: avoid clone + canonicalize when nothing changes.
+    if (auto existingPbr = std::dynamic_pointer_cast<PBRMaterial>(
+            TryGetManagedMaterialSlot(*data, slotIndex))) {
+        if (existingPbr->GetReceiveShadowsOverride() == value) {
+            return;
+        }
+    }
+
+    auto material = EnsureEditableManagedMaterialSlot(*data, slotIndex);
     auto pbr = std::dynamic_pointer_cast<PBRMaterial>(material);
     if (!pbr) {
         return;
     }
 
     pbr->SetReceiveShadowsOverride(value);
+    CanonicalizeManagedMaterialSlot(*data, slotIndex);
 }
 
 static bool Material_GetPbrReceiveShadowsSlot(int entityId, int slot) {
@@ -2990,13 +3116,24 @@ static void Material_SetPbrReceiveShadowsSlot(int entityId, int slot, bool value
     auto* data = Scene::Get().GetEntityData(entityId);
     if (!data || !data->Mesh || slot < 0) return;
 
-    auto material = EnsureEditableManagedMaterialSlot(*data, static_cast<size_t>(slot));
+    const size_t slotIndex = static_cast<size_t>(slot);
+
+    // No-op short circuit: avoid clone + canonicalize when nothing changes.
+    if (auto existingPbr = std::dynamic_pointer_cast<PBRMaterial>(
+            TryGetManagedMaterialSlot(*data, slotIndex))) {
+        if (existingPbr->GetReceiveShadows() == value) {
+            return;
+        }
+    }
+
+    auto material = EnsureEditableManagedMaterialSlot(*data, slotIndex);
     auto pbr = std::dynamic_pointer_cast<PBRMaterial>(material);
     if (!pbr) {
         return;
     }
 
     pbr->SetReceiveShadows(value);
+    CanonicalizeManagedMaterialSlot(*data, slotIndex);
 }
 
 // Function pointers for material interop
@@ -3805,6 +3942,40 @@ extern "C"
         }
     }
 
+    __declspec(dllexport) void AddScript(int entityID, const char* className)
+    {
+        auto& scene = Scene::Get();
+        auto* data = scene.GetEntityData(entityID);
+        if (!data || !className || !*className) {
+            return;
+        }
+
+        for (const ScriptInstance& script : data->Scripts) {
+            if (ScriptClassMatches(script.ClassName, className)) {
+                return;
+            }
+        }
+
+        std::shared_ptr<ScriptComponent> created = ScriptSystem::Instance().Create(className);
+        if (!created) {
+            std::cerr << "[ComponentInterop] Failed to create script '" << className
+                      << "' for entity " << entityID << "\n";
+            return;
+        }
+
+        ScriptInstance instance;
+        instance.ClassName = className;
+        instance.Instance = created;
+        data->Scripts.push_back(std::move(instance));
+        scene.MarkEntityStructureDirty(entityID);
+
+        if (scene.m_IsPlaying) {
+            Entity entity(entityID, &scene);
+            created->OnBind(entity);
+            created->OnCreate(entity);
+        }
+    }
+
     __declspec(dllexport) void RemoveComponent(int entityID, const char* componentName)
     {
         auto& scene = Scene::Get();
@@ -4075,6 +4246,51 @@ extern "C"
             bodyInterface.InvalidateContactCache(data->RigidBody->BodyID);
             bodyInterface.ActivateBody(data->RigidBody->BodyID);
         }
+    }
+
+    // Sets the physics layer (by name) of an entity's physics body. Updates the
+    // collider AND the rigid/static body components together so their inspector
+    // layer dropdowns stay matched, and applies the change to the live Jolt body
+    // so raycast/spherecast/contact filtering takes effect immediately.
+    __declspec(dllexport) bool SetRigidBodyPhysicsLayer(int entityID, const char* layerName)
+    {
+        if (!layerName) return false;
+        auto* data = Scene::Get().GetEntityData(entityID);
+        if (!data) return false;
+
+        const int32_t index = PhysicsLayers::PhysicsLayerManager::Get().GetLayerIndex(layerName);
+        if (index < 0) {
+            std::cerr << "[ComponentInterop] SetRigidBodyPhysicsLayer: unknown physics layer '"
+                      << layerName << "'\n";
+            return false;
+        }
+        const uint32_t layerIndex = static_cast<uint32_t>(index);
+        const std::string name = layerName;
+
+        bool applied = false;
+
+        if (data->Collider) {
+            data->Collider->PhysicsLayer = layerIndex;
+            data->Collider->PhysicsLayerName = name;
+            applied = true;
+        }
+        if (data->RigidBody) {
+            data->RigidBody->PhysicsLayer = layerIndex;
+            data->RigidBody->PhysicsLayerName = name;
+            if (!data->RigidBody->BodyID.IsInvalid()) {
+                Physics::SetBodyLayer(data->RigidBody->BodyID, layerIndex);
+            }
+            applied = true;
+        }
+        if (data->StaticBody) {
+            data->StaticBody->PhysicsLayer = layerIndex;
+            data->StaticBody->PhysicsLayerName = name;
+            if (!data->StaticBody->BodyID.IsInvalid()) {
+                Physics::SetBodyLayer(data->StaticBody->BodyID, layerIndex);
+            }
+            applied = true;
+        }
+        return applied;
     }
 
     __declspec(dllexport) void Collider_GetOffset(int entityID, float* x, float* y, float* z)
@@ -4930,6 +5146,22 @@ extern "C"
         }
     }
 
+    __declspec(dllexport) uint32_t CC_GetCollisionMask(int entityID)
+    {
+        auto* data = Scene::Get().GetEntityData(entityID);
+        if (!data || !data->CharacterController) return 0xFFFFFFFFu;
+        return data->CharacterController->CollisionMask;
+    }
+
+    __declspec(dllexport) void CC_SetCollisionMask(int entityID, uint32_t collisionMask)
+    {
+        auto* data = Scene::Get().GetEntityData(entityID);
+        if (!data || !data->CharacterController) return;
+        // Applied each frame through the CharacterControllerBodyFilter during ExtendedUpdate,
+        // so simply updating the field is sufficient.
+        data->CharacterController->CollisionMask = collisionMask;
+    }
+
     // --- CameraComponent ---
     __declspec(dllexport) unsigned int GetCameraLayerMask(int entityID)
     {
@@ -5569,15 +5801,11 @@ extern "C"
     // --- Animator / AnimationPlayer ---
     __declspec(dllexport) void Animator_SetBool(int entityID, const char* name, bool value)
     {
-        std::cout << "[Animator_SetBool] Called with entityID=" << entityID 
-                  << ", name=" << (name ? name : "NULL") 
-                  << ", value=" << (value ? "true" : "false") << std::endl;
         auto* data = Scene::Get().GetEntityData(entityID);
-        if (!data) { std::cout << "[Animator_SetBool] data is null!" << std::endl; return; }
-        if (!data->AnimationPlayer) { std::cout << "[Animator_SetBool] AnimationPlayer is null!" << std::endl; return; }
-        if (!name) { std::cout << "[Animator_SetBool] name is null!" << std::endl; return; }
+        if (!data) { return; }
+        if (!data->AnimationPlayer) { return; }
+        if (!name) { return; }
         data->AnimationPlayer->AnimatorInstance.SetBool(name, value);
-        std::cout << "[Animator_SetBool] Successfully set " << name << " = " << (value ? "true" : "false") << std::endl;
     }
 
     __declspec(dllexport) void Animator_SetInt(int entityID, const char* name, int value)
@@ -6166,6 +6394,56 @@ extern "C"
         if (!data || !data->AnimationPlayer) return "";
         auto& buf = GetRotatingStringBuffer();
         buf = data->AnimationPlayer->Debug_CurrentControllerStateName;
+        return buf.c_str();
+    }
+
+    __declspec(dllexport) const char* Animator_GetPreviousStateName(int entityID)
+    {
+        auto* data = Scene::Get().GetEntityData(entityID);
+        if (!data || !data->AnimationPlayer) return "";
+        auto& buf = GetRotatingStringBuffer();
+        buf = data->AnimationPlayer->Debug_PreviousControllerStateName;
+        return buf.c_str();
+    }
+
+    // Predict the next base-layer (layer 0) state given the current state and
+    // current parameter/trigger values. Mirrors the exact runtime selection logic
+    // used by AnimationSystem so editor play mode and exported runtime agree.
+    //
+    // Semantics:
+    //  - If a crossfade is already in flight, report its committed target state.
+    //  - Otherwise evaluate transitions exactly as the runtime would this frame.
+    //  - If no transition qualifies (state loops or simply has no pending exit),
+    //    return the current state name (i.e. "self"). Never returns null/empty
+    //    unless the entity has no animator/controller/current state.
+    __declspec(dllexport) const char* Animator_GetNextStateName(int entityID)
+    {
+        auto& buf = GetRotatingStringBuffer();
+        buf.clear();
+        auto* data = Scene::Get().GetEntityData(entityID);
+        if (!data || !data->AnimationPlayer) return buf.c_str();
+        auto& player = *data->AnimationPlayer;
+        if (!player.Controller) return buf.c_str();
+
+        auto& anim = player.AnimatorInstance;
+
+        int nextId = -1;
+        const auto& pb = anim.Playback();
+        if (anim.IsCrossfading() && pb.NextStateId >= 0) {
+            // A transition is mid-flight; its committed target is the next state.
+            nextId = pb.NextStateId;
+        } else {
+            // Evaluate transitions from the current state using current params/triggers.
+            // This is non-destructive (does not consume triggers).
+            nextId = anim.ChooseNextState();
+        }
+
+        // No qualifying transition -> the controller stays in (loops back to) the
+        // current state. Report self so callers can hook the active state safely.
+        if (nextId < 0) nextId = player.CurrentStateId;
+
+        const auto* st = player.Controller->FindStateInLayer(0, nextId);
+        if (st) buf = st->Name;
         return buf.c_str();
     }
 

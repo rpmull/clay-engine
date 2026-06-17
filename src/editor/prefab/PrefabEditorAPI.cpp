@@ -551,7 +551,8 @@ bool FinalizeSavedPrefabFromScene(
         std::cerr << "[PrefabEditor] Failed to rebuild prefab binary for: "
                   << prefabPath << "\n";
     }
-    runtime::RuntimePrefabInstantiator::ResetRuntimeCaches();
+    runtime::RuntimePrefabInstantiator::InvalidateCache(prefabPath);
+    runtime::RuntimePrefabInstantiator::InvalidateCache(BinaryAssetCache::Instance().GetBinaryPath(prefabPath));
 
     std::vector<EntityID> subtree;
     std::unordered_set<EntityID> visited;
@@ -1232,7 +1233,7 @@ PrefabDiagnostics ValidatePrefab(const PrefabAsset& prefab) {
 
 PrefabDiagnostics ValidatePrefabFile(const std::string& path) {
     PrefabAsset asset;
-    if (!PrefabIO::LoadPrefab(path, asset)) {
+    if (!PrefabIO::LoadPrefabSource(path, asset)) {
         PrefabDiagnostics diag;
         diag.Errors.push_back("Failed to load prefab file: " + path);
         return diag;

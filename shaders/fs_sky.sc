@@ -7,7 +7,8 @@ SAMPLERCUBE(s_skybox, 0);
 
 // u_skyParams.x = use procedural sky
 // u_skyParams.y = use cubemap skybox
-// u_skyParams.z = apply gamma (linear -> sRGB) on output
+// u_skyParams.z = max cubemap mip level
+// u_skyParams.w = apply gamma (linear -> sRGB) on output
 uniform vec4 u_skyParams;
 
 uniform vec4 u_cameraPos;
@@ -108,7 +109,7 @@ void main()
     }
 
     // Optional gamma encode to sRGB if requested.
-    if (u_skyParams.z > 0.5)
+    if (u_skyParams.w > 0.5)
     {
         baseColor = linearToSrgb(baseColor);
     }

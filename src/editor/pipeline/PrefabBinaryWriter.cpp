@@ -72,6 +72,16 @@ bool PrefabBinaryWriter::WriteFromScene(Scene& scene, EntityID rootId, std::vect
     // Collect all entities under root (including root)
     std::vector<EntityID> entityIds;
     std::unordered_map<EntityID, uint32_t> entityIndexMap;
+    std::unordered_map<EntityID, std::vector<EntityID>> childrenByParent;
+    for (const auto& entity : scene.GetEntities()) {
+        const EntityID id = entity.GetID();
+        const EntityData* data = scene.GetEntityData(id);
+        if (!data || data->Parent == INVALID_ENTITY_ID) {
+            continue;
+        }
+        childrenByParent[data->Parent].push_back(id);
+    }
+    size_t repairedChildLinks = 0;
     
     // Recursively collect entities
     // CRITICAL: Use both Children array AND parent relationship to ensure no children are missed
@@ -91,25 +101,23 @@ bool PrefabBinaryWriter::WriteFromScene(Scene& scene, EntityID rootId, std::vect
             collectEntities(childId);
         }
         
-        // DEFENSIVE: Also check all entities to find any that have this as parent
-        // This catches cases where Children might not be properly maintained
-        for (const auto& entity : scene.GetEntities()) {
-            EntityID otherId = entity.GetID();
-            if (otherId == id) continue; // Skip self
-            if (entityIndexMap.find(otherId) != entityIndexMap.end()) continue; // Already collected
-            
-            const EntityData* otherData = scene.GetEntityData(otherId);
-            if (otherData && otherData->Parent == id) {
-                // Found a child that wasn't in Children array - collect it
-                std::cerr << "[PrefabBinaryWriter] Warning: Entity '" << otherData->Name 
-                          << "' (id=" << otherId << ") has parent " << id 
-                          << " but wasn't in parent's Children array. Collecting anyway.\n";
-                collectEntities(otherId);
+        auto fallbackIt = childrenByParent.find(id);
+        if (fallbackIt != childrenByParent.end()) {
+            for (EntityID childId : fallbackIt->second) {
+                if (entityIndexMap.find(childId) != entityIndexMap.end()) {
+                    continue;
+                }
+                ++repairedChildLinks;
+                collectEntities(childId);
             }
         }
     };
     
     collectEntities(rootId);
+    if (repairedChildLinks > 0) {
+        std::cerr << "[PrefabBinaryWriter] Recovered " << repairedChildLinks
+                  << " child links from Parent fields while writing prefab.\n";
+    }
     
     if (entityIds.empty()) {
         std::cerr << "[PrefabBinaryWriter] No entities to write\n";
@@ -186,13 +194,6 @@ bool PrefabBinaryWriter::WriteFromScene(Scene& scene, EntityID rootId, std::vect
         // Get components for this entity
         auto components = GetEntityComponents(data);
         header.componentCount = static_cast<uint32_t>(components.size());
-        
-        // Debug: Log component count
-        std::cout << "[PrefabBinaryWriter] Entity '" << data->Name << "' has " << components.size() << " components: ";
-        for (auto typeId : components) {
-            std::cout << static_cast<int>(typeId) << " ";
-        }
-        std::cout << std::endl;
         
         // Write each component
         for (ComponentTypeId typeId : components) {

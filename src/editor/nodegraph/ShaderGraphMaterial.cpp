@@ -3,7 +3,9 @@
 #include "ShaderGraphCodeGen.h"
 #include "core/rendering/MaterialCache.h"
 #include "core/rendering/ShaderManager.h"
+#include "core/rendering/TextureSamplerFlags.h"
 #include "core/rendering/TextureLoader.h"
+#include "core/ecs/Scene.h"
 #include "core/vfs/FileSystem.h"
 #include "ui/Logger.h"
 #include <nlohmann/json.hpp>
@@ -603,6 +605,8 @@ void ShaderGraphMaterial::BindUniforms() const {
     
     // Bind all parameters
     int textureUnit = 0;
+    const uint32_t samplerFlags =
+        cm::rendering::GetTextureSamplerFlags(Scene::Get().GetEnvironment());
     for (const auto& param : m_Parameters) {
         if (param.type == ShaderValueType::Texture2D) {
             if (!bgfx::isValid(param.uniformHandle)) {
@@ -614,7 +618,7 @@ void ShaderGraphMaterial::BindUniforms() const {
                 ? param.textureHandle
                 : GetFallbackTextureForParameter(param.name);
             if (bgfx::isValid(texture)) {
-                bgfx::setTexture(slot, param.uniformHandle, texture);
+                bgfx::setTexture(slot, param.uniformHandle, texture, samplerFlags);
             }
         } else {
             // Uniform binding

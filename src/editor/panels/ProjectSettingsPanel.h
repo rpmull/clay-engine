@@ -17,6 +17,7 @@ private:
     void DrawPhysicsLayersTab();
     void DrawGameCursorTab();
     void DrawAppearanceTab();
+    void DrawViewportTab();
     
     // Cursor preview texture handle
     bgfx::TextureHandle m_CursorPreviewTex = BGFX_INVALID_HANDLE;

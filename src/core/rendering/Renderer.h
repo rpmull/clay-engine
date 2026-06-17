@@ -4,6 +4,7 @@
 #include <memory>
 #include <array>
 #include <string>
+#include <vector>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -38,10 +39,12 @@ struct LightData {
     glm::vec3 color;
     glm::vec3 position;
     glm::vec3 direction;
-    float range;           // For point lights
+    float range;
     float constant;        // Attenuation constant
     float linear;          // Attenuation linear
     float quadratic;       // Attenuation quadratic
+    float spotInnerCos = 1.0f;
+    float spotOuterCos = 1.0f;
 };
 
 class Renderer {
@@ -78,7 +81,9 @@ public:
     bool ShouldUseGpuMorphTargets(const SkinningComponent* skinning, const Mesh* mesh, const BlendShapeComponent* blendShapes) const;
     bool CanUseGpuMaterializedSkinning(const SkinningComponent* skinning, const Mesh* mesh, const BlendShapeComponent* blendShapes) const;
     void Resize(uint32_t width, uint32_t height);
-    void SetRenderToOffscreen(bool enable) { m_RenderToOffscreen = enable; }
+    void SetRenderToOffscreen(bool enable);
+    void SetPresentOffscreenToBackbuffer(bool enable) { m_PresentOffscreenToBackbuffer = enable; }
+    void SetSceneRenderResolution(uint32_t width, uint32_t height);
     
     // Text rendering defaults
     void SetDefaultTextFont(const std::string& fontPath, float basePixelSize = 48.0f);
@@ -115,6 +120,8 @@ public:
     // Viewport info
     int GetWidth() const { return m_Width; }
     int GetHeight() const { return m_Height; }
+    int GetBackbufferWidth() const { return m_BackbufferWidth; }
+    int GetBackbufferHeight() const { return m_BackbufferHeight; }
     bgfx::TextureHandle GetSceneTexture() const { return m_SceneTexture; }
     // Render any scene into a temporary texture using a dedicated offscreen view.
     // The provided camera is used for this render only and does not affect the main viewport.
@@ -151,7 +158,12 @@ public:
     // Shadows (directional)
     void InitShadowResources(uint32_t resolution);
     void ShutdownShadowResources();
-    void RenderShadowMap(class Scene& scene, const Camera* camera);
+    void RenderShadowMap(
+        class Scene& scene,
+        const Camera* camera,
+        const std::vector<uint8_t>* skinnedShadowMainViewSkipMask = nullptr,
+        uint64_t precomputedSkinnedShadowMainViewCulled = 0,
+        uint64_t precomputedSkinnedShadowOffscreenSkipped = 0);
     void BindShadowUniforms();
     
     // Re-bind the cached lighting uniforms (lights + environment) for external systems
@@ -205,6 +217,8 @@ public:
     void DestroyTerrainTextureArrays();
 
 private:
+    void RefreshCachedFallbackTextures();
+
     struct SkinningBindCacheState {
         const SkinningComponent* skinning = nullptr;
         uint32_t atlasUploadSerial = 0;
@@ -223,6 +237,8 @@ private:
     bgfx::TextureHandle m_SceneTexture = BGFX_INVALID_HANDLE;
     bgfx::TextureHandle m_SceneDepthTexture = BGFX_INVALID_HANDLE;
     bgfx::TextureFormat::Enum m_SceneDepthFormat = bgfx::TextureFormat::D24S8;
+    uint32_t m_BackbufferWidth = 0;
+    uint32_t m_BackbufferHeight = 0;
 
     float m_view[16]{};
     float m_proj[16]{};
@@ -230,12 +246,14 @@ private:
     // Multi-light uniforms (support up to 4 lights)
     bgfx::UniformHandle u_LightColors = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_LightPositions = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle u_LightDirections = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_LightParams = BGFX_INVALID_HANDLE;
-	    bgfx::UniformHandle u_cameraPos = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle u_LightSpotParams = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle u_cameraPos = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_AmbientFog   = BGFX_INVALID_HANDLE; // xyz=color/intensity, w=flags
     bgfx::UniformHandle u_FogParams    = BGFX_INVALID_HANDLE; // x=fogDensity, y=unused
     // Sky uniforms
-    bgfx::UniformHandle u_SkyParams    = BGFX_INVALID_HANDLE;  // x=eval procedural, y=sample cubemap, z=apply gamma
+    bgfx::UniformHandle u_SkyParams    = BGFX_INVALID_HANDLE;  // x=procedural sky, y=skybox available, z=max skybox mip, w=sky-pass gamma
     bgfx::UniformHandle u_SkyTopColor  = BGFX_INVALID_HANDLE;  // Zenith color (rgb)
     bgfx::UniformHandle u_SkyHorizonColor = BGFX_INVALID_HANDLE; // Horizon color (rgb)
     bgfx::UniformHandle u_GroundColor  = BGFX_INVALID_HANDLE;  // Ground color (rgb)
@@ -253,6 +271,7 @@ private:
     bgfx::UniformHandle u_DebugColor = BGFX_INVALID_HANDLE;
     bgfx::ProgramHandle m_OutlineProgram = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_outlineColor = BGFX_INVALID_HANDLE;
+    bgfx::ProgramHandle m_PresentProgram = BGFX_INVALID_HANDLE;
 
     // Outline/mask resources
     bgfx::TextureHandle m_VisMaskTex = BGFX_INVALID_HANDLE;
@@ -319,6 +338,7 @@ private:
     bgfx::TextureHandle m_TerrainFallbackAlbedo = BGFX_INVALID_HANDLE;
     bgfx::TextureHandle m_TerrainFallbackNormal = BGFX_INVALID_HANDLE;
     bgfx::TextureHandle m_TerrainFallbackHole = BGFX_INVALID_HANDLE;
+    uint64_t m_CachedFallbackTextureGeneration = 0;
     // Per-terrain texture arrays (rebuilt when layers/resolution change)
     bgfx::TextureHandle m_TerrainAlbedoArrayTex = BGFX_INVALID_HANDLE;
     bgfx::TextureHandle m_TerrainNormalArrayTex = BGFX_INVALID_HANDLE;
@@ -385,6 +405,14 @@ private:
     std::unordered_set<uint16_t> m_UISceneCaptureViewIds;
     std::unordered_map<EntityID, uint16_t> m_UIWorldCanvasViewIds;
     uint16_t m_NextUISceneCaptureViewId = 60;
+
+    // Supersample context for world-space canvas offscreen rendering. While a
+    // world canvas is rendered, m_WorldCanvasSupersample > 1 scales UI layout and
+    // text atlas sizes up uniformly (via getCanvasScale) so the magnified quad
+    // stays crisp; the logical dimensions are the pre-supersample canvas size.
+    float m_WorldCanvasSupersample = 1.0f;
+    uint32_t m_WorldCanvasLogicalWidth = 0;
+    uint32_t m_WorldCanvasLogicalHeight = 0;
 
     // When true, views 0/1/2 render to the offscreen scene framebuffer; otherwise, they render directly to the backbuffer
     bool m_RenderToOffscreen = true;
@@ -477,6 +505,7 @@ public:
     bgfx::VertexBufferHandle m_FullscreenVB = BGFX_INVALID_HANDLE;
     bgfx::IndexBufferHandle  m_FullscreenIB = BGFX_INVALID_HANDLE;
     bool m_EditorLightingOverride = false;
+    bool m_PresentOffscreenToBackbuffer = false;
 
     bool ShouldApplyEditorLightingOverride(const Scene& scene) const;
     
@@ -645,6 +674,9 @@ public:
     void DrawShadowDebugOverlay(const Camera* camera);
     void EnsureFullscreenTriangle();
     void DestroyFullscreenTriangle();
+    void RecreateSceneTargets(uint32_t width, uint32_t height);
+    void ApplySceneRenderPolicy(const Scene& scene);
+    void SubmitScenePresentPass();
 
     // ========================================================================
     // PERFORMANCE: Scratch buffers for RenderScene to eliminate per-frame allocations

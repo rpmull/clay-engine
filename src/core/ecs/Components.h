@@ -219,13 +219,17 @@ struct MeshProxyComponent {
 //----------------------------------------------------------------------
 enum class LightType {
    Directional,
-   Point
+   Point,
+   Spot
    };
 
 struct LightComponent {
    LightType Type = LightType::Directional;
    glm::vec3 Color = { 1.0f, 1.0f, 1.0f };
    float Intensity = 1.0f;
+   float Range = 50.0f;
+   float SpotInnerAngleDegrees = 20.0f;
+   float SpotOuterAngleDegrees = 30.0f;
    // Point-light shadow opt-in (directional shadows remain environment-driven).
    bool PointShadowsEnabled = false;
 
@@ -235,7 +239,7 @@ struct LightComponent {
       : Type(type), Color(color), Intensity(intensity) {
       }
    // For directional: use rotation from TransformComponent
-   // For point: use position from TransformComponent
+   // For point/spot: use position from TransformComponent
    };
 
 
@@ -552,6 +556,11 @@ struct CharacterControllerComponent {
    // Physics layer (index 0-31, name stored for serialization)
    uint32_t PhysicsLayer = 1; // Default to "Player" layer (index 1)
    std::string PhysicsLayerName = "Player";
+
+   // Collision mask: which physics layers this character is allowed to collide with.
+   // Bit i corresponds to physics layer index i. Mirrors RigidBodyComponent::CollisionMask.
+   // Default: collide with everything.
+   uint32_t CollisionMask = 0xFFFFFFFFu;
 
    // Movement / navigation
    glm::vec3 DesiredVelocity = glm::vec3(0.0f);

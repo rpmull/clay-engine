@@ -435,31 +435,178 @@ static PropertyValue CoercePropertyValueToType(const PropertyValue& value, Prope
    return GetDefaultPropertyValue(type);
    }
 
+static thread_local int g_ScriptPropertyCommitSuppressionDepth = 0;
+
+struct ScopedScriptPropertyCommitSuppression
+   {
+   ScopedScriptPropertyCommitSuppression() { ++g_ScriptPropertyCommitSuppressionDepth; }
+   ~ScopedScriptPropertyCommitSuppression() { --g_ScriptPropertyCommitSuppressionDepth; }
+   };
+
+static bool IsScriptPropertyCommitSuppressed()
+   {
+   return g_ScriptPropertyCommitSuppressionDepth > 0;
+   }
+
+static PropertyInfo BuildListElementSchema(const PropertyInfo& property)
+   {
+   PropertyInfo element;
+   element.type = property.listElementType;
+   element.defaultValue = GetDefaultPropertyValue(property.listElementType);
+   element.currentValue = element.defaultValue;
+   element.auxTypeName = property.listElementTypeName;
+   element.enumMeta = property.enumMeta;
+   element.structFields = property.structFields;
+   element.populateFromResources = property.populateFromResources;
+   element.selectFromResources = property.selectFromResources;
+   return element;
+   }
+
+static PropertyValue CreateDefaultValueFromPropertyInfo(const PropertyInfo& property)
+   {
+   if (property.type == PropertyType::Enum)
+      {
+      if (std::holds_alternative<int>(property.defaultValue))
+         {
+         return property.defaultValue;
+         }
+      if (!property.enumMeta.values.empty())
+         {
+         return property.enumMeta.values.front();
+         }
+      return 0;
+      }
+
+   if (property.type == PropertyType::Struct)
+      {
+      auto structPtr = std::make_shared<StructPropertyValue>();
+      structPtr->typeName = property.auxTypeName;
+      for (const auto& field : property.structFields)
+         {
+         structPtr->fields.emplace_back(field.name, CreateDefaultValueFromPropertyInfo(field));
+         }
+      return structPtr;
+      }
+
+   if (property.type == PropertyType::List)
+      {
+      auto listPtr = std::make_shared<ListPropertyValue>();
+      listPtr->elementType = property.listElementType;
+      listPtr->elementTypeName = property.listElementTypeName;
+      return listPtr;
+      }
+
+   PropertyValue coercedDefault = CoercePropertyValueToType(property.defaultValue, property.type);
+   if (std::holds_alternative<std::string>(coercedDefault) &&
+       property.type != PropertyType::String &&
+       property.type != PropertyType::Prefab &&
+       property.type != PropertyType::ClayObject &&
+       property.type != PropertyType::Mesh &&
+       property.type != PropertyType::DialogueLibrary &&
+       property.type != PropertyType::AnimatorController &&
+       property.type != PropertyType::AnimatorControllerOverride &&
+       property.type != PropertyType::Texture &&
+       property.type != PropertyType::Audio)
+      {
+      return GetDefaultPropertyValue(property.type);
+      }
+
+   return coercedDefault;
+   }
+
+static void NormalizePropertyValueAgainstSchema(PropertyValue& value, const PropertyInfo& schema);
+
+static void NormalizeStructPropertyFields(std::shared_ptr<StructPropertyValue>& structPtr, const PropertyInfo& schema)
+   {
+   if (!structPtr)
+      {
+      structPtr = std::make_shared<StructPropertyValue>();
+      }
+
+   if (!schema.auxTypeName.empty())
+      {
+      structPtr->typeName = schema.auxTypeName;
+      }
+
+   std::vector<std::pair<std::string, PropertyValue>> normalizedFields;
+   normalizedFields.reserve(schema.structFields.size() + structPtr->fields.size());
+   std::unordered_set<std::string> consumed;
+
+   for (const auto& fieldSchema : schema.structFields)
+      {
+      PropertyValue fieldValue = CreateDefaultValueFromPropertyInfo(fieldSchema);
+      auto it = std::find_if(structPtr->fields.begin(), structPtr->fields.end(),
+         [&](const auto& field) { return field.first == fieldSchema.name; });
+      if (it != structPtr->fields.end())
+         {
+         fieldValue = it->second;
+         }
+
+      NormalizePropertyValueAgainstSchema(fieldValue, fieldSchema);
+      normalizedFields.emplace_back(fieldSchema.name, std::move(fieldValue));
+      consumed.insert(fieldSchema.name);
+      }
+
+   for (const auto& field : structPtr->fields)
+      {
+      if (consumed.find(field.first) == consumed.end())
+         {
+         normalizedFields.push_back(field);
+         }
+      }
+
+   structPtr->fields = std::move(normalizedFields);
+   }
+
+static void NormalizePropertyValueAgainstSchema(PropertyValue& value, const PropertyInfo& schema)
+   {
+   value = CoercePropertyValueToType(value, schema.type);
+
+   switch (schema.type)
+      {
+      case PropertyType::Struct:
+         {
+         auto structPtr = std::get<std::shared_ptr<StructPropertyValue>>(value);
+         NormalizeStructPropertyFields(structPtr, schema);
+         value = structPtr;
+         break;
+         }
+      case PropertyType::List:
+         {
+         auto listPtr = std::get<std::shared_ptr<ListPropertyValue>>(value);
+         if (!listPtr)
+            {
+            listPtr = std::make_shared<ListPropertyValue>();
+            }
+
+         listPtr->elementType = schema.listElementType;
+         if (!schema.listElementTypeName.empty())
+            {
+            listPtr->elementTypeName = schema.listElementTypeName;
+            }
+
+         PropertyInfo elementSchema = BuildListElementSchema(schema);
+         for (PropertyValue& element : listPtr->elements)
+            {
+            NormalizePropertyValueAgainstSchema(element, elementSchema);
+            }
+
+         value = listPtr;
+         break;
+         }
+      default:
+         break;
+      }
+   }
+
 static void NormalizeListPropertyElements(PropertyInfo& property)
    {
-   if (property.type != PropertyType::List ||
-       !std::holds_alternative<std::shared_ptr<ListPropertyValue>>(property.currentValue))
+   if (property.type != PropertyType::List)
       {
       return;
       }
 
-   auto listPtr = std::get<std::shared_ptr<ListPropertyValue>>(property.currentValue);
-   if (!listPtr)
-      {
-      listPtr = std::make_shared<ListPropertyValue>();
-      property.currentValue = listPtr;
-      }
-
-   listPtr->elementType = property.listElementType;
-   if (listPtr->elementTypeName.empty())
-      {
-      listPtr->elementTypeName = property.listElementTypeName;
-      }
-
-   for (PropertyValue& element : listPtr->elements)
-      {
-      element = CoercePropertyValueToType(element, property.listElementType);
-      }
+   NormalizePropertyValueAgainstSchema(property.currentValue, property);
    }
 
 // Recursively propagate a layer value to all descendants of an entity
@@ -1126,7 +1273,7 @@ void InspectorPanel::DrawInspectorContents() {
                   ImGui::Checkbox("Auto-refresh (expensive)", &s_autoRefresh);
 
                   if (doRefresh || rootChanged || (s_autoRefresh && m_Context)) {
-                     PrefabAsset base; bool baseLoaded = PrefabIO::LoadPrefab(full.string(), base);
+                     PrefabAsset base; bool baseLoaded = PrefabIO::LoadPrefabSource(full.string(), base);
                      if (baseLoaded) {
                         s_cachedOverrides = prefab_editor::ComputeOverrides(base, *m_Context, prefabRoot);
                         s_haveCache = true;
@@ -4369,14 +4516,17 @@ void InspectorPanel::DrawComponents(EntityID entity) {
          s_options.push_back({ "Skinned PBR", "<builtin:SkinnedPBR>", true });
          s_options.push_back({ "PSX", "<builtin:PSX>", true });
          s_options.push_back({ "Skinned PSX", "<builtin:SkinnedPSX>", true });
-         const auto& materialAssets = ui::GetProjectAssetEntries(ui::MakeExtensionQuery({ ".mat", ".sgmat" }));
+         const auto& materialAssets = ui::GetProjectAssetEntries(ui::MakeExtensionQuery({ ".mat", ".sgmat", ".shgraph" }));
          for (const ui::ProjectAssetEntry& asset : materialAssets) {
-            const bool shaderGraphMaterial = asset.extensionLower == ".sgmat";
-            s_options.push_back({
-               shaderGraphMaterial ? "[SG] " + asset.name : asset.name,
-               asset.absolutePath,
-               false
-            });
+            std::string label;
+            if (asset.extensionLower == ".sgmat") {
+               label = "[SG] " + asset.name;          // saved shader-graph material asset
+            } else if (asset.extensionLower == ".shgraph") {
+               label = "[Graph] " + asset.name;       // raw shader graph, used directly as a material
+            } else {
+               label = asset.name;
+            }
+            s_options.push_back({ label, asset.absolutePath, false });
          }
 
          // Ensure materials array is initialized (only modify once to avoid layout recalculation)
@@ -4448,6 +4598,14 @@ void InspectorPanel::DrawComponents(EntityID entity) {
                            if (shadergraph::LoadShaderGraphMaterial(s_options[i].path, sgDesc)) {
                               newMat = shadergraph::ShaderGraphMaterial::CreateFromDesc(sgDesc);
                            }
+                        } else if (matExt == ".shgraph") {
+                           // Assign a shader graph directly: build a material that
+                           // references the graph; it compiles on demand and
+                           // serializes by its graph path like any .sgmat.
+                           shadergraph::ShaderGraphMaterialDesc sgDesc;
+                           sgDesc.shaderGraphPath = s_options[i].path;
+                           sgDesc.name = std::filesystem::path(s_options[i].path).stem().string();
+                           newMat = shadergraph::ShaderGraphMaterial::CreateFromDesc(sgDesc);
                         } else {
                            MaterialAssetDesc desc; if (LoadMaterialAsset(s_options[i].path, desc)) newMat = CreateMaterialFromAsset(desc);
                         }
@@ -4516,10 +4674,34 @@ void InspectorPanel::DrawComponents(EntityID entity) {
             }
          }
 
+         // Shadow casting override (entity-level)
+         {
+            ImGui::Separator();
+            ImGui::TextDisabled("Shadows");
+            bool castShadows = (!data->RenderOverrides) || data->RenderOverrides->CastShadows;
+            if (ImGui::Checkbox("Cast Shadows", &castShadows)) {
+               if (!data->RenderOverrides) {
+                  data->RenderOverrides = std::make_unique<RenderOverridesComponent>();
+               }
+               data->RenderOverrides->CastShadows = castShadows;
+               if (m_Context) {
+                  m_Context->NotifyComponentChanged(entity, cm::world::RuntimeDirtyBits::RenderBinding);
+               }
+            }
+            if (ImGui::IsItemHovered()) {
+               ImGui::SetTooltip("When off, this mesh is excluded from the shadow map: it won't block\nlight or cast shadows onto other meshes (e.g. a roof under a fill light).");
+            }
+         }
+
          std::shared_ptr<Material> baseMat = (!meshComp->materials.empty() ? meshComp->materials[0] : meshComp->material);
          if (baseMat) {
             std::string n = baseMat->GetName();
-            bool isPSX = (n == "PSX" || n == "SkinnedPSX");
+            // Detect PSX materials by their uniforms (robust against renamed or
+            // cloned materials like "PSX_Clone"), with a name check as fallback.
+            glm::vec4 psxProbe(0.0f);
+            bool isPSX = baseMat->TryGetUniform("u_psxParams", psxProbe) ||
+                         baseMat->TryGetUniform("u_toonParams", psxProbe) ||
+                         n.find("PSX") != std::string::npos;
             
             // Check if it's a ShaderGraphMaterial
             auto sgMat = std::dynamic_pointer_cast<shadergraph::ShaderGraphMaterial>(baseMat);
@@ -4676,7 +4858,8 @@ void InspectorPanel::DrawComponents(EntityID entity) {
                   changed |= ImGui::SliderFloat("Override Jitter (px)", &jitterPB, 0.0f, 4.0f, "%.1f");
                   changed |= ImGui::SliderFloat("Override Affine", &affinePB, 0.0f, 1.0f, "%.2f");
                   changed |= ImGui::SliderFloat("Override Light Influence", &lightInfPB, 0.0f, 1.0f, "%.2f");
-                  if (changed) meshComp->PropertyBlock.SetVector("u_psxParams", glm::vec4(jitterPB, affinePB, lightInfPB, 0.0f));
+                  // Preserve w (normal perturb) so this UI doesn't wipe overrides set elsewhere
+                  if (changed) meshComp->PropertyBlock.SetVector("u_psxParams", glm::vec4(jitterPB, affinePB, lightInfPB, pbPsx.w));
 
                   glm::vec4 pbToon(3.0f, 1.0f, 0.0f, 0.0f);
                   auto it2 = meshComp->PropertyBlock.Vec4Uniforms.find("u_toonParams");
@@ -4686,7 +4869,22 @@ void InspectorPanel::DrawComponents(EntityID entity) {
                   bool changedToon = false;
                   changedToon |= ImGui::SliderFloat("Override Shadow Bands", &bandsPB, 1.0f, 8.0f, "%.0f");
                   changedToon |= ImGui::SliderFloat("Override Smoothness", &bandSoftPB, 0.0f, 1.0f, "%.2f");
-                  if (changedToon) meshComp->PropertyBlock.SetVector("u_toonParams", glm::vec4(bandsPB, bandSoftPB, 0.0f, 0.0f));
+                  if (changedToon) meshComp->PropertyBlock.SetVector("u_toonParams", glm::vec4(bandsPB, bandSoftPB, pbToon.z, pbToon.w));
+
+                  // Emission (u_psxEmission: xyz=color, w=strength)
+                  glm::vec4 pbEmission(1.0f, 1.0f, 1.0f, 0.0f);
+                  if (baseMat) baseMat->TryGetUniform("u_psxEmission", pbEmission);
+                  auto it3 = meshComp->PropertyBlock.Vec4Uniforms.find("u_psxEmission");
+                  if (it3 != meshComp->PropertyBlock.Vec4Uniforms.end()) pbEmission = it3->second;
+                  glm::vec3 emissionColor(pbEmission.x, pbEmission.y, pbEmission.z);
+                  float emissionStrength = pbEmission.w;
+                  bool changedEmission = false;
+                  changedEmission |= ImGui::ColorEdit3("Emission Color", &emissionColor.x, ImGuiColorEditFlags_Float);
+                  changedEmission |= ImGui::SliderFloat("Emission Strength", &emissionStrength, 0.0f, 10.0f, "%.2f");
+                  if (changedEmission) {
+                     meshComp->PropertyBlock.SetVector("u_psxEmission",
+                        glm::vec4(emissionColor, std::max(emissionStrength, 0.0f)));
+                  }
                   }
                }
             }
@@ -6618,7 +6816,29 @@ void InspectorPanel::DrawScriptComponent(const ScriptInstance& script, int index
             if (auto managed = std::dynamic_pointer_cast<ManagedScriptComponent>(script.Instance))
                scriptHandle = managed->GetHandle();
             }
+         // Group serializable-struct leaf fields ("parent.leaf") under a collapsible header.
+         std::string currentStructGroup;
+         bool structGroupOpen = false;
+         bool structGroupActive = false;
          for (auto& property : properties) {
+            // Open/close the struct group when the dotted prefix changes.
+            std::string structPrefix;
+            {
+               size_t dotPos = property.name.find('.');
+               if (dotPos != std::string::npos) structPrefix = property.name.substr(0, dotPos);
+            }
+            if (structPrefix != currentStructGroup) {
+               if (structGroupOpen) { ImGui::TreePop(); structGroupOpen = false; }
+               currentStructGroup = structPrefix;
+               structGroupActive = !structPrefix.empty();
+               if (structGroupActive) {
+                  structGroupOpen = ImGui::TreeNodeEx(PrettifyLabel(structPrefix).c_str(),
+                     ImGuiTreeNodeFlags_DefaultOpen);
+               }
+            }
+            if (structGroupActive && !structGroupOpen) {
+               continue; // group collapsed: skip its leaf fields
+            }
             // When scene is playing, read current value from runtime script instance
             // This allows inspector to reflect runtime changes (e.g., state machine enum changes)
             // Falls back to serialized data if runtime read fails or scene not playing
@@ -6711,6 +6931,7 @@ void InspectorPanel::DrawScriptComponent(const ScriptInstance& script, int index
             // After drawing, if a modification happened the DrawScriptProperty will write back via SetManagedField
             // and we'll persist below when updated is true.
             }
+         if (structGroupOpen) { ImGui::TreePop(); }
          }
       else {
          ImGui::Text("No exposed properties");
@@ -6725,7 +6946,14 @@ void InspectorPanel::DrawScriptComponent(const ScriptInstance& script, int index
 void InspectorPanel::DrawScriptProperty(PropertyInfo& property, void* scriptHandle, const std::string& className, EntityID entityID) {
    ImGui::PushID(property.name.c_str());
    bool updated = false;
-   const std::string pretty = PrettifyLabel(property.name);
+   // For nested struct leaves ("parent.leaf"), show just the leaf in the label;
+   // the parent is shown as the enclosing group header.
+   std::string labelSource = property.name;
+   {
+      size_t dotPos = labelSource.rfind('.');
+      if (dotPos != std::string::npos) labelSource = labelSource.substr(dotPos + 1);
+   }
+   const std::string pretty = PrettifyLabel(labelSource);
 
    switch (property.type) {
       case PropertyType::Int: {
@@ -7240,12 +7468,15 @@ void InspectorPanel::DrawScriptProperty(PropertyInfo& property, void* scriptHand
          // Draw elements
          for (size_t i = 0; i < listPtr->elements.size(); ++i) {
             ImGui::PushID(static_cast<int>(i));
-            
-            // Element row layout: [Label] [Field-----------------] [X]
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextDisabled("Element %zu", i);
-            ImGui::SameLine(indentWidth + labelWidth);
-            ImGui::SetNextItemWidth(fieldWidth);
+
+            const bool isStructElement = property.listElementType == PropertyType::Struct;
+            if (!isStructElement) {
+               // Element row layout: [Label] [Field-----------------] [X]
+               ImGui::AlignTextToFramePadding();
+               ImGui::TextDisabled("Element %zu", i);
+               ImGui::SameLine(indentWidth + labelWidth);
+               ImGui::SetNextItemWidth(fieldWidth);
+            }
             
             // Draw element based on type
             switch (property.listElementType) {
@@ -7598,19 +7829,48 @@ void InspectorPanel::DrawScriptProperty(PropertyInfo& property, void* scriptHand
                   }
                   break;
                }
+               case PropertyType::Struct: {
+                  PropertyInfo elementSchema = BuildListElementSchema(property);
+                  elementSchema.name = pretty + " " + std::to_string(i + 1);
+                  elementSchema.currentValue = listPtr->elements[i];
+                  elementSchema.defaultValue = CreateDefaultValueFromPropertyInfo(elementSchema);
+
+                  const std::string beforeSerialized = ScriptReflection::PropertyValueToString(listPtr->elements[i]);
+                  {
+                     ScopedScriptPropertyCommitSuppression suppressCommit;
+                     DrawScriptProperty(elementSchema, nullptr, className, entityID);
+                  }
+
+                  listPtr->elements[i] = elementSchema.currentValue;
+                  if (beforeSerialized != ScriptReflection::PropertyValueToString(elementSchema.currentValue)) {
+                     updated = true;
+                  }
+
+                  ImGui::Indent(20.0f);
+                  ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.2f, 0.2f, 0.6f));
+                  ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.7f, 0.3f, 0.3f, 0.8f));
+                  if (ImGui::Button("Remove", ImVec2(72.0f, 0))) {
+                     toRemove = static_cast<int>(i);
+                  }
+                  ImGui::PopStyleColor(2);
+                  ImGui::Unindent(20.0f);
+                  break;
+               }
                default:
                   ImGui::TextDisabled("Unsupported");
                   break;
             }
             
-            // Remove button (individual element)
-            ImGui::SameLine(0, 4);
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.2f, 0.2f, 0.6f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.7f, 0.3f, 0.3f, 0.8f));
-            if (ImGui::Button("x", ImVec2(removeButtonWidth, 0))) {
-               toRemove = static_cast<int>(i);
+            if (!isStructElement) {
+               // Remove button (individual element)
+               ImGui::SameLine(0, 4);
+               ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.2f, 0.2f, 0.6f));
+               ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.7f, 0.3f, 0.3f, 0.8f));
+               if (ImGui::Button("x", ImVec2(removeButtonWidth, 0))) {
+                  toRemove = static_cast<int>(i);
+               }
+               ImGui::PopStyleColor(2);
             }
-            ImGui::PopStyleColor(2);
             
             ImGui::PopID();
          }
@@ -7641,7 +7901,7 @@ void InspectorPanel::DrawScriptProperty(PropertyInfo& property, void* scriptHand
                case PropertyType::Bool: newElem = false; break;
                case PropertyType::String: newElem = std::string(); break;
                case PropertyType::Vector3: newElem = glm::vec3(0.0f); break;
-               case PropertyType::Enum: newElem = 0; break;
+               case PropertyType::Enum: newElem = property.enumMeta.values.empty() ? PropertyValue{0} : PropertyValue{property.enumMeta.values.front()}; break;
                case PropertyType::Entity: newElem = -1; break; // Unassigned entity
                case PropertyType::ClayObject: newElem = std::string(); break; // Empty GUID
                case PropertyType::DialogueLibrary: newElem = std::string(); break; // Empty GUID
@@ -7649,6 +7909,7 @@ void InspectorPanel::DrawScriptProperty(PropertyInfo& property, void* scriptHand
                case PropertyType::AnimatorControllerOverride: newElem = std::string(); break;
                case PropertyType::Texture: newElem = std::string(); break;
                case PropertyType::Audio: newElem = std::string(); break;
+               case PropertyType::Struct: newElem = CreateDefaultValueFromPropertyInfo(BuildListElementSchema(property)); break;
                default: newElem = 0; break;
             }
             listPtr->elements.push_back(newElem);
@@ -7669,17 +7930,40 @@ void InspectorPanel::DrawScriptProperty(PropertyInfo& property, void* scriptHand
       }
       
       case PropertyType::Struct: {
-      // Expandable struct with nested fields
+      NormalizePropertyValueAgainstSchema(property.currentValue, property);
       auto structPtr = std::get<std::shared_ptr<StructPropertyValue>>(property.currentValue);
       if (!structPtr) {
          structPtr = std::make_shared<StructPropertyValue>();
          property.currentValue = structPtr;
       }
-      
+
       if (ImGui::TreeNode(pretty.c_str())) {
-         for (auto& subProp : property.structFields) {
-            DrawScriptProperty(subProp, scriptHandle, className, entityID);
+         ScopedScriptPropertyCommitSuppression suppressCommit;
+
+         if (property.structFields.empty()) {
+            ImGui::TextDisabled("No struct metadata available.");
          }
+
+         for (const auto& schemaField : property.structFields) {
+            auto fieldIt = std::find_if(structPtr->fields.begin(), structPtr->fields.end(),
+               [&](const auto& field) { return field.first == schemaField.name; });
+            if (fieldIt == structPtr->fields.end()) {
+               structPtr->fields.emplace_back(schemaField.name, CreateDefaultValueFromPropertyInfo(schemaField));
+               fieldIt = structPtr->fields.end();
+               --fieldIt;
+            }
+
+            PropertyInfo childProperty = schemaField;
+            childProperty.currentValue = fieldIt->second;
+
+            const std::string beforeSerialized = ScriptReflection::PropertyValueToString(fieldIt->second);
+            DrawScriptProperty(childProperty, nullptr, className, entityID);
+            fieldIt->second = childProperty.currentValue;
+            if (beforeSerialized != ScriptReflection::PropertyValueToString(childProperty.currentValue)) {
+               updated = true;
+            }
+         }
+
          ImGui::TreePop();
       }
       break;
@@ -8090,7 +8374,7 @@ void InspectorPanel::DrawScriptProperty(PropertyInfo& property, void* scriptHand
       break;
       }
       }
-   if (updated)
+   if (updated && !IsScriptPropertyCommitSuppressed())
       {
       // Persist change into the entity's per-script overrides
       if (m_Context && m_SelectedEntity && *m_SelectedEntity != -1) {
@@ -8614,6 +8898,24 @@ void InspectorPanel::DrawModelOverridesSection(EntityID entity, EntityData& data
     ImGui::Unindent(8.0f);
 }
 
+namespace {
+// True if two presets carry identical override values (identity fields ignored).
+bool PresetOverridesEqual(const MeshMaterialPreset& a, const MeshMaterialPreset& b)
+{
+   return a.OverrideAlbedo == b.OverrideAlbedo && a.AlbedoPath == b.AlbedoPath
+       && a.OverrideNormal == b.OverrideNormal && a.NormalPath == b.NormalPath
+       && a.OverrideMetallicRoughness == b.OverrideMetallicRoughness && a.MetallicRoughnessPath == b.MetallicRoughnessPath
+       && a.OverrideAO == b.OverrideAO && a.AOPath == b.AOPath
+       && a.OverrideEmission == b.OverrideEmission && a.EmissionPath == b.EmissionPath
+       && a.OverrideDisplacement == b.OverrideDisplacement && a.DisplacementPath == b.DisplacementPath
+       && a.OverrideTint == b.OverrideTint && a.ColorTint == b.ColorTint
+       && a.OverrideAlphaBlend == b.OverrideAlphaBlend && a.AlphaBlend == b.AlphaBlend
+       && a.AlphaCutout == b.AlphaCutout && a.AlphaCutoutThreshold == b.AlphaCutoutThreshold
+       && a.OverrideTwoSided == b.OverrideTwoSided && a.TwoSided == b.TwoSided
+       && a.UseCustomMaterial == b.UseCustomMaterial && a.MaterialAssetPath == b.MaterialAssetPath;
+}
+} // namespace
+
 void InspectorPanel::DrawModelInspector()
 {
    namespace fs = std::filesystem;
@@ -8669,80 +8971,178 @@ void InspectorPanel::DrawModelInspector()
    ImGuiStorage* storage = ImGui::GetStateStorage();
    ImGuiID meshSelectId = ImGui::GetID("##ModelInspectorMeshSelect");
    ImGuiID slotSelectId = ImGui::GetID("##ModelInspectorSlotSelect");
-   
-   int selectedMeshIdx = storage->GetInt(meshSelectId, 0);
-   int selectedSlot = storage->GetInt(slotSelectId, 0);
-   
-   // Clamp selection
-   if (selectedMeshIdx >= (int)m_ModelMeshes.size()) selectedMeshIdx = 0;
-   const ModelMeshInfo& selectedMesh = m_ModelMeshes[selectedMeshIdx];
-   if (selectedSlot >= selectedMesh.materialSlotCount) selectedSlot = 0;
-   
-   // Mesh dropdown
-   std::string meshLabel = selectedMesh.name;
-   if (selectedMesh.skinned) meshLabel += " (Skinned)";
-   
-   if (ImGui::BeginCombo("Mesh", meshLabel.c_str()))
-   {
-      for (int i = 0; i < (int)m_ModelMeshes.size(); ++i)
-      {
-         std::string label = m_ModelMeshes[i].name;
-         if (m_ModelMeshes[i].skinned) label += " (Skinned)";
-         bool isSelected = (i == selectedMeshIdx);
-         if (ImGui::Selectable(label.c_str(), isSelected))
-         {
-            selectedMeshIdx = i;
-            storage->SetInt(meshSelectId, i);
-            selectedSlot = 0;
-            storage->SetInt(slotSelectId, 0);
-         }
-         if (isSelected) ImGui::SetItemDefaultFocus();
-      }
-      ImGui::EndCombo();
-   }
-   
-   // Material slot dropdown
-   auto getSlotLabel = [&](int slot) -> std::string
-   {
-      std::string label = "Slot " + std::to_string(slot);
-      if (slot >= 0 &&
-          slot < static_cast<int>(selectedMesh.materialSlotNames.size()) &&
-          !selectedMesh.materialSlotNames[slot].empty())
-      {
-         label += " - " + selectedMesh.materialSlotNames[slot];
-      }
-      return label;
-   };
+   ImGuiID editModeId   = ImGui::GetID("##ModelInspectorMatEditMode");
+   ImGuiID matSelectId  = ImGui::GetID("##ModelInspectorMatSelect");
 
-   std::string slotLabel = getSlotLabel(selectedSlot);
-   if (selectedMesh.materialSlotCount > 1)
+   // Edit mode: 0 = Per Mesh (legacy), 1 = By Material (shared across all meshes).
+   int editMode = storage->GetInt(editModeId, 0);
+   ImGui::TextDisabled("Edit Mode");
+   ImGui::SameLine(120.0f);
+   if (ImGui::RadioButton("Per Mesh", editMode == 0)) { editMode = 0; storage->SetInt(editModeId, 0); }
+   ImGui::SameLine();
+   if (ImGui::RadioButton("By Material", editMode == 1)) { editMode = 1; storage->SetInt(editModeId, 1); }
+   if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Define overrides once for a material name; they apply to every\nmesh slot that uses it (e.g. a shared texture atlas).");
+   ImGui::Spacing();
+
+   const bool groupMode = (editMode == 1);
+
+   // Filled in By Material mode and consumed by the cleanup step below.
+   std::vector<std::pair<std::string, int>> groupTargets; // current (meshName, slot) using the material
+   MeshMaterialPreset groupSnapshot;                      // shared preset state before editing
+
+   MeshMaterialPreset* preset = nullptr;
+
+   if (groupMode)
    {
-      if (ImGui::BeginCombo("Material Slot", slotLabel.c_str()))
+      // Helper: resolve a slot's material name, falling back to a slot label.
+      auto slotMaterialName = [](const ModelMeshInfo& mesh, int slot) -> std::string
       {
-         for (int i = 0; i < selectedMesh.materialSlotCount; ++i)
+         if (slot >= 0 && slot < (int)mesh.materialSlotNames.size() && !mesh.materialSlotNames[slot].empty())
+            return mesh.materialSlotNames[slot];
+         return "Slot " + std::to_string(slot);
+      };
+
+      // Build the sorted, unique list of material names across all meshes/slots.
+      std::vector<std::string> materialNames;
+      for (const auto& mesh : m_ModelMeshes)
+      {
+         for (int s = 0; s < mesh.materialSlotCount; ++s)
          {
-            std::string entry = getSlotLabel(i);
-            bool isSelected = (i == selectedSlot);
-            if (ImGui::Selectable(entry.c_str(), isSelected))
+            std::string name = slotMaterialName(mesh, s);
+            if (std::find(materialNames.begin(), materialNames.end(), name) == materialNames.end())
+               materialNames.push_back(name);
+         }
+      }
+      std::sort(materialNames.begin(), materialNames.end());
+
+      if (materialNames.empty())
+      {
+         ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "No materials found.");
+         return;
+      }
+
+      int selectedMat = storage->GetInt(matSelectId, 0);
+      if (selectedMat >= (int)materialNames.size()) selectedMat = 0;
+
+      if (ImGui::BeginCombo("Material", materialNames[selectedMat].c_str()))
+      {
+         for (int i = 0; i < (int)materialNames.size(); ++i)
+         {
+            bool isSelected = (i == selectedMat);
+            if (ImGui::Selectable(materialNames[i].c_str(), isSelected))
             {
-               selectedSlot = i;
-               storage->SetInt(slotSelectId, i);
+               selectedMat = i;
+               storage->SetInt(matSelectId, i);
             }
             if (isSelected) ImGui::SetItemDefaultFocus();
          }
          ImGui::EndCombo();
       }
+
+      const std::string& groupMaterialName = materialNames[selectedMat];
+
+      // Collect the current (mesh, slot) pairs using this material name. Used only
+      // to clean up shadowing per-mesh records when the shared preset is edited.
+      for (const auto& mesh : m_ModelMeshes)
+      {
+         for (int s = 0; s < mesh.materialSlotCount; ++s)
+         {
+            if (slotMaterialName(mesh, s) == groupMaterialName)
+               groupTargets.emplace_back(mesh.name, s);
+         }
+      }
+
+      ImGui::TextDisabled("Applies to every slot named \"%s\" (%d in this model, plus future meshes)",
+                          groupMaterialName.c_str(), (int)groupTargets.size());
+
+      // Edit a single shared record keyed by material name. It is resolved by name
+      // at import/instantiation time, so meshes added later inherit it automatically.
+      preset = m_ModelImportSettings.FindOrCreateSharedPreset(groupMaterialName);
+      groupSnapshot = *preset; // capture pre-edit state to detect changes
    }
    else
    {
-      ImGui::Text("Material Slot: %s", slotLabel.c_str());
+      int selectedMeshIdx = storage->GetInt(meshSelectId, 0);
+      int selectedSlot = storage->GetInt(slotSelectId, 0);
+
+      // Clamp selection
+      if (selectedMeshIdx >= (int)m_ModelMeshes.size()) selectedMeshIdx = 0;
+      const ModelMeshInfo& selectedMesh = m_ModelMeshes[selectedMeshIdx];
+      if (selectedSlot >= selectedMesh.materialSlotCount) selectedSlot = 0;
+
+      // Mesh dropdown
+      std::string meshLabel = selectedMesh.name;
+      if (selectedMesh.skinned) meshLabel += " (Skinned)";
+
+      if (ImGui::BeginCombo("Mesh", meshLabel.c_str()))
+      {
+         for (int i = 0; i < (int)m_ModelMeshes.size(); ++i)
+         {
+            std::string label = m_ModelMeshes[i].name;
+            if (m_ModelMeshes[i].skinned) label += " (Skinned)";
+            bool isSelected = (i == selectedMeshIdx);
+            if (ImGui::Selectable(label.c_str(), isSelected))
+            {
+               selectedMeshIdx = i;
+               storage->SetInt(meshSelectId, i);
+               selectedSlot = 0;
+               storage->SetInt(slotSelectId, 0);
+            }
+            if (isSelected) ImGui::SetItemDefaultFocus();
+         }
+         ImGui::EndCombo();
+      }
+
+      // Material slot dropdown
+      auto getSlotLabel = [&](int slot) -> std::string
+      {
+         std::string label = "Slot " + std::to_string(slot);
+         if (slot >= 0 &&
+             slot < static_cast<int>(selectedMesh.materialSlotNames.size()) &&
+             !selectedMesh.materialSlotNames[slot].empty())
+         {
+            label += " - " + selectedMesh.materialSlotNames[slot];
+         }
+         return label;
+      };
+
+      std::string slotLabel = getSlotLabel(selectedSlot);
+      if (selectedMesh.materialSlotCount > 1)
+      {
+         if (ImGui::BeginCombo("Material Slot", slotLabel.c_str()))
+         {
+            for (int i = 0; i < selectedMesh.materialSlotCount; ++i)
+            {
+               std::string entry = getSlotLabel(i);
+               bool isSelected = (i == selectedSlot);
+               if (ImGui::Selectable(entry.c_str(), isSelected))
+               {
+                  selectedSlot = i;
+                  storage->SetInt(slotSelectId, i);
+               }
+               if (isSelected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+         }
+      }
+      else
+      {
+         ImGui::Text("Material Slot: %s", slotLabel.c_str());
+      }
+
+      // Get or create preset for selected mesh/slot
+      preset = m_ModelImportSettings.FindOrCreatePreset(selectedMesh.name, selectedSlot);
    }
-   
+
    ImGui::Separator();
-   
-   // Get or create preset for selected mesh/slot
-   MeshMaterialPreset* preset = m_ModelImportSettings.FindOrCreatePreset(selectedMesh.name, selectedSlot);
-   
+
+   if (!preset)
+   {
+      ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "No material slot selected.");
+      return;
+   }
+
    // Custom material asset option
    if (ImGui::Checkbox("Use Custom Material Asset", &preset->UseCustomMaterial))
    {
@@ -9018,7 +9418,20 @@ void InspectorPanel::DrawModelInspector()
          }
       }
    }
-   
+
+   // When the shared (By Material) preset is edited, drop any per-mesh records that
+   // shadow this material so the shared override fully governs every slot using it
+   // (this also migrates records left by the older per-mesh broadcast). Only runs on
+   // an actual change, so merely viewing the mode never deletes per-mesh overrides.
+   // Note: SharedMaterialPresets and MaterialPresets are separate vectors, so erasing
+   // from MaterialPresets here does not invalidate `preset`.
+   if (groupMode && preset && !PresetOverridesEqual(*preset, groupSnapshot))
+   {
+      for (const auto& target : groupTargets)
+         m_ModelImportSettings.RemovePreset(target.first, target.second);
+      m_ModelMetaDirty = true;
+   }
+
    // Save/Reimport buttons
    ImGui::Spacing();
    ImGui::Separator();

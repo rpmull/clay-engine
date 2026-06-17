@@ -1,49 +1,82 @@
+# ==========================
 # Build output
+# ==========================
+/out/
 /Builds/
 /build/
-/out/
 /bin/
 /obj/
 
-# Managed build output
-/managed/**/bin/
-/managed/**/obj/
+# ==========================
+# External dependencies
+# ==========================
+/external/*
+!/external/imgui/
+!/external/imgui/**
+!/external/ImGuizmo/
+!/external/ImGuizmo/**
+!/external/recastnavigation/
+!/external/recastnavigation/**
 
-# Locally generated tool drops
-/tools/ScriptCompiler.deps.json
-/tools/ScriptCompiler.exe
-/tools/ScriptCompiler.runtimeconfig.json
-/tools/createdump.exe
-/tools/shaderc.exe
-/src/tools/ScriptCompiler.deps.json
-/src/tools/ScriptCompiler.exe
-/src/tools/ScriptCompiler.runtimeconfig.json
-/src/tools/shaderc.exe
+# ==========================
+# C# project build output
+# ==========================
+/managed/ClaymoreEngine/bin/
+/managed/ClaymoreEngine/obj/
+/managed/ScriptCompiler/bin/
+/managed/ScriptCompiler/obj/
 
-# Engine-generated caches
-/.bin/
-/.library/
-/logs/
+ managed/Modules/*/obj/
+ managed/Modules/*/bin/
 
-# Editor and IDE state
-/.vs/
-/.vscode/
+# Track .cs files, ignore binaries
+!managed/ClaymoreEngine/*.cs
+!managed/ScriptCompiler/*.cs
+
+
+# ==========================
+# Editor & IDE clutter
+# ==========================
 *.user
 *.suo
 *.sdf
-*.VC.db
-*.db
 *.cache
+*.meta
+*.db
+*.VC.db
 *.log
-*.ilk
-*.exp
+*.skelbin
+*.meshbin
+*.avatar
+.vscode/
+.vs/
 
-# Temporary files
+# ==========================
+# Engine-generated stuff
+# ==========================
+*.dll
+*.pdb
+*.lib
+*.exp
+*.ilk
+
+# ==========================
+# Project binary cache
+# ==========================
+# .bin/ contains generated binary assets for play mode (.sceneb, .matbin, etc.)
+.bin/
+.library/
+
+# ==========================
+# Temporary & misc
+# ==========================
 *.tmp
 *.bak
 *.swp
-.DS_Store
+*.DS_Store
 Thumbs.db
 
-# Project exports
+# ==========================
+# ClayProject files
+# ==========================
 /ClayProject/dist/

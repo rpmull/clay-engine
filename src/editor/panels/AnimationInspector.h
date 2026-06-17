@@ -30,6 +30,7 @@ private:
     // Import settings UI and actions
     void DrawImportSettingsChip();
     void ReimportAnimation();
+    bool SaveBakedRootMotionSettings();
     bool CalculateRootMotion(AnimationRootMotion& outRootMotion);
 
 private:

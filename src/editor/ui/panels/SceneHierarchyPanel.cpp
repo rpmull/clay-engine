@@ -467,8 +467,15 @@ void SceneHierarchyPanel::DrawEntityNode(EntityID id, int depth, bool inheritedM
         
         // Model root: Reset children to model default (clears position/scale deltas from hot reload)
         bool isModelRoot = data->ModelAssetGuid.high != 0 || data->ModelAssetGuid.low != 0;
-        if (isModelRoot && ImGui::MenuItem("Reset Children to Model Default")) {
+        if (isModelRoot && ImGui::MenuItem("Reset Children to Model Transform Defaults")) {
             if (m_Context->ResetModelChildrenToDefault(id)) {
+                if (ctxPrefabEditor) ctxPrefabEditor->MarkDeltasStale();
+                sceneStructureChanged = true;
+            }
+        }
+        // Model root: Reset children's materials/parameters/textures to model import defaults
+        if (isModelRoot && ImGui::MenuItem("Reset Children to Model Material Defaults")) {
+            if (m_Context->ResetModelChildrenMaterialsToDefault(id)) {
                 if (ctxPrefabEditor) ctxPrefabEditor->MarkDeltasStale();
                 sceneStructureChanged = true;
             }

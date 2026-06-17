@@ -211,6 +211,56 @@ namespace ClaymoreEngine
         public bool IsLooping => ComponentInterop.AnimLayer_GetLooping?.Invoke(_entityId, _layerName) ?? true;
     }
 
+    /// <summary>
+    /// Handle to a named state in the animator controller. Obtained via
+    /// <see cref="AnimatorController.GetState(string)"/>. Lets scripts hook methods into
+    /// state transitions:
+    /// <code>
+    /// var state = animator.GetController().GetState("Attack");
+    /// state.OnStateEntered += () => { /* ... */ };
+    /// state.OnStateExited  += () => { /* ... */ };
+    /// </code>
+    /// Callbacks fire on actual committed transitions (base or overlay layers), in both
+    /// editor play mode and exported runtime. Handlers route through
+    /// <see cref="AnimationStateInterop"/>; subscribing has no per-frame cost.
+    /// </summary>
+    public sealed class AnimatorState
+    {
+        private readonly int _entityId;
+        private readonly string _stateName;
+
+        internal AnimatorState(int entityId, string stateName)
+        {
+            _entityId = entityId;
+            _stateName = stateName;
+        }
+
+        /// <summary>The authored state name this handle refers to.</summary>
+        public string Name => _stateName;
+
+        /// <summary>Raised when this state becomes the active state in its layer.</summary>
+        public event Action OnStateEntered
+        {
+            add { AnimationStateInterop.AddEnterHandler(_entityId, _stateName, value); }
+            remove { AnimationStateInterop.RemoveEnterHandler(_entityId, _stateName, value); }
+        }
+
+        /// <summary>Raised when this state stops being the active state in its layer.</summary>
+        public event Action OnStateExited
+        {
+            add { AnimationStateInterop.AddExitHandler(_entityId, _stateName, value); }
+            remove { AnimationStateInterop.RemoveExitHandler(_entityId, _stateName, value); }
+        }
+
+        /// <summary>True if this is the controller's current base-layer state.</summary>
+        public bool IsActive =>
+            _entityId > 0 && string.Equals(ComponentInterop.Animator_GetState(_entityId), _stateName, StringComparison.Ordinal);
+
+        /// <summary>The base-layer state that was active immediately before the current one.</summary>
+        public string PreviousState =>
+            _entityId > 0 ? ComponentInterop.Animator_GetPreviousState(_entityId) : string.Empty;
+    }
+
     // Thin managed wrapper over native Animator/AnimationPlayer component
     public sealed class Animator : ComponentBase
     {
@@ -422,7 +472,75 @@ namespace ClaymoreEngine
             if (!IsValid) return string.Empty;
             return ComponentInterop.Animator_GetState(_entityId);
         }
-        
+
+        /// <summary>
+        /// Get a handle to a named state so you can hook into its transitions, e.g.
+        /// <c>GetState("Attack").OnStateEntered += () => {...}</c>. The handle is a thin
+        /// value object; subscribing/unsubscribing is what registers the callback.
+        /// Returns null if this controller is not attached to a valid entity.
+        /// </summary>
+        /// <param name="stateName">The authored state name (as shown in the controller).</param>
+        public AnimatorState GetState(string stateName)
+        {
+            if (!IsValid || string.IsNullOrEmpty(stateName)) return null;
+            return new AnimatorState(_entityId, stateName);
+        }
+
+        /// <summary>
+        /// Get a handle to the controller's current base-layer state. Equivalent to
+        /// <c>GetState(GetState())</c> but returns a usable <see cref="AnimatorState"/>
+        /// handle so you can hook its transitions, e.g.
+        /// <c>GetCurrentState().OnStateExited += () => {...}</c>.
+        /// Returns null if the controller is invalid or has no active state.
+        /// </summary>
+        public AnimatorState GetCurrentState()
+        {
+            if (!IsValid) return null;
+            string name = ComponentInterop.Animator_GetState(_entityId);
+            if (string.IsNullOrEmpty(name)) return null;
+            return new AnimatorState(_entityId, name);
+        }
+
+        /// <summary>
+        /// Compute the state this controller will transition into next, based on the
+        /// current base-layer state and the current parameter/trigger values, and return
+        /// a handle to it. This mirrors the runtime's transition selection exactly, so it
+        /// behaves identically in editor play mode and exported runtime.
+        /// <para>
+        /// If no transition currently qualifies (the state loops or simply has no pending
+        /// exit), this returns a handle to the <em>current</em> state (self). If a
+        /// crossfade is already in flight, it returns the transition's target state.
+        /// </para>
+        /// Because the query is non-destructive it does not consume triggers, so it is
+        /// safe to call right after <see cref="SetTrigger(string)"/> to discover the state
+        /// the trigger will lead into:
+        /// <code>
+        /// controller.SetTrigger(obj.Data.AnimTrigger);
+        /// controller.GetNextState().OnStateExited += () => { obj.OnInteract(self); };
+        /// </code>
+        /// Returns null if the controller is invalid or has no resolvable state.
+        /// </summary>
+        public AnimatorState GetNextState()
+        {
+            if (!IsValid) return null;
+            string name = ComponentInterop.Animator_GetNextState(_entityId);
+            if (string.IsNullOrEmpty(name)) return null;
+            return new AnimatorState(_entityId, name);
+        }
+
+        /// <summary>
+        /// The base-layer state that was active immediately before the current state.
+        /// Returns an empty string if there is no prior state yet.
+        /// </summary>
+        public string PreviousState
+        {
+            get
+            {
+                if (!IsValid) return string.Empty;
+                return ComponentInterop.Animator_GetPreviousState(_entityId);
+            }
+        }
+
         /// <summary>
         /// Register a callback to be invoked when an animation event with the specified name fires.
         /// The event name corresponds to the "Script Class" field in the animation event editor.

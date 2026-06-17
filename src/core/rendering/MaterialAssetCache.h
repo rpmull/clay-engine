@@ -17,5 +17,7 @@ namespace MaterialAssetCache
 
     // Removes a cached material entry so the next Acquire will rebuild it.
     void Invalidate(const std::string& assetPath);
-}
 
+    // Removes every cached material asset.
+    void Clear();
+}

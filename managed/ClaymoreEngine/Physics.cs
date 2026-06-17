@@ -243,6 +243,29 @@ namespace ClaymoreEngine.Physics
         out float hitDistance,
         out int hitEntityId);
 
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate bool Physics_SpherecastFn(
+        float originX, float originY, float originZ,
+        float dirX, float dirY, float dirZ,
+        float radius,
+        float maxDistance,
+        uint layerMask,
+        out float hitPointX, out float hitPointY, out float hitPointZ,
+        out float hitNormalX, out float hitNormalY, out float hitNormalZ,
+        out float hitDistance,
+        out int hitEntityId);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate bool Physics_SpherecastPointsFn(
+        float fromX, float fromY, float fromZ,
+        float toX, float toY, float toZ,
+        float radius,
+        uint layerMask,
+        out float hitPointX, out float hitPointY, out float hitPointZ,
+        out float hitNormalX, out float hitNormalY, out float hitNormalZ,
+        out float hitDistance,
+        out int hitEntityId);
+
     /// <summary>
     /// Provides physics raycast functionality.
     /// </summary>
@@ -250,10 +273,12 @@ namespace ClaymoreEngine.Physics
     {
         private static Physics_RaycastFn? _raycast;
         private static Physics_RaycastPointsFn? _raycastPoints;
+        private static Physics_SpherecastFn? _spherecast;
+        private static Physics_SpherecastPointsFn? _spherecastPoints;
         private static bool _initialized = false;
-        
+
         // Expected number of function pointers (must match native kPhysicsInteropCount)
-        private const int kExpectedCount = 8;
+        private const int kExpectedCount = 10;
 
         /// <summary>
         /// Initialize physics interop from native function pointers.
@@ -279,7 +304,10 @@ namespace ClaymoreEngine.Physics
             PhysicsLayer._getLayerIndex = Marshal.GetDelegateForFunctionPointer<PhysicsLayer.GetLayerIndexFn>(ptrs[i++]);
             PhysicsLayer._getLayerMask = Marshal.GetDelegateForFunctionPointer<PhysicsLayer.GetLayerMaskFn>(ptrs[i++]);
             PhysicsLayer._getLayerCount = Marshal.GetDelegateForFunctionPointer<PhysicsLayer.GetLayerCountFn>(ptrs[i++]);
-            
+            // Spherecast functions (8-9)
+            _spherecast = Marshal.GetDelegateForFunctionPointer<Physics_SpherecastFn>(ptrs[i++]);
+            _spherecastPoints = Marshal.GetDelegateForFunctionPointer<Physics_SpherecastPointsFn>(ptrs[i++]);
+
             _initialized = true;
             Console.WriteLine($"[PhysicsInterop] Physics delegates initialized ({count} functions, {PhysicsLayer.GetCount()} layers).");
         }
@@ -345,6 +373,90 @@ namespace ClaymoreEngine.Physics
             bool result = _raycastPoints(
                 from.X, from.Y, from.Z,
                 to.X, to.Y, to.Z,
+                layerMask,
+                out float px, out float py, out float pz,
+                out float nx, out float ny, out float nz,
+                out float dist,
+                out int entityId);
+
+            hit = new RaycastHit
+            {
+                Point = new Vector3(px, py, pz),
+                Normal = new Vector3(nx, ny, nz),
+                Distance = dist,
+                EntityId = entityId
+            };
+
+            return result;
+        }
+
+        /// <summary>
+        /// Sweeps a sphere from origin along direction up to maxDistance.
+        /// Cheaper alternative to many raycasts when you need thickness (e.g. line of
+        /// sight, projectiles, ground checks). A radius &lt;= 0 behaves like a Raycast.
+        /// </summary>
+        /// <param name="origin">The starting point of the sphere centre in world space.</param>
+        /// <param name="direction">The sweep direction (will be normalized internally).</param>
+        /// <param name="radius">The radius of the swept sphere.</param>
+        /// <param name="maxDistance">The maximum distance the sphere should travel.</param>
+        /// <param name="hit">If true is returned, contains information about the hit.</param>
+        /// <param name="layerMask">Bitmask of layers to include. Use LayerMask constants.</param>
+        /// <returns>True if the sphere hit something, false otherwise.</returns>
+        public static bool Spherecast(Vector3 origin, Vector3 direction, float radius, float maxDistance, out RaycastHit hit, uint layerMask = LayerMask.All)
+        {
+            hit = default;
+
+            if (!_initialized || _spherecast == null)
+            {
+                Console.WriteLine("[Physics] Spherecast not initialized - native interop not set up.");
+                return false;
+            }
+
+            bool result = _spherecast(
+                origin.X, origin.Y, origin.Z,
+                direction.X, direction.Y, direction.Z,
+                radius,
+                maxDistance,
+                layerMask,
+                out float px, out float py, out float pz,
+                out float nx, out float ny, out float nz,
+                out float dist,
+                out int entityId);
+
+            hit = new RaycastHit
+            {
+                Point = new Vector3(px, py, pz),
+                Normal = new Vector3(nx, ny, nz),
+                Distance = dist,
+                EntityId = entityId
+            };
+
+            return result;
+        }
+
+        /// <summary>
+        /// Sweeps a sphere between two points (swept-sphere line segment cast).
+        /// </summary>
+        /// <param name="from">The starting point in world space.</param>
+        /// <param name="to">The end point in world space.</param>
+        /// <param name="radius">The radius of the swept sphere.</param>
+        /// <param name="hit">If true is returned, contains information about the hit.</param>
+        /// <param name="layerMask">Bitmask of layers to include. Use LayerMask constants.</param>
+        /// <returns>True if the sphere hit something between the two points, false otherwise.</returns>
+        public static bool SphereLinecast(Vector3 from, Vector3 to, float radius, out RaycastHit hit, uint layerMask = LayerMask.All)
+        {
+            hit = default;
+
+            if (!_initialized || _spherecastPoints == null)
+            {
+                Console.WriteLine("[Physics] SphereLinecast not initialized - native interop not set up.");
+                return false;
+            }
+
+            bool result = _spherecastPoints(
+                from.X, from.Y, from.Z,
+                to.X, to.Y, to.Z,
+                radius,
                 layerMask,
                 out float px, out float py, out float pz,
                 out float nx, out float ny, out float nz,

@@ -117,6 +117,9 @@ struct RuntimeLightEntry {
     LightType Type = LightType::Directional;
     glm::vec3 Color{ 1.0f };
     float Intensity = 1.0f;
+    float Range = 50.0f;
+    float SpotInnerAngleDegrees = 20.0f;
+    float SpotOuterAngleDegrees = 30.0f;
     glm::vec3 Position{ 0.0f };
     glm::vec3 Direction{ 0.0f, -1.0f, 0.0f };
 };
@@ -323,6 +326,9 @@ private:
         LightType Type = LightType::Directional;
         glm::vec3 Color{ 1.0f };
         float Intensity = 1.0f;
+        float Range = 50.0f;
+        float SpotInnerAngleDegrees = 20.0f;
+        float SpotOuterAngleDegrees = 30.0f;
     };
 
     Index AcquireSlot(EntityID sceneEntity);
@@ -409,6 +415,11 @@ private:
     bool m_HierarchyDirty = true;
     bool m_PersistentIndicesDirty = true;
     bool m_SkinningCachesDirty = true;
+    // Set during transform propagation when a light's world matrix is recomputed
+    // because an ancestor moved (the light itself was never marked dirty). Consumed
+    // on the main thread after the transform stage to bump LightVersion so the light
+    // list re-extracts and the light follows its parent.
+    bool m_LightWorldDirtyFromHierarchy = false;
 };
 
 } // namespace cm::world

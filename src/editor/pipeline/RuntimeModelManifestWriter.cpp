@@ -167,8 +167,20 @@ bool RuntimeModelManifestWriter::CompileFromJson(
                         slot.alphaBlend = false;
                     }
 
-                    // Apply material preset overrides if defined
-                    const MeshMaterialPreset* preset = importSettings.FindPreset(node.name, materialSlot);
+                    // Resolve the slot's material name (prefer slotNames, fall back to
+                    // the material's own "name") so shared, name-keyed overrides match.
+                    std::string slotMatName;
+                    if (entry.contains("slotNames") && entry["slotNames"].is_array() &&
+                        materialSlot < static_cast<int>(entry["slotNames"].size()) &&
+                        entry["slotNames"][materialSlot].is_string())
+                    {
+                        slotMatName = entry["slotNames"][materialSlot].get<std::string>();
+                    }
+                    if (slotMatName.empty())
+                        slotMatName = slot.name;
+
+                    // Apply material preset overrides if defined (per-mesh first, then shared-by-name)
+                    const MeshMaterialPreset* preset = importSettings.ResolvePreset(node.name, materialSlot, slotMatName);
                     if (preset) {
                         if (!(preset->UseCustomMaterial && !preset->MaterialAssetPath.empty())) {
                             if (preset->OverrideAlbedo && !preset->AlbedoPath.empty()) {

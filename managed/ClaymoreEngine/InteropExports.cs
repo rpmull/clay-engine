@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
 using System.Reflection;
 using System.Numerics;
+using System.Text.Json;
 
 namespace ClaymoreEngine
 {
@@ -215,19 +216,118 @@ namespace ClaymoreEngine
             return null;
         }
         
-        // Get struct field info for serialization
-        private static List<(string name, NativePropertyType type, string? auxType)> GetStructFields(Type t)
+        private static IEnumerable<FieldInfo> GetSerializableStructFields(Type t)
         {
-            var result = new List<(string, NativePropertyType, string?)>();
-            foreach (var field in t.GetFields(BindingFlags.Instance | BindingFlags.Public))
+            foreach (var field in t.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
             {
-                var nType = ToNative(field.FieldType);
-                string? aux = null;
-                if (nType == NativePropertyType.Enum)
-                    aux = field.FieldType.FullName;
-                result.Add((field.Name, nType, aux));
+                if (field.IsPublic || field.GetCustomAttribute<SerializeField>() != null)
+                {
+                    yield return field;
+                }
             }
-            return result;
+        }
+
+        private static bool IsStructuredListElementType(Type elementType)
+        {
+            return ToNative(elementType) == NativePropertyType.Struct;
+        }
+
+        private static string BuildStructFieldsJson(Type structType)
+        {
+            return JsonSerializer.Serialize(BuildStructFieldArray(structType));
+        }
+
+        private static List<Dictionary<string, object?>> BuildStructFieldArray(Type structType)
+        {
+            var fields = new List<Dictionary<string, object?>>();
+            foreach (var field in GetSerializableStructFields(structType))
+            {
+                Type fieldType = field.FieldType;
+                NativePropertyType nativeType = ToNative(fieldType);
+
+                var entry = new Dictionary<string, object?>
+                {
+                    ["name"] = field.Name,
+                    ["type"] = (int)nativeType,
+                    ["aux"] = GetAuxTypeName(fieldType, nativeType)
+                };
+
+                if (nativeType == NativePropertyType.Enum)
+                {
+                    entry["enumNames"] = Enum.GetNames(fieldType);
+                    entry["enumValues"] = Enum.GetValues(fieldType).Cast<int>().ToArray();
+                }
+
+                if (nativeType == NativePropertyType.List)
+                {
+                    Type? elementType = GetListElementType(fieldType);
+                    if (elementType != null)
+                    {
+                        NativePropertyType elementNativeType = ToNative(elementType);
+                        entry["listElementType"] = (int)elementNativeType;
+                        entry["listElementTypeName"] = elementType.FullName;
+
+                        if (elementNativeType == NativePropertyType.Enum)
+                        {
+                            entry["enumNames"] = Enum.GetNames(elementType);
+                            entry["enumValues"] = Enum.GetValues(elementType).Cast<int>().ToArray();
+                        }
+
+                        if (elementNativeType == NativePropertyType.Struct)
+                        {
+                            entry["structFields"] = BuildStructFieldArray(elementType);
+                        }
+                    }
+                }
+                else if (nativeType == NativePropertyType.Struct)
+                {
+                    entry["structFields"] = BuildStructFieldArray(fieldType);
+                }
+
+                if (field.GetCustomAttribute<PopulateFromResourcesAttribute>() != null ||
+                    field.GetCustomAttribute<PopulateFromResourceAttribute>() != null)
+                {
+                    entry["populateFromResources"] = true;
+                }
+
+                bool isResourceRef = fieldType.IsGenericType && fieldType.GetGenericTypeDefinition() == typeof(ResourceRef<>);
+                if (isResourceRef ||
+                    field.GetCustomAttribute<SelectFromResourcesAttribute>() != null ||
+                    field.GetCustomAttribute<SelectFromResourceAttribute>() != null)
+                {
+                    entry["selectFromResources"] = true;
+                }
+
+                fields.Add(entry);
+            }
+
+            return fields;
+        }
+
+        private static string? GetAuxTypeName(Type type, NativePropertyType nativeType)
+        {
+            if (nativeType == NativePropertyType.Enum ||
+                nativeType == NativePropertyType.ComponentRef ||
+                nativeType == NativePropertyType.ScriptRef ||
+                nativeType == NativePropertyType.Struct ||
+                nativeType == NativePropertyType.DialogueLibrary ||
+                nativeType == NativePropertyType.AnimationController ||
+                nativeType == NativePropertyType.AnimationControllerOverride)
+            {
+                return type.FullName;
+            }
+
+            if (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(ResourceRef<>))
+            {
+                return type.GetGenericArguments()[0].FullName;
+            }
+
+            if (nativeType == NativePropertyType.ClayObject)
+            {
+                return type.FullName;
+            }
+
+            return null;
         }
         
         // Get enum values and names for dropdown display
@@ -238,12 +338,455 @@ namespace ClaymoreEngine
             return (names, values);
         }
 
+        // Recursively registers each public field of a serializable struct as a
+        // flat "prefix.leaf" property. Handles nested structs (and Vector2, which
+        // is a struct of X/Y floats) by recursing. Boxed defaults are read from the
+        // supplied struct value so field initializers are preserved.
+        private static void RegisterStructLeaves(string className, string prefix,
+            Type structType, object? structValue, int depth)
+        {
+            if (depth > 6) return; // guard against pathological/self-referential structs
+            foreach (var sub in structType.GetFields(BindingFlags.Instance | BindingFlags.Public))
+            {
+                Type ft = sub.FieldType;
+                NativePropertyType nType = ToNative(ft);
+                object? def = null;
+                try { def = structValue != null ? sub.GetValue(structValue) : null; } catch { def = null; }
+                string fullName = prefix + "." + sub.Name;
+
+                if (nType == NativePropertyType.Struct)
+                {
+                    object? nestedVal = def;
+                    if (nestedVal == null && ft.IsValueType)
+                    {
+                        try { nestedVal = Activator.CreateInstance(ft); } catch { nestedVal = null; }
+                    }
+                    RegisterStructLeaves(className, fullName, ft, nestedVal, depth + 1);
+                    continue;
+                }
+
+                IntPtr boxedPtr = BoxLeafDefault(ft, def, nType,
+                    out string? aux, out string? enumNames, out string? enumValues);
+                if (_registerPropExtendedNative != null)
+                {
+                    _registerPropExtendedNative(className, fullName, (int)nType, boxedPtr, aux,
+                        enumNames, enumValues, 0, null, null, false, false);
+                }
+                else
+                {
+                    _registerPropNative?.Invoke(className, fullName, (int)nType, boxedPtr, aux);
+                }
+                if (boxedPtr != IntPtr.Zero) Marshal.FreeHGlobal(boxedPtr);
+            }
+        }
+
+        // Boxes a primitive leaf default to unmanaged memory for registration.
+        // Mirrors the inline boxing used for top-level fields, for the common leaf
+        // types found inside structs. Returns IntPtr.Zero for unsupported types.
+        private static IntPtr BoxLeafDefault(Type ft, object? def, NativePropertyType nType,
+            out string? aux, out string? enumNames, out string? enumValues)
+        {
+            aux = null; enumNames = null; enumValues = null;
+            try
+            {
+                if (ft == typeof(int)) { IntPtr p = Marshal.AllocHGlobal(sizeof(int)); Marshal.WriteInt32(p, def is int i ? i : 0); return p; }
+                if (ft == typeof(float)) { IntPtr p = Marshal.AllocHGlobal(sizeof(float)); float f = def is float fv ? fv : 0f; Marshal.StructureToPtr(f, p, false); return p; }
+                if (ft == typeof(bool)) { IntPtr p = Marshal.AllocHGlobal(1); Marshal.WriteByte(p, (byte)((def is bool b && b) ? 1 : 0)); return p; }
+                if (ft == typeof(string)) { return Marshal.StringToHGlobalAnsi(def as string ?? string.Empty); }
+                if (ft == typeof(System.Numerics.Vector3)) { IntPtr p = Marshal.AllocHGlobal(Marshal.SizeOf<System.Numerics.Vector3>()); var v = def is System.Numerics.Vector3 vv ? vv : default; Marshal.StructureToPtr(v, p, false); return p; }
+                if (ft == typeof(Entity)) { IntPtr p = Marshal.AllocHGlobal(sizeof(int)); Marshal.WriteInt32(p, def is Entity e ? e.EntityID : -1); return p; }
+                if (ft.IsEnum) { aux = ft.FullName; enumNames = string.Join("|", Enum.GetNames(ft)); enumValues = string.Join("|", Enum.GetValues(ft).Cast<int>()); IntPtr p = Marshal.AllocHGlobal(sizeof(int)); Marshal.WriteInt32(p, def != null ? (int)def : 0); return p; }
+            }
+            catch { }
+            return IntPtr.Zero;
+        }
+
+        // Sets a nested struct field via a dotted path ("parent.leaf" or deeper).
+        // Structs are value types, so the chain is read into boxed copies, the leaf
+        // is set, and the copies are written back up to the owning instance.
+        private static void SetNestedManagedField(object root, string path, IntPtr boxed)
+        {
+            string[] parts = path.Split('.');
+            object?[] chain = new object?[parts.Length];
+            FieldInfo?[] fields = new FieldInfo?[parts.Length];
+            chain[0] = root;
+            for (int i = 0; i < parts.Length - 1; i++)
+            {
+                if (chain[i] == null) return;
+                fields[i] = chain[i]!.GetType().GetField(parts[i],
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (fields[i] == null) return;
+                object? next = fields[i]!.GetValue(chain[i]);
+                if (next == null)
+                {
+                    Type nt = fields[i]!.FieldType;
+                    if (!nt.IsValueType) return;
+                    next = Activator.CreateInstance(nt);
+                }
+                chain[i + 1] = next;
+            }
+
+            object? leafOwner = chain[parts.Length - 1];
+            if (leafOwner == null) return;
+            FieldInfo? leaf = leafOwner.GetType().GetField(parts[parts.Length - 1],
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (leaf == null) return;
+            object? leafValue = UnboxLeafValue(leaf.FieldType, boxed);
+            if (leafValue == null) return;
+            leaf.SetValue(leafOwner, leafValue);
+
+            // Write boxed value-type copies back up the chain.
+            for (int i = parts.Length - 1; i > 0; i--)
+            {
+                fields[i - 1]!.SetValue(chain[i - 1], chain[i]);
+            }
+        }
+
+        // Reads a nested struct field via a dotted path. Read-only (no copy-back).
+        private static object? GetNestedManagedFieldValue(object root, string path, out Type? leafType)
+        {
+            leafType = null;
+            string[] parts = path.Split('.');
+            object? cur = root;
+            FieldInfo? fi = null;
+            for (int i = 0; i < parts.Length; i++)
+            {
+                if (cur == null) return null;
+                fi = cur.GetType().GetField(parts[i],
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (fi == null) return null;
+                cur = fi.GetValue(cur);
+            }
+            leafType = fi?.FieldType;
+            return cur;
+        }
+
+        // Converts a boxed native pointer to a managed leaf value for the given type.
+        private static object? UnboxLeafValue(Type ft, IntPtr boxed)
+        {
+            if (ft == typeof(int)) return Marshal.ReadInt32(boxed);
+            if (ft == typeof(float)) return Marshal.PtrToStructure<float>(boxed);
+            if (ft == typeof(bool)) return Marshal.ReadByte(boxed) != 0;
+            if (ft == typeof(string)) return Marshal.PtrToStringAnsi(boxed);
+            if (ft == typeof(System.Numerics.Vector3)) return Marshal.PtrToStructure<System.Numerics.Vector3>(boxed);
+            if (ft == typeof(Entity)) return new Entity(Marshal.ReadInt32(boxed));
+            if (ft.IsEnum) return Enum.ToObject(ft, Marshal.ReadInt32(boxed));
+            return null;
+        }
+
+        private static bool LooksLikeJsonPayload(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return false;
+            }
+
+            for (int i = 0; i < value.Length; i++)
+            {
+                char c = value[i];
+                if (char.IsWhiteSpace(c))
+                {
+                    continue;
+                }
+
+                return c == '[' || c == '{';
+            }
+
+            return false;
+        }
+
+        private static object? SerializeStructuredValue(object? value, Type declaredType)
+        {
+            if (value == null)
+            {
+                return null;
+            }
+
+            if (declaredType == typeof(int)) return (int)value;
+            if (declaredType == typeof(float)) return (float)value;
+            if (declaredType == typeof(bool)) return (bool)value;
+            if (declaredType == typeof(string)) return (string?)value;
+            if (declaredType == typeof(System.Numerics.Vector3))
+            {
+                var vector = (System.Numerics.Vector3)value;
+                return new[] { vector.X, vector.Y, vector.Z };
+            }
+            if (declaredType == typeof(Entity)) return ((Entity)value).EntityID;
+            if (typeof(ComponentBase).IsAssignableFrom(declaredType))
+            {
+                var component = value as ComponentBase;
+                return component?.Entity.EntityID ?? -1;
+            }
+            if (typeof(global::ScriptComponent).IsAssignableFrom(declaredType))
+            {
+                var script = value as global::ScriptComponent;
+                return script?.EntityID ?? -1;
+            }
+            if (declaredType == typeof(Prefab)) return ((Prefab)value).Guid ?? "";
+            if (declaredType == typeof(Mesh)) return ((Mesh)value).ToInteropString();
+            if (declaredType == typeof(Texture)) return ((Texture)value).ToInteropString();
+            if (declaredType == typeof(AudioClip)) return ((AudioClip)value).ToInteropString();
+            if (declaredType == typeof(AnimationController)) return ((AnimationController)value).Path ?? "";
+            if (declaredType == typeof(AnimationControllerOverride)) return ((AnimationControllerOverride)value).Path ?? "";
+            if (declaredType.Name == "DialogueLibraryRef" || declaredType.FullName == "Dialogue.DialogueLibraryRef")
+            {
+                var guidField = declaredType.GetField("guid", BindingFlags.Instance | BindingFlags.Public);
+                return guidField?.GetValue(value) as string ?? "";
+            }
+            if (declaredType.IsGenericType && declaredType.GetGenericTypeDefinition() == typeof(ResourceRef<>))
+            {
+                return declaredType.GetProperty("Guid")?.GetValue(value) as string ?? "";
+            }
+            if (typeof(Scripting.Scriptable.ClayScriptableObject).IsAssignableFrom(declaredType))
+            {
+                return (value as Scripting.Scriptable.ClayScriptableObject)?.Guid ?? "";
+            }
+            if (declaredType.IsEnum) return Convert.ToInt32(value);
+            if (declaredType.IsGenericType && declaredType.GetGenericTypeDefinition() == typeof(List<>))
+            {
+                Type elementType = declaredType.GetGenericArguments()[0];
+                var list = value as System.Collections.IList;
+                var result = new List<object?>();
+                if (list != null)
+                {
+                    foreach (var element in list)
+                    {
+                        result.Add(SerializeStructuredValue(element, elementType));
+                    }
+                }
+                return result;
+            }
+
+            if (ToNative(declaredType) == NativePropertyType.Struct)
+            {
+                var obj = new Dictionary<string, object?>();
+                foreach (var field in GetSerializableStructFields(declaredType))
+                {
+                    obj[field.Name] = SerializeStructuredValue(field.GetValue(value), field.FieldType);
+                }
+                return obj;
+            }
+
+            return null;
+        }
+
+        private static object? GetComponentByType(Entity entity, Type componentType)
+        {
+            try
+            {
+                MethodInfo? method = typeof(EntityExtensions)
+                    .GetMethods(BindingFlags.Public | BindingFlags.Static)
+                    .FirstOrDefault(m => m.Name == nameof(EntityExtensions.GetComponent) &&
+                                         m.IsGenericMethodDefinition &&
+                                         m.GetParameters().Length == 1);
+                if (method == null)
+                {
+                    return null;
+                }
+
+                return method.MakeGenericMethod(componentType).Invoke(null, new object[] { entity });
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static object? DeserializeStructuredValue(Type targetType, JsonElement element)
+        {
+            try
+            {
+                if (targetType == typeof(int))
+                {
+                    if (element.ValueKind == JsonValueKind.Number && element.TryGetInt32(out int intValue)) return intValue;
+                    if (element.ValueKind == JsonValueKind.String && int.TryParse(element.GetString(), out int parsedInt)) return parsedInt;
+                    return 0;
+                }
+
+                if (targetType == typeof(float))
+                {
+                    if (element.ValueKind == JsonValueKind.Number) return element.GetSingle();
+                    if (element.ValueKind == JsonValueKind.String &&
+                        float.TryParse(element.GetString(), System.Globalization.NumberStyles.Float,
+                            System.Globalization.CultureInfo.InvariantCulture, out float parsedFloat))
+                    {
+                        return parsedFloat;
+                    }
+                    return 0f;
+                }
+
+                if (targetType == typeof(bool))
+                {
+                    if (element.ValueKind == JsonValueKind.True || element.ValueKind == JsonValueKind.False) return element.GetBoolean();
+                    if (element.ValueKind == JsonValueKind.String && bool.TryParse(element.GetString(), out bool parsedBool)) return parsedBool;
+                    return false;
+                }
+
+                if (targetType == typeof(string))
+                {
+                    return element.ValueKind == JsonValueKind.Null ? string.Empty : (element.GetString() ?? string.Empty);
+                }
+
+                if (targetType == typeof(System.Numerics.Vector3))
+                {
+                    if (element.ValueKind == JsonValueKind.Array && element.GetArrayLength() >= 3)
+                    {
+                        return new System.Numerics.Vector3(
+                            element[0].GetSingle(),
+                            element[1].GetSingle(),
+                            element[2].GetSingle());
+                    }
+
+                    if (element.ValueKind == JsonValueKind.Object)
+                    {
+                        float x = element.TryGetProperty("X", out var xProp) ? xProp.GetSingle() : 0f;
+                        float y = element.TryGetProperty("Y", out var yProp) ? yProp.GetSingle() : 0f;
+                        float z = element.TryGetProperty("Z", out var zProp) ? zProp.GetSingle() : 0f;
+                        return new System.Numerics.Vector3(x, y, z);
+                    }
+
+                    return default(System.Numerics.Vector3);
+                }
+
+                if (targetType == typeof(Entity))
+                {
+                    int id = element.ValueKind == JsonValueKind.Number ? element.GetInt32() : -1;
+                    return new Entity(id);
+                }
+
+                if (typeof(ComponentBase).IsAssignableFrom(targetType))
+                {
+                    int id = element.ValueKind == JsonValueKind.Number ? element.GetInt32() : -1;
+                    return GetComponentByType(new Entity(id), targetType);
+                }
+
+                if (typeof(global::ScriptComponent).IsAssignableFrom(targetType))
+                {
+                    int id = element.ValueKind == JsonValueKind.Number ? element.GetInt32() : -1;
+                    return ScriptRegistry.Get(targetType, id);
+                }
+
+                if (targetType == typeof(Prefab)) return new Prefab { Guid = element.GetString() };
+                if (targetType == typeof(Mesh)) return Mesh.FromInteropString(element.GetString());
+                if (targetType == typeof(Texture)) return Texture.FromInteropString(element.GetString());
+                if (targetType == typeof(AudioClip)) return AudioClip.FromInteropString(element.GetString());
+                if (targetType == typeof(AnimationController)) return new AnimationController { Path = element.GetString() ?? "" };
+                if (targetType == typeof(AnimationControllerOverride)) return new AnimationControllerOverride { Path = element.GetString() ?? "" };
+
+                if (targetType.Name == "DialogueLibraryRef" || targetType.FullName == "Dialogue.DialogueLibraryRef")
+                {
+                    object? dialogueRef = Activator.CreateInstance(targetType);
+                    var guidField = targetType.GetField("guid", BindingFlags.Instance | BindingFlags.Public);
+                    if (dialogueRef != null && guidField != null)
+                    {
+                        guidField.SetValue(dialogueRef, element.GetString() ?? "");
+                    }
+                    return dialogueRef;
+                }
+
+                if (targetType.IsGenericType && targetType.GetGenericTypeDefinition() == typeof(ResourceRef<>))
+                {
+                    object? resourceRef = Activator.CreateInstance(targetType);
+                    targetType.GetProperty("Guid")?.SetValue(resourceRef, element.GetString() ?? "");
+                    return resourceRef;
+                }
+
+                if (typeof(Scripting.Scriptable.ClayScriptableObject).IsAssignableFrom(targetType))
+                {
+                    string guid = element.GetString() ?? "";
+                    if (string.IsNullOrEmpty(guid))
+                    {
+                        return null;
+                    }
+
+                    return Scripting.Scriptable.ClayScriptableObjectLoader.Load(guid, targetType);
+                }
+
+                if (targetType.IsEnum)
+                {
+                    if (element.ValueKind == JsonValueKind.Number && element.TryGetInt32(out int enumValue))
+                    {
+                        return Enum.ToObject(targetType, enumValue);
+                    }
+
+                    if (element.ValueKind == JsonValueKind.String)
+                    {
+                        string? enumText = element.GetString();
+                        if (int.TryParse(enumText, out int parsedEnum))
+                        {
+                            return Enum.ToObject(targetType, parsedEnum);
+                        }
+
+                        if (!string.IsNullOrEmpty(enumText))
+                        {
+                            return Enum.Parse(targetType, enumText, ignoreCase: true);
+                        }
+                    }
+
+                    return Activator.CreateInstance(targetType);
+                }
+
+                if (targetType.IsGenericType && targetType.GetGenericTypeDefinition() == typeof(List<>))
+                {
+                    Type elementType = targetType.GetGenericArguments()[0];
+                    var list = Activator.CreateInstance(targetType) as System.Collections.IList;
+                    if (list == null || element.ValueKind != JsonValueKind.Array)
+                    {
+                        return list;
+                    }
+
+                    foreach (JsonElement item in element.EnumerateArray())
+                    {
+                        object? deserialized = DeserializeStructuredValue(elementType, item);
+                        if (deserialized != null || !elementType.IsValueType)
+                        {
+                            list.Add(deserialized);
+                        }
+                    }
+
+                    return list;
+                }
+
+                if (ToNative(targetType) == NativePropertyType.Struct)
+                {
+                    object? structValue = Activator.CreateInstance(targetType);
+                    if (structValue == null || element.ValueKind != JsonValueKind.Object)
+                    {
+                        return structValue;
+                    }
+
+                    foreach (var field in GetSerializableStructFields(targetType))
+                    {
+                        if (element.TryGetProperty(field.Name, out JsonElement fieldJson))
+                        {
+                            field.SetValue(structValue, DeserializeStructuredValue(field.FieldType, fieldJson));
+                        }
+                    }
+
+                    return structValue;
+                }
+            }
+            catch
+            {
+            }
+
+            return null;
+        }
+
         // Native will grab pointer to this method
         public static void SetManagedField(IntPtr handle, string field, IntPtr boxed)
         {
             try
             {
                 if (!TryGetLiveTarget(handle, out var inst) || inst == null) return;
+
+                // Dotted path => nested struct field (e.g. "adjustmentData.JitterAmount").
+                if (field.IndexOf('.') >= 0)
+                {
+                    SetNestedManagedField(inst, field, boxed);
+                    return;
+                }
+
                 var fi = inst.GetType().GetField(field, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
                 if (fi == null) return;
 
@@ -378,90 +921,103 @@ namespace ClaymoreEngine
                 }
                 else if (ft.IsGenericType && ft.GetGenericTypeDefinition() == typeof(List<>))
                 {
-                    // List<T> - boxed value is a pipe-separated string of serialized elements
-                    // For ClayScriptableObject elements, these are GUIDs
                     string? serialized = Marshal.PtrToStringAnsi(boxed);
                     Type elemType = ft.GetGenericArguments()[0];
                     
-                    // Create the list instance
                     var list = Activator.CreateInstance(ft) as System.Collections.IList;
                     if (list != null && !string.IsNullOrEmpty(serialized))
                     {
-                        string[] parts = serialized.Split('|');
-                        foreach (string part in parts)
+                        if (IsStructuredListElementType(elemType) && LooksLikeJsonPayload(serialized))
                         {
-                            if (string.IsNullOrEmpty(part)) continue;
-                            
-                            object? elem = null;
-                            if (typeof(Scripting.Scriptable.ClayScriptableObject).IsAssignableFrom(elemType))
+                            using JsonDocument doc = JsonDocument.Parse(serialized);
+                            if (doc.RootElement.ValueKind == JsonValueKind.Array)
                             {
-                                // Element is a ClayScriptableObject - load by GUID
-                                elem = Scripting.Scriptable.ClayScriptableObjectLoader.Load(part, elemType);
-                            }
-                            else if (elemType == typeof(int))
-                            {
-                                if (int.TryParse(part, out int iv)) elem = iv;
-                            }
-                            else if (elemType == typeof(float))
-                            {
-                                if (float.TryParse(part, System.Globalization.NumberStyles.Float, 
-                                    System.Globalization.CultureInfo.InvariantCulture, out float fv)) elem = fv;
-                            }
-                            else if (elemType == typeof(bool))
-                            {
-                                elem = part == "true" || part == "1";
-                            }
-                            else if (elemType == typeof(string))
-                            {
-                                elem = part;
-                            }
-                            else if (elemType == typeof(Prefab))
-                            {
-                                elem = new Prefab { Guid = part };
-                            }
-                            else if (elemType == typeof(Mesh))
-                            {
-                                elem = Mesh.FromInteropString(part);
-                            }
-                            else if (elemType == typeof(Texture))
-                            {
-                                elem = Texture.FromInteropString(part);
-                            }
-                            else if (elemType == typeof(AudioClip))
-                            {
-                                elem = AudioClip.FromInteropString(part);
-                            }
-                            else if (elemType.Name == "DialogueLibraryRef" || elemType.FullName == "Dialogue.DialogueLibraryRef")
-                            {
-                                object? dialogueRef = Activator.CreateInstance(elemType);
-                                var guidField = elemType.GetField("guid", BindingFlags.Instance | BindingFlags.Public);
-                                if (dialogueRef != null && guidField != null)
+                                foreach (JsonElement item in doc.RootElement.EnumerateArray())
                                 {
-                                    guidField.SetValue(dialogueRef, part);
-                                    elem = dialogueRef;
+                                    object? deserialized = DeserializeStructuredValue(elemType, item);
+                                    if (deserialized != null || !elemType.IsValueType)
+                                    {
+                                        list.Add(deserialized);
+                                    }
                                 }
                             }
-                            else if (elemType == typeof(AnimationController))
+                        }
+                        else
+                        {
+                            string[] parts = serialized.Split('|');
+                            foreach (string part in parts)
                             {
-                                elem = new AnimationController { Path = part };
-                            }
-                            else if (elemType == typeof(AnimationControllerOverride))
-                            {
-                                elem = new AnimationControllerOverride { Path = part };
-                            }
-                            else if (elemType == typeof(Entity))
-                            {
-                                // Entity is stored as int (entity ID)
-                                if (int.TryParse(part, out int entityId)) elem = new Entity(entityId);
-                            }
-                            else if (elemType.IsEnum)
-                            {
-                                if (int.TryParse(part, out int ev)) elem = Enum.ToObject(elemType, ev);
-                            }
-                            
-                            if (elem != null)
-                            {
-                                list.Add(elem);
+                                if (string.IsNullOrEmpty(part)) continue;
+
+                                object? elem = null;
+                                if (typeof(Scripting.Scriptable.ClayScriptableObject).IsAssignableFrom(elemType))
+                                {
+                                    elem = Scripting.Scriptable.ClayScriptableObjectLoader.Load(part, elemType);
+                                }
+                                else if (elemType == typeof(int))
+                                {
+                                    if (int.TryParse(part, out int iv)) elem = iv;
+                                }
+                                else if (elemType == typeof(float))
+                                {
+                                    if (float.TryParse(part, System.Globalization.NumberStyles.Float,
+                                        System.Globalization.CultureInfo.InvariantCulture, out float fv)) elem = fv;
+                                }
+                                else if (elemType == typeof(bool))
+                                {
+                                    elem = part == "true" || part == "1";
+                                }
+                                else if (elemType == typeof(string))
+                                {
+                                    elem = part;
+                                }
+                                else if (elemType == typeof(Prefab))
+                                {
+                                    elem = new Prefab { Guid = part };
+                                }
+                                else if (elemType == typeof(Mesh))
+                                {
+                                    elem = Mesh.FromInteropString(part);
+                                }
+                                else if (elemType == typeof(Texture))
+                                {
+                                    elem = Texture.FromInteropString(part);
+                                }
+                                else if (elemType == typeof(AudioClip))
+                                {
+                                    elem = AudioClip.FromInteropString(part);
+                                }
+                                else if (elemType.Name == "DialogueLibraryRef" || elemType.FullName == "Dialogue.DialogueLibraryRef")
+                                {
+                                    object? dialogueRef = Activator.CreateInstance(elemType);
+                                    var guidField = elemType.GetField("guid", BindingFlags.Instance | BindingFlags.Public);
+                                    if (dialogueRef != null && guidField != null)
+                                    {
+                                        guidField.SetValue(dialogueRef, part);
+                                        elem = dialogueRef;
+                                    }
+                                }
+                                else if (elemType == typeof(AnimationController))
+                                {
+                                    elem = new AnimationController { Path = part };
+                                }
+                                else if (elemType == typeof(AnimationControllerOverride))
+                                {
+                                    elem = new AnimationControllerOverride { Path = part };
+                                }
+                                else if (elemType == typeof(Entity))
+                                {
+                                    if (int.TryParse(part, out int entityId)) elem = new Entity(entityId);
+                                }
+                                else if (elemType.IsEnum)
+                                {
+                                    if (int.TryParse(part, out int ev)) elem = Enum.ToObject(elemType, ev);
+                                }
+
+                                if (elem != null)
+                                {
+                                    list.Add(elem);
+                                }
                             }
                         }
                     }
@@ -489,6 +1045,22 @@ namespace ClaymoreEngine
             try
             {
                 if (!TryGetLiveTarget(handle, out var inst) || inst == null) return false;
+
+                // Dotted path => nested struct field. Supports the simple value-type
+                // leaves used inside serializable structs.
+                if (field.IndexOf('.') >= 0)
+                {
+                    object? nv = GetNestedManagedFieldValue(inst, field, out Type? lt);
+                    if (nv == null || lt == null) return false;
+                    if (lt == typeof(int)) { Marshal.WriteInt32(boxedOut, (int)nv); return true; }
+                    if (lt == typeof(float)) { Marshal.StructureToPtr((float)nv, boxedOut, false); return true; }
+                    if (lt == typeof(bool)) { Marshal.WriteByte(boxedOut, (byte)(((bool)nv) ? 1 : 0)); return true; }
+                    if (lt == typeof(System.Numerics.Vector3)) { Marshal.StructureToPtr((System.Numerics.Vector3)nv, boxedOut, false); return true; }
+                    if (lt == typeof(Entity)) { Marshal.WriteInt32(boxedOut, ((Entity)nv).EntityID); return true; }
+                    if (lt.IsEnum) { Marshal.WriteInt32(boxedOut, Convert.ToInt32(nv)); return true; }
+                    return false;
+                }
+
                 var fi = inst.GetType().GetField(field, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
                 if (fi == null) return false;
 
@@ -638,78 +1210,92 @@ namespace ClaymoreEngine
                         return false;
 
                     case NativePropertyType.List:
-                        // Lists are serialized as pipe-separated strings
                         if (ft.IsGenericType && ft.GetGenericTypeDefinition() == typeof(List<>))
                         {
                             var list = value as System.Collections.IList;
                             if (list != null)
                             {
                                 Type elemType = ft.GetGenericArguments()[0];
-                                var parts = new List<string>();
-                                foreach (var elem in list)
+                                string listStr;
+
+                                if (IsStructuredListElementType(elemType))
                                 {
-                                    if (elem == null) continue;
-                                    string? serialized = null;
-                                    if (typeof(Scripting.Scriptable.ClayScriptableObject).IsAssignableFrom(elemType))
+                                    var payload = new List<object?>(list.Count);
+                                    foreach (var elem in list)
                                     {
-                                        var so = elem as Scripting.Scriptable.ClayScriptableObject;
-                                        serialized = so?.Guid ?? "";
+                                        payload.Add(SerializeStructuredValue(elem, elemType));
                                     }
-                                    else if (elemType == typeof(int))
-                                    {
-                                        serialized = ((int)elem).ToString();
-                                    }
-                                    else if (elemType == typeof(float))
-                                    {
-                                        serialized = ((float)elem).ToString(System.Globalization.CultureInfo.InvariantCulture);
-                                    }
-                                    else if (elemType == typeof(bool))
-                                    {
-                                        serialized = ((bool)elem) ? "true" : "false";
-                                    }
-                                    else if (elemType == typeof(string))
-                                    {
-                                        serialized = (string?)elem ?? "";
-                                    }
-                                    else if (elemType == typeof(Prefab))
-                                    {
-                                        serialized = ((Prefab)elem).Guid ?? "";
-                                    }
-                                    else if (elemType == typeof(Mesh))
-                                    {
-                                        serialized = ((Mesh)elem).ToInteropString();
-                                    }
-                                    else if (elemType == typeof(Texture))
-                                    {
-                                        serialized = ((Texture)elem).ToInteropString();
-                                    }
-                                    else if (elemType == typeof(AudioClip))
-                                    {
-                                        serialized = ((AudioClip)elem).ToInteropString();
-                                    }
-                                    else if (elemType.Name == "DialogueLibraryRef" || elemType.FullName == "Dialogue.DialogueLibraryRef")
-                                    {
-                                        var guidField = elemType.GetField("guid", BindingFlags.Instance | BindingFlags.Public);
-                                        serialized = guidField?.GetValue(elem) as string ?? "";
-                                    }
-                                    else if (elemType == typeof(AnimationController))
-                                    {
-                                        serialized = ((AnimationController)elem).Path ?? "";
-                                    }
-                                    else if (elemType == typeof(AnimationControllerOverride))
-                                    {
-                                        serialized = ((AnimationControllerOverride)elem).Path ?? "";
-                                    }
-                                    else if (elemType.IsEnum)
-                                    {
-                                        serialized = Convert.ToInt32(elem).ToString();
-                                    }
-                                    if (serialized != null)
-                                    {
-                                        parts.Add(serialized);
-                                    }
+                                    listStr = JsonSerializer.Serialize(payload);
                                 }
-                                string listStr = string.Join("|", parts);
+                                else
+                                {
+                                    var parts = new List<string>();
+                                    foreach (var elem in list)
+                                    {
+                                        if (elem == null) continue;
+                                        string? serialized = null;
+                                        if (typeof(Scripting.Scriptable.ClayScriptableObject).IsAssignableFrom(elemType))
+                                        {
+                                            var so = elem as Scripting.Scriptable.ClayScriptableObject;
+                                            serialized = so?.Guid ?? "";
+                                        }
+                                        else if (elemType == typeof(int))
+                                        {
+                                            serialized = ((int)elem).ToString();
+                                        }
+                                        else if (elemType == typeof(float))
+                                        {
+                                            serialized = ((float)elem).ToString(System.Globalization.CultureInfo.InvariantCulture);
+                                        }
+                                        else if (elemType == typeof(bool))
+                                        {
+                                            serialized = ((bool)elem) ? "true" : "false";
+                                        }
+                                        else if (elemType == typeof(string))
+                                        {
+                                            serialized = (string?)elem ?? "";
+                                        }
+                                        else if (elemType == typeof(Prefab))
+                                        {
+                                            serialized = ((Prefab)elem).Guid ?? "";
+                                        }
+                                        else if (elemType == typeof(Mesh))
+                                        {
+                                            serialized = ((Mesh)elem).ToInteropString();
+                                        }
+                                        else if (elemType == typeof(Texture))
+                                        {
+                                            serialized = ((Texture)elem).ToInteropString();
+                                        }
+                                        else if (elemType == typeof(AudioClip))
+                                        {
+                                            serialized = ((AudioClip)elem).ToInteropString();
+                                        }
+                                        else if (elemType.Name == "DialogueLibraryRef" || elemType.FullName == "Dialogue.DialogueLibraryRef")
+                                        {
+                                            var guidField = elemType.GetField("guid", BindingFlags.Instance | BindingFlags.Public);
+                                            serialized = guidField?.GetValue(elem) as string ?? "";
+                                        }
+                                        else if (elemType == typeof(AnimationController))
+                                        {
+                                            serialized = ((AnimationController)elem).Path ?? "";
+                                        }
+                                        else if (elemType == typeof(AnimationControllerOverride))
+                                        {
+                                            serialized = ((AnimationControllerOverride)elem).Path ?? "";
+                                        }
+                                        else if (elemType.IsEnum)
+                                        {
+                                            serialized = Convert.ToInt32(elem).ToString();
+                                        }
+                                        if (serialized != null)
+                                        {
+                                            parts.Add(serialized);
+                                        }
+                                    }
+                                    listStr = string.Join("|", parts);
+                                }
+
                                 IntPtr strPtr = Marshal.StringToHGlobalAnsi(listStr);
                                 // Write the pointer to the location pointed to by boxedOut
                                 Marshal.WriteIntPtr(boxedOut, strPtr);
@@ -1074,6 +1660,21 @@ namespace ClaymoreEngine
 
                     NativePropertyType nType = ToNative(field.FieldType);
 
+                    // Serializable structs (including System.Numerics.Vector2) are
+                    // expanded into flat "field.leaf" properties. Each leaf is a
+                    // primitive that round-trips through the existing serialization,
+                    // apply, and inspector paths; nested struct fields are reached
+                    // via dotted paths in Get/SetManagedField.
+                    if (nType == NativePropertyType.Struct)
+                    {
+                        object? structOwner = null;
+                        try { structOwner = Activator.CreateInstance(t); } catch { structOwner = null; }
+                        object? structDef = null;
+                        try { structDef = structOwner != null ? field.GetValue(structOwner) : null; } catch { structDef = null; }
+                        RegisterStructLeaves(t.FullName!, field.Name, field.FieldType, structDef, 0);
+                        continue;
+                    }
+
                     // Instantiate a temporary object to read field initializers as defaults
                     object? tmp = null; try { tmp = Activator.CreateInstance(t); } catch { tmp = null; }
                     object? def = null; try { def = tmp != null ? field.GetValue(tmp) : null; } catch { def = null; }
@@ -1161,6 +1762,11 @@ namespace ClaymoreEngine
                                 enumNames = string.Join("|", names);
                                 enumValues = string.Join("|", values);
                             }
+
+                            if (ToNative(elemType) == NativePropertyType.Struct)
+                            {
+                                structFieldsJson = BuildStructFieldsJson(elemType);
+                            }
                         }
                     }
 
@@ -1168,11 +1774,7 @@ namespace ClaymoreEngine
                     if (nType == NativePropertyType.Struct)
                     {
                         aux = ft.FullName;
-                        var structFields = GetStructFields(ft);
-                        // Build simple JSON array: [{"name":"x","type":1},...]
-                        var jsonParts = structFields.Select(sf => 
-                            $"{{\"name\":\"{sf.name}\",\"type\":{(int)sf.type},\"aux\":\"{sf.auxType ?? ""}\"}}");
-                        structFieldsJson = "[" + string.Join(",", jsonParts) + "]";
+                        structFieldsJson = BuildStructFieldsJson(ft);
                     }
 
                     // Check for PopulateFromResources attribute

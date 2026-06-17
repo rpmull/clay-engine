@@ -1,11 +1,11 @@
 #include "core/ecs/ScenePostProcessing.h"
 #include "core/ecs/EntityData.h"
 #include "core/ecs/AnimationComponents.h"
-#include "core/rendering/SkinnedPBRMaterial.h"
-#include "core/rendering/MaterialManager.h"
+#include "core/rendering/MaterialCache.h"
 #include "core/animation/AvatarDefinition.h"
 #include "core/jobs/Jobs.h"
 #include "core/jobs/ParallelFor.h"
+#include <algorithm>
 #include <iostream>
 #include <unordered_map>
 #include <unordered_set>
@@ -251,7 +251,12 @@ static void RebuildSkeletonBoneEntities(Scene& scene, const std::vector<EntityID
             }
         }
 
-        if (!needsRebuild) continue;
+        if (!needsRebuild) {
+            // BoneSkeletonEntity/BoneIndex are runtime-only (not serialized), so even
+            // when the loaded BoneEntities are valid we must (re)stamp the markers.
+            scene.RebindSkeletonBoneMarkers(id);
+            continue;
+        }
 
         const auto boneMap = BuildBoneNameMap(scene, id);
         skeleton.BoneEntities.assign(boneCount, INVALID_ENTITY_ID);
@@ -269,6 +274,9 @@ static void RebuildSkeletonBoneEntities(Scene& scene, const std::vector<EntityID
             skeleton.BoneEntities[i] = it->second;
             ++resolvedCount;
         }
+
+        // Stage 3 foundation: stamp runtime-only bone markers after rebinding by name.
+        scene.RebindSkeletonBoneMarkers(id);
 
         std::cout << "[ScenePostProcessing] Rebuilt " << resolvedCount << "/" << boneCount
                   << " bone entity refs for skeleton '" << data->Name
@@ -486,33 +494,45 @@ void EnsureSkinnedMaterials(Scene& scene, const std::vector<EntityID>& entities)
         // Check if mesh has skinning data
         bool meshIsSkinned = data->Mesh->mesh && data->Mesh->mesh->HasSkinning();
         if (!meshIsSkinned) continue;
-        
-        auto oldMat = data->Mesh->material;
-        bool needsSkinned = true;
-        
-        if (oldMat) {
-            std::string matName = oldMat->GetName();
-            if (std::dynamic_pointer_cast<SkinnedPBRMaterial>(oldMat) || 
-                matName.find("Skinned") != std::string::npos) {
-                needsSkinned = false;
-            }
+
+        MeshComponent& mesh = *data->Mesh;
+        const size_t slotCount = std::max<size_t>(1, mesh.materials.size());
+        if (mesh.materials.size() < slotCount) {
+            mesh.materials.resize(slotCount);
         }
-        
-        if (needsSkinned) {
-            auto newMat = MaterialManager::Instance().CreateSceneSkinnedDefaultMaterial(&scene);
-            if (oldMat) {
-                newMat->m_StateFlags = oldMat->GetStateFlags();
-                glm::vec4 tint(1.0f);
-                if (oldMat->TryGetUniform("u_ColorTint", tint)) {
-                    newMat->SetUniform("u_ColorTint", tint);
-                }
-            }
-            data->Mesh->material = newMat;
-            
-            if (!data->Mesh->materials.empty()) {
-                data->Mesh->materials[0] = newMat;
-            }
+        if (mesh.OwnedMaterialSlots.size() < slotCount) {
+            mesh.OwnedMaterialSlots.resize(slotCount, false);
         }
+
+        for (size_t slot = 0; slot < slotCount; ++slot) {
+            std::shared_ptr<Material> current =
+                mesh.materials[slot]
+                    ? mesh.materials[slot]
+                    : ((slot == 0) ? mesh.material : nullptr);
+            if (!current && slot != 0) {
+                continue;
+            }
+            std::shared_ptr<Material> skinned =
+                AcquireSkinnedMaterialVariant(scene, current);
+            if (!skinned) {
+                continue;
+            }
+
+            mesh.materials[slot] = skinned;
+            mesh.OwnedMaterialSlots[slot] =
+                !GetMaterialEquivalenceKey(skinned.get()).EquivalentSafe;
+        }
+
+        if (!mesh.materials.empty() && mesh.materials[0]) {
+            mesh.material = mesh.materials[0];
+        } else {
+            mesh.material = AcquireSkinnedMaterialVariant(scene, mesh.material);
+        }
+
+        mesh.UniqueMaterial = std::any_of(
+            mesh.OwnedMaterialSlots.begin(),
+            mesh.OwnedMaterialSlots.end(),
+            [](bool owned) { return owned; });
     }
 }
 

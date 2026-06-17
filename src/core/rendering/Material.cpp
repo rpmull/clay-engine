@@ -1,5 +1,17 @@
 #include "Material.h"
 #include "MaterialPropertyBlock.h"
+#include "TextureSamplerFlags.h"
+#include "core/ecs/Scene.h"
+
+// Sampler flags derived from the scene-wide texture filter preference
+// (Scene > Environment > Global Shader Properties > Texture Filter).
+// Base Material textures are bound via property blocks; without these flags
+// bgfx falls back to each texture's creation-time sampler and the scene
+// Point/Linear setting is ignored. Mirrors PBRMaterial::BindUniforms.
+static uint32_t EnvironmentTextureSamplerFlags()
+{
+    return cm::rendering::GetTextureSamplerFlags(Scene::Get().GetEnvironment());
+}
 
 // === Fast PropertyID-based API ===
 
@@ -241,9 +253,10 @@ void Material::ApplyPackedPropertyOverrides(const PackedPropertyOverrides& packe
         }
     }
 
+    const uint32_t envSamplerFlags = EnvironmentTextureSamplerFlags();
     for (const auto& entry : packed.TextureOverrides) {
         if (bgfx::isValid(entry.Sampler) && bgfx::isValid(entry.Texture)) {
-            bgfx::setTexture(entry.Stage, entry.Sampler, entry.Texture);
+            bgfx::setTexture(entry.Stage, entry.Sampler, entry.Texture, envSamplerFlags);
         }
     }
 
@@ -287,6 +300,7 @@ void Material::ApplyPropertyBlockFast(const MaterialPropertyBlock& block) const
     // skybox, and GPU skinning atlases). Custom material overrides start above
     // that range so they don't stomp renderer bindings mid-draw.
     uint8_t nextFreeSlot = 12;
+    const uint32_t envSamplerFlags = EnvironmentTextureSamplerFlags();
     for (const auto& entry : textureOverrides) {
         uint32_t propId = entry.PropertyId;
         bgfx::TextureHandle tex = entry.Texture;
@@ -299,8 +313,8 @@ void Material::ApplyPropertyBlockFast(const MaterialPropertyBlock& block) const
         if (maxSlots > 0 && stage >= maxSlots) {
             continue;
         }
-        
-        bgfx::setTexture(stage, sampler, tex);
+
+        bgfx::setTexture(stage, sampler, tex, envSamplerFlags);
         
         // Update texture usage flags (only if CommonProperties are initialized)
         if (CommonProperties::MetallicRoughness.IsValid()) {
@@ -357,6 +371,7 @@ void Material::ApplyPropertyBlock(const MaterialPropertyBlock& block) const
     // Reserve stages 7-11 for renderer-owned global samplers (shadow maps,
     // skybox, and GPU skinning atlases).
     uint8_t nextFreeSlot = 12;
+    const uint32_t envSamplerFlags = EnvironmentTextureSamplerFlags();
     for (const auto& kv : block.Textures)
     {
         const PropertyID id = PropertyID::Get(kv.first);
@@ -364,7 +379,7 @@ void Material::ApplyPropertyBlock(const MaterialPropertyBlock& block) const
         if (bgfx::isValid(sampler) && bgfx::isValid(kv.second))
         {
             uint8_t stage = ResolveTextureStage(id.Value(), nextFreeSlot);
-            bgfx::setTexture(stage, sampler, kv.second);
+            bgfx::setTexture(stage, sampler, kv.second, envSamplerFlags);
             if (usageIt != m_Uniforms.end())
             {
                 if (kv.first == "s_metallicRoughness") { ensureUsage(); usageOverride.x = 1.0f; }

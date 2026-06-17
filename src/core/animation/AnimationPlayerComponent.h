@@ -202,6 +202,14 @@ struct AnimationPlayerComponent {
     /// Exposed runtime info for UI and scripting
     std::string Debug_CurrentAnimationName;      ///< clip/asset name currently bound
     std::string Debug_CurrentControllerStateName; ///< controller state name when in controller mode
+    std::string Debug_PreviousControllerStateName; ///< base-layer state active before the current one (for PreviousState query)
+
+    // =========================================================================
+    // State Enter/Exit Callback Tracking (base layer)
+    // =========================================================================
+    /// Last committed base-layer state id for which we dispatched enter/exit callbacks.
+    /// Compared against CurrentStateId each frame to detect transitions.
+    int _StateCallbackPrevStateId = -1;
 
     // Runtime-only dormancy bit set by AnimationSystem when an offscreen
     // animator is frozen on a stable idle pose. Skinning can use this to
@@ -312,6 +320,12 @@ struct AnimationPlayerComponent {
     
     /// Force reload of all cached assets (call after controller file changes)
     void InvalidateAssetCache() {
+        if (!ControllerPath.empty()) {
+            Controller.reset();
+        }
+        if (!ControllerOverridePath.empty()) {
+            ControllerOverride.reset();
+        }
         CachedClips.clear();
         CachedAssets.clear();
         CachedDurations.clear();

@@ -14,6 +14,7 @@
 #include "editor/import/ModelLoader.h"
 #include <bx/math.h>
 #include "core/rendering/ShaderManager.h"
+#include "core/rendering/MaterialCache.h"
 #include "core/rendering/TextureLoader.h"
 #include "core/rendering/TerrainGrass.h"
 #include "panels/InspectorPanel.h"
@@ -21,7 +22,6 @@
 #include "editor/panels/AnimationInspector.h"
 #include "editor/animation/AnimationTimelinePanel.h"
 #include "core/rendering/MaterialManager.h"
-#include "core/rendering/MaterialInstance.h"
 #include "core/rendering/PBRMaterial.h"
 #include "core/rendering/StandardMeshManager.h"
 #include "core/world/RuntimeWorld.h"
@@ -70,6 +70,7 @@
 #include "core/physics/Physics.h"
 #include "core/utils/Profiler.h"
 #include "core/prefab/PrefabAPI.h"
+#include "core/prefab/PrefabPrewarm.h"
 #include "core/prefab/RuntimePrefabInstantiator.h"
 
 #ifndef NOMINMAX
@@ -160,76 +161,6 @@ uint32_t FloatBits(float v)
     static_assert(sizeof(bits) == sizeof(v), "float and uint32 size mismatch");
     std::memcpy(&bits, &v, sizeof(bits));
     return bits;
-}
-
-struct MaterialEquivalenceKeyInfo
-{
-    uint64_t Key = 0;
-    bool EquivalentSafe = false;
-};
-
-MaterialEquivalenceKeyInfo GetMaterialEquivalenceKey(const Material* material)
-{
-    MaterialEquivalenceKeyInfo info{};
-    if (!material) {
-        return info;
-    }
-
-    info.Key = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(material));
-    if (dynamic_cast<const MaterialInstance*>(material) != nullptr) {
-        return info;
-    }
-
-    if (const auto* pbr = dynamic_cast<const PBRMaterial*>(material)) {
-        const PropertyID colorTintId = PropertyID::Get("u_ColorTint");
-        const PropertyID tintParamsId = PropertyID::Get("u_TintParams");
-
-        uint64_t h = 1469598103934665603ULL;
-        h = HashCombine64(h, static_cast<uint64_t>(material->GetProgram().idx));
-        h = HashCombine64(h, static_cast<uint64_t>(material->GetStateFlags()));
-        h = HashCombine64(h, static_cast<uint64_t>(pbr->m_AlbedoTex.idx));
-        h = HashCombine64(h, static_cast<uint64_t>(pbr->m_MetallicRoughnessTex.idx));
-        h = HashCombine64(h, static_cast<uint64_t>(pbr->m_NormalTex.idx));
-        h = HashCombine64(h, static_cast<uint64_t>(pbr->m_AOTex.idx));
-        h = HashCombine64(h, static_cast<uint64_t>(pbr->m_EmissionTex.idx));
-        h = HashCombine64(h, static_cast<uint64_t>(pbr->m_DisplacementTex.idx));
-        h = HashCombine64(h, FloatBits(pbr->GetMetallic()));
-        h = HashCombine64(h, FloatBits(pbr->GetRoughness()));
-        h = HashCombine64(h, FloatBits(pbr->GetNormalScale()));
-        h = HashCombine64(h, FloatBits(pbr->GetAmbientOcclusion()));
-        h = HashCombine64(h, FloatBits(pbr->GetEmissionStrength()));
-        h = HashCombine64(h, FloatBits(pbr->GetDisplacementScale()));
-
-        const glm::vec3 emissionColor = pbr->GetEmissionColor();
-        h = HashCombine64(h, FloatBits(emissionColor.x));
-        h = HashCombine64(h, FloatBits(emissionColor.y));
-        h = HashCombine64(h, FloatBits(emissionColor.z));
-
-        const glm::vec2 uvScale = pbr->GetUVScale();
-        const glm::vec2 uvOffset = pbr->GetUVOffset();
-        h = HashCombine64(h, FloatBits(uvScale.x));
-        h = HashCombine64(h, FloatBits(uvScale.y));
-        h = HashCombine64(h, FloatBits(uvOffset.x));
-        h = HashCombine64(h, FloatBits(uvOffset.y));
-
-        glm::vec4 tint(1.0f);
-        glm::vec4 tintParams(0.0f);
-        material->TryGetUniform(colorTintId, tint);
-        material->TryGetUniform(tintParamsId, tintParams);
-        h = HashCombine64(h, FloatBits(tint.x));
-        h = HashCombine64(h, FloatBits(tint.y));
-        h = HashCombine64(h, FloatBits(tint.z));
-        h = HashCombine64(h, FloatBits(tint.w));
-        h = HashCombine64(h, FloatBits(tintParams.x));
-        h = HashCombine64(h, FloatBits(tintParams.y));
-        h = HashCombine64(h, FloatBits(tintParams.z));
-        h = HashCombine64(h, FloatBits(tintParams.w));
-
-        info.Key = h;
-        info.EquivalentSafe = true;
-    }
-
-    return info;
 }
 
 ImVec4 LerpImVec4(const ImVec4& a, const ImVec4& b, float t)
@@ -1864,6 +1795,26 @@ void UILayer::OnUIRender() {
             ImGui::Text("Objects culled: %llu", static_cast<unsigned long long>(culledObjects));
             ImGui::Text("Skinned meshes culled: %llu / %llu", static_cast<unsigned long long>(skinnedMeshesCulled), static_cast<unsigned long long>(skinnedMeshesTotal));
             ImGui::Text("GPU morphed skinned meshes: %d active / %d eligible", gpuMorphActiveSkinnedMeshes, gpuMorphEligibleSkinnedMeshes);
+            // NOTE: the line above is a UI-side proxy (eligible = Dynamic+skinned+blendshapes;
+            // active = eligible AND has any nonzero blendshape weight). It does NOT reflect
+            // whether the skinning system actually activated GPU crowd morph. The counters
+            // below are the ground truth published by SkinningSystem each frame.
+            {
+                const auto& skinCounters = Profiler::Get().GetLastFrameCounters();
+                auto skinCounter = [&](const char* name) -> unsigned long long {
+                    auto it = skinCounters.find(name);
+                    return it != skinCounters.end() ? static_cast<unsigned long long>(it->second) : 0ull;
+                };
+                ImGui::Text("  GPU morph: crowd %llu  batchTooSmall %llu  renderBlocked %llu  cpuConsumerBlocked %llu",
+                    skinCounter("Skinning/GpuMorphCrowdEligibleMeshes"),
+                    skinCounter("Skinning/GpuMorphBatchTooSmall"),
+                    skinCounter("Skinning/GpuMorphRenderStateBlocked"),
+                    skinCounter("Skinning/GpuMorphCpuConsumerBlocked"));
+                ImGui::Text("  Skinning: groupsUpdated %llu  sharedSource %llu  morphBaseCapable %llu",
+                    skinCounter("Skinning/GroupsUpdated"),
+                    skinCounter("Skinning/GpuSharedSourceMeshes"),
+                    skinCounter("Skinning/GpuMorphBaseCapableMeshes"));
+            }
             ImGui::Text("Skinned LOD groups: Near %llu  Medium %llu  Far %llu  Beyond %llu",
                 static_cast<unsigned long long>(lodNearGroups),
                 static_cast<unsigned long long>(lodMediumGroups),
@@ -3012,8 +2963,16 @@ bool UILayer::LaunchExternalRuntimePreview(const std::string& runtimeExePath,
     if (windowMode == PlayWindowMode::Fullscreen) {
         args += L" --fullscreen";
     } else {
+        const Environment& env = m_Scene.GetEnvironment();
+        const uint32_t launchWidth = env.HasFixedRenderResolution()
+            ? static_cast<uint32_t>(env.RenderResolutionWidth)
+            : static_cast<uint32_t>(std::max(1, Renderer::Get().GetBackbufferWidth()));
+        const uint32_t launchHeight = env.HasFixedRenderResolution()
+            ? static_cast<uint32_t>(env.RenderResolutionHeight)
+            : static_cast<uint32_t>(std::max(1, Renderer::Get().GetBackbufferHeight()));
         args += L" --windowed";
-        args += L" --width 1600 --height 900";
+        args += L" --width " + std::to_wstring(launchWidth);
+        args += L" --height " + std::to_wstring(launchHeight);
     }
 
     std::wstring commandLine = quote(runtimeExe.wstring()) + L" " + args;
@@ -3242,14 +3201,16 @@ void UILayer::ProcessDeferredSceneLoad() {
     EndBlockingOverlay();
 }
 
-void UILayer::BeginBlockingOverlay(const std::string& label) {
+void UILayer::BeginBlockingOverlay(const std::string& label, float progress) {
     m_BlockingOverlayActive = true;
     m_BlockingOverlayLabel = label;
+    m_BlockingOverlayProgress = progress < 0.0f ? -1.0f : std::clamp(progress, 0.0f, 1.0f);
 }
 
 void UILayer::EndBlockingOverlay() {
     m_BlockingOverlayActive = false;
     m_BlockingOverlayLabel.clear();
+    m_BlockingOverlayProgress = -1.0f;
 }
 
 bool UILayer::HasTerrainSelection() {
@@ -3301,12 +3262,14 @@ void UILayer::RenderBlockingOverlay() {
     ImGui::Text("%s", m_BlockingOverlayLabel.empty()? "Loading..." : m_BlockingOverlayLabel.c_str());
     ImGui::Separator();
     
-    // Indeterminate bar alternative
-    static float t = 0.0f; 
-    t += 0.02f; 
-    if (t > 1.0f) t = 0.0f;
-     
-    ImGui::ProgressBar(t, ImVec2(-1, 0));
+    if (m_BlockingOverlayProgress >= 0.0f) {
+        ImGui::ProgressBar(m_BlockingOverlayProgress, ImVec2(-1, 0));
+    } else {
+        static float t = 0.0f;
+        t += 0.02f;
+        if (t > 1.0f) t = 0.0f;
+        ImGui::ProgressBar(t, ImVec2(-1, 0));
+    }
     ImGui::EndChild();
     ImGui::End();
     ImGui::PopStyleColor();
@@ -3318,6 +3281,8 @@ void UILayer::RequestBeginPlayAsync(bool binaryOnly, bool useTempPak, PlayWindow
     m_PendingPlayOptions.useTempPak = useTempPak;
     m_PendingPlayOptions.binaryOnly = binaryOnly || useTempPak;
     m_PendingPlayOptions.windowMode = windowMode;
+    m_PlayModeStartPhase = PlayModeStartPhase::Idle;
+    m_PendingPlayBaseScene.reset();
     if (windowMode == PlayWindowMode::Editor) {
         BeginBlockingOverlay(useTempPak ? "Preparing Runtime Preview..." : "Starting Play Mode...");
     } else {
@@ -3330,199 +3295,236 @@ void UILayer::RequestBeginPlayAsync(bool binaryOnly, bool useTempPak, PlayWindow
 
 void UILayer::ProcessBeginPlayAsync() {
     if (!m_BeginPlayRequested) return;
-    // Perform the heavy work now that at least one UI frame has rendered the overlay
-    
-    // Clear prefab failed cache so failed prefabs can be retried in the new play session
-    ClearPrefabFailedCache();
-    runtime::RuntimePrefabInstantiator::ResetRuntimeCaches();
-    
+
     auto& scene = m_Scene;
-    std::shared_ptr<Scene> baseScene;
-    std::string entryScenePath;
+    auto resetPlayStartState = [this]() {
+        m_PlayModeStartPhase = PlayModeStartPhase::Idle;
+        m_PendingPlayBaseScene.reset();
+    };
     auto abortPlay = [&](const char* message) {
         if (message && *message) {
             std::cerr << message << std::endl;
         }
+        prefab::Clear();
+        resetPlayStartState();
         EndRuntimePreview();
         EndBlockingOverlay();
         m_BeginPlayRequested = false;
         m_ToolbarPanel.AbortPlayMode();
     };
 
-    if (m_PendingPlayOptions.useTempPak) {
-        if (scene.IsDirty() || m_CurrentScenePath.empty()) {
-            abortPlay("[PlayMode] Runtime Preview requires a saved scene. Save the scene and try again.");
-            return;
-        }
+    if (m_PlayModeStartPhase != PlayModeStartPhase::Prewarming) {
+        // Perform the heavy setup now that at least one UI frame has rendered the overlay.
+        ClearPrefabFailedCache();
+        runtime::RuntimePrefabInstantiator::ResetRuntimeCaches();
+        prefab::Clear();
+        resetPlayStartState();
 
-        const bool externalPreview = m_PendingPlayOptions.windowMode != PlayWindowMode::Editor;
-        const std::string projName = GetProjectNameOrFallback();
-        const fs::path cacheRoot = BinaryAssetCache::Instance().GetCacheRoot();
-        const fs::path previewOutputDir = externalPreview ? (cacheRoot / "runtime_preview") : cacheRoot;
-        if (externalPreview) {
-            std::error_code cleanupEc;
-            fs::remove_all(previewOutputDir, cleanupEc);
-            if (cleanupEc) {
-                std::cerr << "[PlayMode] Warning: Could not fully clear preview staging directory: "
-                          << previewOutputDir << " (" << cleanupEc.message() << ")" << std::endl;
-            }
-        }
+        std::shared_ptr<Scene> baseScene;
+        std::string entryScenePath;
 
-        std::error_code createDirEc;
-        fs::create_directories(previewOutputDir, createDirEc);
-        if (createDirEc) {
-            std::cerr << "[PlayMode] Failed to prepare preview output directory: "
-                      << previewOutputDir << " (" << createDirEc.message() << ")" << std::endl;
-            abortPlay("[PlayMode] Failed to prepare runtime preview output directory.");
-            return;
-        }
-
-        BuildExporter::Options opts;
-        opts.outputDirectory = previewOutputDir.string();
-        opts.entryScenes = { m_CurrentScenePath };
-        opts.validateBeforeExport = true;
-        opts.compressPak = true;
-        opts.pakOnly = !externalPreview;
-        opts.allowPartialBinaryBuilds = true;
-
-        if (!BuildExporter::ExportProject(opts, [this](float, const std::string& status) {
-            BeginBlockingOverlay(status);
-        })) {
-            abortPlay("[PlayMode] Runtime Preview export failed.");
-            return;
-        }
-
-        const fs::path pakPath = previewOutputDir / (projName + ".pak");
-        if (externalPreview) {
-            const fs::path runtimeExePath = previewOutputDir / (projName + ".exe");
-            if (!LaunchExternalRuntimePreview(runtimeExePath.string(),
-                                              previewOutputDir.string(),
-                                              pakPath.string(),
-                                              m_PendingPlayOptions.windowMode)) {
-                abortPlay("[PlayMode] Failed to launch external runtime preview.");
+        if (m_PendingPlayOptions.useTempPak) {
+            if (scene.IsDirty() || m_CurrentScenePath.empty()) {
+                abortPlay("[PlayMode] Runtime Preview requires a saved scene. Save the scene and try again.");
                 return;
             }
 
-            m_ExternalRuntimePreviewActive = true;
-            TogglePlayMode();
-            EndBlockingOverlay();
-            m_BeginPlayRequested = false;
-            return;
-        }
-
-        // Mount temp pak
-        m_PrePlayPakPath = FileSystem::Instance().GetMountedPakPath();
-        if (!FileSystem::Instance().MountPak(pakPath.string())) {
-            std::string err = std::string("[PlayMode] Failed to mount preview pak: ") + pakPath.string();
-            abortPlay(err.c_str());
-            return;
-        }
-
-        m_PrePlayDiskFallbackAllowed = FileSystem::Instance().IsDiskFallbackAllowed();
-        FileSystem::Instance().SetAllowDiskFallback(false);
-
-        // Swap to runtime asset resolver and load manifest for GUID/path resolution
-        m_PrePlayResolver = Assets::GetResolver();
-        m_RuntimePreviewResolver = std::make_unique<RuntimeAssetResolver>();
-        m_RuntimePreviewActive = true;
-        {
-            std::string manifestText;
-            if (FileSystem::Instance().ReadTextFile("game_manifest.json", manifestText)) {
-                m_RuntimePreviewResolver->LoadManifest(manifestText);
-                try {
-                    auto j = nlohmann::json::parse(manifestText);
-                    entryScenePath = j.value("entryScene", "");
-                } catch (...) {}
-            } else {
-                abortPlay("[PlayMode] Failed to read game_manifest.json from preview pak.");
-                return;
-            }
-        }
-        {
-            std::string resourceText;
-            if (FileSystem::Instance().ReadTextFile("resource_manifest.json", resourceText)) {
-                m_PrePlayResourceManifestPath = (BinaryAssetCache::Instance().GetCacheRoot() / "resource_manifest_editor_backup.json").string();
-                m_RestoreResourceManifest = ResourceManifest::Get().SaveToFile(m_PrePlayResourceManifestPath);
-                m_RuntimePreviewResolver->LoadResourceManifest(resourceText);
-            }
-        }
-
-        // Load model registry from pak
-        cm::ModelRegistry::Instance().Load(".bin/model_registry.bin");
-    }
-
-    if (m_PendingPlayOptions.binaryOnly && !m_PendingPlayOptions.useTempPak) {
-        // Serialize current scene to a temporary binary and load from it
-        std::filesystem::path tempBinPath = BinaryAssetCache::Instance().GetCacheRoot() / "playmode_temp.sceneb";
-        std::filesystem::path tempStampPath = tempBinPath;
-        tempStampPath += ".stamp.json";
-        std::error_code ec;
-        std::filesystem::create_directories(tempBinPath.parent_path(), ec);
-        if (ec) {
-            std::cerr << "[PlayMode] Failed to create binary cache directory: " 
-                      << tempBinPath.parent_path().string() << " (" << ec.message() << ")\n";
-        }
-
-        const uint64_t sceneHash = ComputePlayModeSceneHash(scene);
-        uint64_t stampedHash = 0;
-        const bool canReuseTempBinary =
-            sceneHash != 0 &&
-            std::filesystem::exists(tempBinPath) &&
-            ReadPlayModeSceneStamp(tempStampPath, stampedHash) &&
-            stampedHash == sceneHash;
-
-        if (!canReuseTempBinary) {
-            if (!binary::EntityBinaryWriter::Write(scene, tempBinPath.string())) {
-                abortPlay("[PlayMode] Failed to write temporary binary scene.");
-                return;
-            }
-            WritePlayModeSceneStamp(tempStampPath, sceneHash);
-        } else {
-            std::cout << "[PlayMode] Reusing current temporary binary scene: "
-                      << tempBinPath.string() << "\n";
-        }
-
-        baseScene = std::make_shared<Scene>();
-        if (!binary::EntityBinaryLoader::Load(tempBinPath.string(), *baseScene)) {
-            if (std::filesystem::exists(tempBinPath)) {
-                std::error_code sizeEc;
-                auto size = std::filesystem::file_size(tempBinPath, sizeEc);
-                if (!sizeEc) {
-                    std::cerr << "[PlayMode] Temporary binary size: " << size << " bytes\n";
+            const bool externalPreview = m_PendingPlayOptions.windowMode != PlayWindowMode::Editor;
+            const std::string projName = GetProjectNameOrFallback();
+            const fs::path cacheRoot = BinaryAssetCache::Instance().GetCacheRoot();
+            const fs::path previewOutputDir = externalPreview ? (cacheRoot / "runtime_preview") : cacheRoot;
+            if (externalPreview) {
+                std::error_code cleanupEc;
+                fs::remove_all(previewOutputDir, cleanupEc);
+                if (cleanupEc) {
+                    std::cerr << "[PlayMode] Warning: Could not fully clear preview staging directory: "
+                              << previewOutputDir << " (" << cleanupEc.message() << ")" << std::endl;
                 }
             }
-            abortPlay("[PlayMode] Failed to load temporary binary scene.");
-            return;
+
+            std::error_code createDirEc;
+            fs::create_directories(previewOutputDir, createDirEc);
+            if (createDirEc) {
+                std::cerr << "[PlayMode] Failed to prepare preview output directory: "
+                          << previewOutputDir << " (" << createDirEc.message() << ")" << std::endl;
+                abortPlay("[PlayMode] Failed to prepare runtime preview output directory.");
+                return;
+            }
+
+            BuildExporter::Options opts;
+            opts.outputDirectory = previewOutputDir.string();
+            opts.entryScenes = { m_CurrentScenePath };
+            opts.validateBeforeExport = true;
+            opts.compressPak = true;
+            opts.pakOnly = !externalPreview;
+            opts.allowPartialBinaryBuilds = true;
+
+            if (!BuildExporter::ExportProject(opts, [this](float progress, const std::string& status) {
+                BeginBlockingOverlay(status, progress);
+            })) {
+                abortPlay("[PlayMode] Runtime Preview export failed.");
+                return;
+            }
+
+            const fs::path pakPath = previewOutputDir / (projName + ".pak");
+            if (externalPreview) {
+                const fs::path runtimeExePath = previewOutputDir / (projName + ".exe");
+                if (!LaunchExternalRuntimePreview(runtimeExePath.string(),
+                                                  previewOutputDir.string(),
+                                                  pakPath.string(),
+                                                  m_PendingPlayOptions.windowMode)) {
+                    abortPlay("[PlayMode] Failed to launch external runtime preview.");
+                    return;
+                }
+
+                m_ExternalRuntimePreviewActive = true;
+                prefab::Clear();
+                resetPlayStartState();
+                TogglePlayMode();
+                EndBlockingOverlay();
+                m_BeginPlayRequested = false;
+                return;
+            }
+
+            m_PrePlayPakPath = FileSystem::Instance().GetMountedPakPath();
+            if (!FileSystem::Instance().MountPak(pakPath.string())) {
+                std::string err = std::string("[PlayMode] Failed to mount preview pak: ") + pakPath.string();
+                abortPlay(err.c_str());
+                return;
+            }
+
+            m_PrePlayDiskFallbackAllowed = FileSystem::Instance().IsDiskFallbackAllowed();
+            FileSystem::Instance().SetAllowDiskFallback(false);
+
+            m_PrePlayResolver = Assets::GetResolver();
+            m_RuntimePreviewResolver = std::make_unique<RuntimeAssetResolver>();
+            m_RuntimePreviewActive = true;
+            {
+                std::string manifestText;
+                if (FileSystem::Instance().ReadTextFile("game_manifest.json", manifestText)) {
+                    m_RuntimePreviewResolver->LoadManifest(manifestText);
+                    try {
+                        auto j = nlohmann::json::parse(manifestText);
+                        entryScenePath = j.value("entryScene", "");
+                    } catch (...) {}
+                } else {
+                    abortPlay("[PlayMode] Failed to read game_manifest.json from preview pak.");
+                    return;
+                }
+            }
+            {
+                std::string resourceText;
+                if (FileSystem::Instance().ReadTextFile("resource_manifest.json", resourceText)) {
+                    m_PrePlayResourceManifestPath = (BinaryAssetCache::Instance().GetCacheRoot() / "resource_manifest_editor_backup.json").string();
+                    m_RestoreResourceManifest = ResourceManifest::Get().SaveToFile(m_PrePlayResourceManifestPath);
+                    m_RuntimePreviewResolver->LoadResourceManifest(resourceText);
+                }
+            }
+
+            cm::ModelRegistry::Instance().Load(".bin/model_registry.bin");
         }
-    } else if (m_PendingPlayOptions.useTempPak) {
-        if (entryScenePath.empty()) {
-            abortPlay("[PlayMode] Preview pak missing entry scene.");
-            return;
+
+        if (m_PendingPlayOptions.binaryOnly && !m_PendingPlayOptions.useTempPak) {
+            std::filesystem::path tempBinPath = BinaryAssetCache::Instance().GetCacheRoot() / "playmode_temp.sceneb";
+            std::filesystem::path tempStampPath = tempBinPath;
+            tempStampPath += ".stamp.json";
+            std::error_code ec;
+            std::filesystem::create_directories(tempBinPath.parent_path(), ec);
+            if (ec) {
+                std::cerr << "[PlayMode] Failed to create binary cache directory: "
+                          << tempBinPath.parent_path().string() << " (" << ec.message() << ")\n";
+            }
+
+            const uint64_t sceneHash = ComputePlayModeSceneHash(scene);
+            uint64_t stampedHash = 0;
+            const bool canReuseTempBinary =
+                sceneHash != 0 &&
+                std::filesystem::exists(tempBinPath) &&
+                ReadPlayModeSceneStamp(tempStampPath, stampedHash) &&
+                stampedHash == sceneHash;
+
+            if (!canReuseTempBinary) {
+                if (!binary::EntityBinaryWriter::Write(scene, tempBinPath.string())) {
+                    abortPlay("[PlayMode] Failed to write temporary binary scene.");
+                    return;
+                }
+                WritePlayModeSceneStamp(tempStampPath, sceneHash);
+            } else {
+                std::cout << "[PlayMode] Reusing current temporary binary scene: "
+                          << tempBinPath.string() << "\n";
+            }
+
+            baseScene = std::make_shared<Scene>();
+            if (!binary::EntityBinaryLoader::Load(tempBinPath.string(), *baseScene)) {
+                if (std::filesystem::exists(tempBinPath)) {
+                    std::error_code sizeEc;
+                    auto size = std::filesystem::file_size(tempBinPath, sizeEc);
+                    if (!sizeEc) {
+                        std::cerr << "[PlayMode] Temporary binary size: " << size << " bytes\n";
+                    }
+                }
+                abortPlay("[PlayMode] Failed to load temporary binary scene.");
+                return;
+            }
+        } else if (m_PendingPlayOptions.useTempPak) {
+            if (entryScenePath.empty()) {
+                abortPlay("[PlayMode] Preview pak missing entry scene.");
+                return;
+            }
+            baseScene = std::make_shared<Scene>();
+            if (!binary::EntityBinaryLoader::Load(entryScenePath, *baseScene)) {
+                std::string err = std::string("[PlayMode] Failed to load entry scene from preview pak: ") + entryScenePath;
+                abortPlay(err.c_str());
+                return;
+            }
         }
-        baseScene = std::make_shared<Scene>();
-        if (!binary::EntityBinaryLoader::Load(entryScenePath, *baseScene)) {
-            std::string err = std::string("[PlayMode] Failed to load entry scene from preview pak: ") + entryScenePath;
-            abortPlay(err.c_str());
+
+        Scene& playSource = baseScene ? *baseScene : scene;
+        PrepareSceneForPlayClone(playSource, baseScene ? "binary source" : "editor source");
+        m_PendingPlayBaseScene = std::move(baseScene);
+
+        TextureLoadSettings textureSettings{};
+        textureSettings.MaxDimension = playSource.GetEnvironment().TextureMaxDimension;
+        if (SetPersistentTextureLoadSettings(textureSettings)) {
+            RefreshSceneTextureOverrides(playSource);
+        }
+        prefab::Clear();
+        prefab::QueueScenePrefabs(playSource);
+        if (prefab::HasPendingWork()) {
+            m_PlayModeStartPhase = PlayModeStartPhase::Prewarming;
+            prefab::Update(12.0);
+            BeginBlockingOverlay("Prewarming Play Mode Assets...", prefab::GetProgress());
+            if (prefab::HasPendingWork()) {
+                return;
+            }
+        }
+    } else {
+        prefab::Update(12.0);
+        BeginBlockingOverlay("Prewarming Play Mode Assets...", prefab::GetProgress());
+        if (prefab::HasPendingWork()) {
             return;
         }
     }
 
-    if (baseScene) {
-        PrepareSceneForPlayClone(*baseScene, "binary source");
-        baseScene->ReleasePhysicsRuntimeState();
-        scene.m_RuntimeScene = baseScene->RuntimeClone();
+    if (m_PendingPlayBaseScene) {
+        m_PendingPlayBaseScene->ReleasePhysicsRuntimeState();
+        scene.m_RuntimeScene = m_PendingPlayBaseScene->RuntimeClone();
     } else {
-        PrepareSceneForPlayClone(scene, "editor source");
         scene.ReleasePhysicsRuntimeState();
         scene.m_RuntimeScene = scene.RuntimeClone();
     }
 
-    if (scene.m_RuntimeScene) {
-        scene.m_RuntimeScene->m_IsPlaying = true;
-        // CRITICAL: Update global scene pointer so scripts create entities in the runtime scene
-        Scene::CurrentScene = scene.m_RuntimeScene.get();
-        TogglePlayMode();
+    if (!scene.m_RuntimeScene) {
+        abortPlay("[PlayMode] Failed to create runtime scene clone.");
+        return;
     }
+
+    scene.m_RuntimeScene->m_IsPlaying = true;
+    // CRITICAL: Update global scene pointer so scripts create entities in the runtime scene
+    Scene::CurrentScene = scene.m_RuntimeScene.get();
+    TogglePlayMode();
+    prefab::Clear();
+    resetPlayStartState();
     EndBlockingOverlay();
     m_BeginPlayRequested = false;
 }

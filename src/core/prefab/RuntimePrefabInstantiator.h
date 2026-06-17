@@ -3,6 +3,7 @@
 #include "PrefabAsset.h"
 #include "core/ecs/Entity.h"
 #include "core/assets/IAssetResolver.h"
+#include <memory>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -119,6 +120,26 @@ public:
     static EntityID InstantiateByGuid(const ClaymoreGUID& prefabGuid, Scene& scene,
                                       EntityID existingRoot = INVALID_ENTITY_ID,
                                       bool useExistingRoot = false);
+
+    /**
+     * Load and parse the compiled prefab into the runtime cache without
+     * instantiating it. This mirrors Godot's separation between loading a
+     * PackedScene resource and instantiating from its prepared SceneState.
+     */
+    static bool Preload(const std::string& prefabPath);
+
+    /**
+     * Store already-read compiled prefab bytes in the runtime cache.
+     * Used by the prewarm system to avoid re-reading the same file.
+     */
+    static bool PreloadFromMemory(const std::string& prefabPath,
+                                  std::shared_ptr<std::vector<uint8_t>> data);
+
+    /**
+     * Resolve a prefab GUID through the asset resolver and preload its
+     * compiled binary representation.
+     */
+    static bool PreloadByGuid(const ClaymoreGUID& prefabGuid);
     
     /**
      * Process queued async prefab instantiations with a time budget (ms).
@@ -136,6 +157,13 @@ public:
      * Call on play-mode/session boundaries to avoid stale prefab data reuse.
      */
     static void ResetRuntimeCaches();
+
+    /**
+     * Drop prepared runtime state for a single prefab path. This is used by
+     * editor import/reimport so one changed prefab does not evict unrelated
+     * prepared scenes.
+     */
+    static void InvalidateCache(const std::string& prefabPath);
 
     /**
      * Cancel queued async prefab requests targeting a specific scene.

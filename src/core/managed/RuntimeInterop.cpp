@@ -29,6 +29,7 @@
 #include "managed/interop/ResourceInterop.h"
 #include "managed/interop/DialogueInterop.h"
 #include "managed/interop/AnimationEventInterop.h"
+#include "managed/interop/AnimationStateInterop.h"
 #include "core/multiplayer/NetworkingInterop.h"
 
 #include <iostream>
@@ -81,6 +82,7 @@ extern "C" void* Get_Prefab_InstantiateByGuidBlocking_Ptr();
 extern "C" void* Get_Prefab_InstantiateByGuidWithRoot_Ptr();
 extern "C" void* Get_Prefab_GetAsyncStatus_Ptr();
 extern "C" void* Get_Prefab_GetAssetNameByGuid_Ptr();
+extern "C" void* Get_Prefab_PreloadByGuid_Ptr();
 
 // Mesh interop functions (defined in MeshInterop.cpp)
 extern "C" void* Get_Mesh_InstantiateByGuid_Ptr();
@@ -479,7 +481,9 @@ bool SetupPhysicsInterop() {
         (void*)::Physics_RegisterLayerPtr,
         (void*)::Physics_GetLayerIndexPtr,
         (void*)::Physics_GetLayerMaskPtr,
-        (void*)::Physics_GetLayerCountPtr
+        (void*)::Physics_GetLayerCountPtr,
+        (void*)::Physics_SpherecastPtr,
+        (void*)::Physics_SpherecastPointsPtr
     };
 
     using PhysicsInteropInitFn = void(*)(void**, int);
@@ -885,13 +889,14 @@ bool SetupPrefabInterop() {
     
     std::cout << "[RuntimeInterop] Setting up Prefab interop...\n";
     
-    // CRITICAL: Must match editor's SetupPrefabInterop - 5 functions
-    void* args[5];
+    // CRITICAL: Must match editor's SetupPrefabInterop.
+    void* args[6];
     args[0] = (void*)Get_Prefab_InstantiateByGuid_Ptr();
     args[1] = (void*)Get_Prefab_InstantiateByGuidBlocking_Ptr();
     args[2] = (void*)Get_Prefab_GetAsyncStatus_Ptr();
     args[3] = (void*)Get_Prefab_GetAssetNameByGuid_Ptr();
     args[4] = (void*)Get_Prefab_InstantiateByGuidWithRoot_Ptr();
+    args[5] = (void*)Get_Prefab_PreloadByGuid_Ptr();
     
     using PrefabInteropInitFn = void(*)(void**, int);
     PrefabInteropInitFn initPrefabFn = nullptr;
@@ -906,8 +911,8 @@ bool SetupPrefabInterop() {
     );
     
     if (rc == 0 && initPrefabFn) {
-        initPrefabFn(args, 5);
-        std::cout << "[RuntimeInterop] Prefab interop initialized (5 functions)\n";
+        initPrefabFn(args, 6);
+        std::cout << "[RuntimeInterop] Prefab interop initialized (6 functions)\n";
         return true;
     }
     
@@ -1373,6 +1378,36 @@ bool SetupAnimationEventInterop() {
     return false;
 }
 
+bool SetupAnimationStateInterop() {
+    if (!s_loader) return false;
+
+    std::cout << "[RuntimeInterop] Setting up Animation State interop...\n";
+
+    void* animStateArgs[1];
+    animStateArgs[0] = (void*)Get_AnimState_SetCallback_Ptr();
+
+    using AnimStateInteropInitFn = void(*)(void**, int);
+    AnimStateInteropInitFn initAnimStateFn = nullptr;
+
+    int rc = s_loader(
+        s_engineDllPath.c_str(),
+        L"ClaymoreEngine.AnimationStateInterop, ClaymoreEngine",
+        L"Initialize",
+        L"ClaymoreEngine.AnimationEventInteropInitDelegate, ClaymoreEngine",
+        nullptr,
+        (void**)&initAnimStateFn
+    );
+
+    if (rc == 0 && initAnimStateFn) {
+        initAnimStateFn(animStateArgs, 1);
+        std::cout << "[RuntimeInterop] Animation State interop initialized\n";
+        return true;
+    }
+
+    std::cerr << "[RuntimeInterop] Animation State interop not available (rc=0x" << std::hex << rc << std::dec << ")\n";
+    return false;
+}
+
 bool SetupQuestInterop() {
     if (!s_loader) return false;
     
@@ -1533,7 +1568,10 @@ bool SetupAllInterop(load_assembly_and_get_function_pointer_fn loader, const std
     
     // Animation Events - for animation event callbacks
     SetupAnimationEventInterop();
-    
+
+    // Animation State transitions - for OnStateEntered/OnStateExited callbacks
+    SetupAnimationStateInterop();
+
     std::cout << "[RuntimeInterop] ============================================\n";
     std::cout << "[RuntimeInterop] Interop setup " << (success ? "complete" : "FAILED") << "\n";
     std::cout << "[RuntimeInterop] ============================================\n";

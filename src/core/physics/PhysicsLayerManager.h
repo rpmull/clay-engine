@@ -50,9 +50,15 @@ public:
     
     // Clear all layers (for scene reload)
     void Clear();
-    
+
     // Register default layers (called on init)
     void RegisterDefaults();
+
+    // Replace all layers with the given ordered list (index = position in the
+    // vector). Used when loading project settings / runtime manifests so that
+    // name->index mapping matches what the project authored. Falls back to the
+    // built-in defaults if the list is empty.
+    void SetLayers(const std::vector<std::string>& layers);
 
 private:
     PhysicsLayerManager() { RegisterDefaults(); }

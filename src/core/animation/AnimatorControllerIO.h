@@ -21,6 +21,12 @@ inline std::shared_ptr<AnimatorController> LoadAnimatorController(const std::str
 // Save an AnimatorController to disk and update binary cache
 bool SaveAnimatorController(const AnimatorController& ctrl, const std::string& path);
 
+// Removes cached controller entries for a source or compiled controller path.
+void InvalidateAnimatorControllerCache(const std::string& path);
+
+// Clears all cached controllers.
+void ClearAnimatorControllerCache();
+
 } // namespace animation
 } // namespace cm
 

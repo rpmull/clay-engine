@@ -12,7 +12,8 @@ class TextureCube; // forward declaration
 struct Environment {
     enum class TextureFilterMode {
         Linear,
-        Point
+        Point,
+        Anisotropic
     };
     enum class AmbientMode {
         FlatColor,
@@ -70,4 +71,18 @@ struct Environment {
 
     // Scene-wide texture sampling preference for default materials
     TextureFilterMode TextureFilter = TextureFilterMode::Linear;
+
+    // Scene-wide texture quality cap. 0 keeps authored size.
+    uint16_t TextureMaxDimension = 0;
+
+    // Fixed internal scene render resolution. 0x0 tracks the viewport/window.
+    uint16_t RenderResolutionWidth = 0;
+    uint16_t RenderResolutionHeight = 0;
+
+    // Runtime-only cache key for lazily rebuilt skybox GPU resources.
+    std::string SkyboxRuntimeCacheKey;
+
+    [[nodiscard]] bool HasFixedRenderResolution() const {
+        return RenderResolutionWidth > 0 && RenderResolutionHeight > 0;
+    }
 };

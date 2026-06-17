@@ -891,7 +891,7 @@ bool PrefabEditorPanel::LoadPrefab(const std::string& path)
     }
 
     PrefabAsset warmAsset;
-    if (!PrefabIO::LoadPrefab(path, warmAsset)) {
+    if (!PrefabIO::LoadPrefabSource(path, warmAsset)) {
         SetStatusMessage("Failed to parse prefab file.", StatusLevel::Error);
         std::cerr << "[PrefabEditor] Failed to parse prefab JSON: " << path << std::endl;
         return false;
@@ -1060,7 +1060,8 @@ bool PrefabEditorPanel::SavePrefab()
     if (!BinaryAssetCache::Instance().EnsureBinary(m_PrefabPath)) {
         std::cerr << "[PrefabEditor] Failed to rebuild prefab binary for: " << m_PrefabPath << std::endl;
     }
-    runtime::RuntimePrefabInstantiator::ResetRuntimeCaches();
+    runtime::RuntimePrefabInstantiator::InvalidateCache(m_PrefabPath);
+    runtime::RuntimePrefabInstantiator::InvalidateCache(BinaryAssetCache::Instance().GetBinaryPath(m_PrefabPath));
     AssetPipeline::Instance().HotSwapPrefabInScene(m_PrefabPath);
 
     m_Scene.ClearDirty();
@@ -1857,7 +1858,7 @@ void PrefabEditorPanel::RefreshFromModelChange(const std::string& modelPath, Cla
     }
 
     PrefabAsset baselineAsset;
-    if (!PrefabIO::LoadPrefab(m_PrefabPath, baselineAsset)) {
+    if (!PrefabIO::LoadPrefabSource(m_PrefabPath, baselineAsset)) {
         SetStatusMessage("Failed to load prefab from disk for refresh.", StatusLevel::Error);
         std::cerr << "[PrefabEditor] Failed to load baseline prefab for refresh\n";
         return;

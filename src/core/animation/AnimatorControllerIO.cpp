@@ -28,15 +28,6 @@ namespace {
 constexpr uint32_t kCtrlBinMagic = 'A' | ('C' << 8) | ('T' << 16) | ('B' << 24);
 constexpr uint32_t kCtrlBinVersion = 1;
 
-#if defined(CLAYMORE_EDITOR)
-bool TryEnsureBinaryForPlayMode(const std::string& sourcePath) {
-    if (sourcePath.empty()) return false;
-    if (Assets::GetLoadMode() != AssetLoadMode::PlayMode) return false;
-    if (FileSystem::Instance().IsPakMounted()) return false;
-    return BinaryAssetCache::Instance().EnsureBinary(sourcePath);
-}
-#endif
-
 struct CachedController {
     std::shared_ptr<AnimatorController> controller;
     std::filesystem::file_time_type timestamp;
@@ -223,6 +214,9 @@ std::shared_ptr<AnimatorController> LoadAnimatorControllerFromFile(const std::st
     // In play mode (not runtime), try loading from .bin cache first
     if (useBinaryCache) {
         for (const auto& candidate : candidates) {
+            if (!BinaryAssetCache::Instance().IsCurrent(candidate)) {
+                continue;
+            }
             std::string binaryPath = BinaryAssetCache::Instance().GetBinaryPath(candidate);
             if (binaryPath.empty()) continue;
             const std::string key = NormalizeCacheKey(binaryPath);
@@ -233,21 +227,6 @@ std::shared_ptr<AnimatorController> LoadAnimatorControllerFromFile(const std::st
                 StoreCached(key, binaryPath, ctrl);
                 return ctrl;
             }
-#if defined(CLAYMORE_EDITOR)
-            if (TryEnsureBinaryForPlayMode(candidate)) {
-                binaryPath = BinaryAssetCache::Instance().GetBinaryPath(candidate);
-                if (!binaryPath.empty()) {
-                    const std::string compiledKey = NormalizeCacheKey(binaryPath);
-                    if (auto cached = TryGetCached(compiledKey, binaryPath)) {
-                        return cached;
-                    }
-                    if (auto ctrl = TryLoadControllerBinary(binaryPath)) {
-                        StoreCached(compiledKey, binaryPath, ctrl);
-                        return ctrl;
-                    }
-                }
-            }
-#endif
         }
     }
     
@@ -302,6 +281,52 @@ std::shared_ptr<AnimatorController> LoadAnimatorControllerFromFile(const std::st
     return nullptr;
 }
 
+void InvalidateAnimatorControllerCache(const std::string& path) {
+    if (path.empty()) return;
+
+    std::vector<std::string> candidates = BuildControllerPathCandidates(path);
+
+#ifdef CLAYMORE_EDITOR
+    try {
+        std::filesystem::path projectPath = Project::GetProjectDirectory();
+        if (!projectPath.empty() && !std::filesystem::path(path).is_absolute()) {
+            std::string fullPath = (projectPath / path).string();
+            for (const auto& candidate : BuildControllerPathCandidates(fullPath)) {
+                AppendUnique(candidates, candidate);
+            }
+        }
+
+        std::string binaryPath = BinaryAssetCache::Instance().GetBinaryPath(path);
+        if (!binaryPath.empty()) {
+            AppendUnique(candidates, binaryPath);
+        }
+    } catch (...) {
+    }
+#endif
+
+    std::vector<std::string> keys;
+    keys.reserve(candidates.size() * 2);
+    for (const auto& candidate : candidates) {
+        AppendUnique(keys, NormalizeCacheKey(candidate));
+        try {
+            std::filesystem::path binPath(candidate);
+            binPath.replace_extension(".actrlbin");
+            AppendUnique(keys, NormalizeCacheKey(binPath.string()));
+        } catch (...) {
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_controllerCacheMutex);
+    for (const auto& key : keys) {
+        g_controllerCache.erase(key);
+    }
+}
+
+void ClearAnimatorControllerCache() {
+    std::lock_guard<std::mutex> lock(g_controllerCacheMutex);
+    g_controllerCache.clear();
+}
+
 bool SaveAnimatorController(const AnimatorController& ctrl, const std::string& path) {
     // Save JSON source file
     try {
@@ -346,6 +371,7 @@ bool SaveAnimatorController(const AnimatorController& ctrl, const std::string& p
     }
 #endif
 
+    InvalidateAnimatorControllerCache(path);
     return true;
 }
 

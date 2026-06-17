@@ -63,9 +63,11 @@ public:
         
         // String table for name lookups
         std::vector<std::string> strings;
+        const std::vector<std::string>* stringView = nullptr;
         
         // Asset reference table
         std::vector<AssetRefEntry> assetRefs;
+        const std::vector<AssetRefEntry>* assetRefView = nullptr;
         
         bool Read(void* dst, size_t count);
         std::string ReadString(uint32_t index) const;
@@ -114,11 +116,42 @@ public:
     static bool IsStreamingComplete(const StreamingContext& stream) { return stream.complete; }
     static float GetStreamingProgress(const StreamingContext& stream);
     
+    struct PreparedEntityRecord {
+        uint32_t entityId = 0;
+        uint32_t parentId = 0;
+        uint32_t nameIndex = 0;
+        uint64_t guidHigh = 0;
+        uint64_t guidLow = 0;
+        uint8_t flags = 0;
+        int32_t layer = 0;
+        uint32_t tagIndex = 0xFFFFFFFFu;
+        std::string legacyTag;
+        uint64_t modelGuidHigh = 0;
+        uint64_t modelGuidLow = 0;
+        uint32_t componentCount = 0;
+        size_t componentOffset = 0;
+    };
+
 private:
     static bool LoadHeader(LoadContext& ctx, SceneBinaryHeader& header);
+    static bool LoadFromMemoryInternal(const uint8_t* data,
+                                       size_t size,
+                                       Scene& scene,
+                                       const std::string& cacheKey,
+                                       uint64_t timestampToken);
     static bool LoadStringTable(LoadContext& ctx, const SceneBinaryHeader& header);
     static bool LoadAssetRefTable(LoadContext& ctx, const SceneBinaryHeader& header);
     static bool LoadEntities(LoadContext& ctx, const SceneBinaryHeader& header, Scene& scene);
+    static bool LoadPreparedEntities(LoadContext& ctx,
+                                     const SceneBinaryHeader& header,
+                                     const std::vector<PreparedEntityRecord>& records,
+                                     Scene& scene);
+    static bool LoadSinglePreparedEntity(LoadContext& ctx,
+                                         const PreparedEntityRecord& record,
+                                         Scene& scene,
+                                         std::vector<std::pair<EntityID, EntityID>>& parentRelationships,
+                                         std::unordered_map<EntityID, EntityID>& oldToNewIdMap,
+                                         std::vector<EntityID>& outEntityOrder);
     static bool LoadSingleEntity(LoadContext& ctx,
                                  const SceneBinaryHeader& header,
                                  Scene& scene,

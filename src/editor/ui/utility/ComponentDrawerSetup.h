@@ -41,6 +41,7 @@
 #include "core/navigation/Navigation.h"
 #include "core/navigation/NavDebugDraw.h"
 #include "core/ecs/Scene.h"
+#include "core/ecs/ComponentUtils.h"
 #include "core/rendering/Terrain.h"
 #include "core/rendering/GlobalShaderProperties.h"
 #include "core/physics/area/AreaComponent.h"
@@ -1394,7 +1395,7 @@ inline void RegisterComponentDrawers() {
 
     registry.Register<LightComponent>("Light", [](LightComponent& l) {
         int type = static_cast<int>(l.Type);
-        const char* types[] = { "Directional", "Point" };
+        const char* types[] = { "Directional", "Point", "Spot" };
         bool dirty = false;
         if (ImGui::Combo("Type", &type, types, IM_ARRAYSIZE(types))) {
             l.Type = static_cast<LightType>(type);
@@ -1403,8 +1404,18 @@ inline void RegisterComponentDrawers() {
 
         dirty |= ImGui::ColorEdit3("Color", &l.Color.x);
         dirty |= ImGui::DragFloat("Intensity", &l.Intensity, 0.05f, 0.0f, 100.0f);
+        if (l.Type == LightType::Point || l.Type == LightType::Spot) {
+            dirty |= ImGui::DragFloat("Range", &l.Range, 0.25f, 0.5f, 500.0f, "%.2f");
+        }
+        if (l.Type == LightType::Spot) {
+            dirty |= ImGui::SliderFloat("Inner Cone", &l.SpotInnerAngleDegrees, 0.1f, 89.0f, "%.1f deg");
+            dirty |= ImGui::SliderFloat("Outer Cone", &l.SpotOuterAngleDegrees, l.SpotInnerAngleDegrees, 89.5f, "%.1f deg");
+        }
         if (l.Type == LightType::Point) {
             dirty |= ImGui::Checkbox("Cast Shadows (Opt-in)", &l.PointShadowsEnabled);
+        } else if (l.PointShadowsEnabled) {
+            l.PointShadowsEnabled = false;
+            dirty = true;
         }
         if (dirty) {
             NotifyCurrentComponentChanged(cm::world::RuntimeDirtyBits::Light);
@@ -1413,10 +1424,22 @@ inline void RegisterComponentDrawers() {
 
     registry.Register<ColliderComponent>("Collider", [](ColliderComponent& c) {
         // Shape type dropdown
+        const ColliderShape previousShapeType = c.ShapeType;
         int shapeType = static_cast<int>(c.ShapeType);
         const char* shapeTypes[] = { "Box", "Capsule", "Sphere", "Mesh" };
         if (ImGui::Combo("Shape Type", &shapeType, shapeTypes, IM_ARRAYSIZE(shapeTypes))) {
             c.ShapeType = static_cast<ColliderShape>(shapeType);
+            if (c.ShapeType != previousShapeType) {
+                if (c.ShapeType == ColliderShape::Mesh) {
+                    // Mesh vertices are already in entity-local space, so carrying over the
+                    // auto-fitted box-center offset drifts the physics shape away from the mesh.
+                    c.Offset = glm::vec3(0.0f);
+                } else if (c.ShapeType == ColliderShape::Box) {
+                    if (EntityData* ownerData = GetCurrentComponentEntityData()) {
+                        ApplyMeshBoundsToBoxCollider(c, *ownerData);
+                    }
+                }
+            }
         }
 
         // Physics layer
@@ -3643,6 +3666,8 @@ inline void RegisterComponentDrawers() {
     registry.Register<CharacterControllerComponent>("CharacterController", [](CharacterControllerComponent& cc) {
         // Physics layer
         DrawPhysicsLayerCombo("Physics Layer##CharacterControllerPhysicsLayer", cc.PhysicsLayer, cc.PhysicsLayerName);
+        // Collision mask: which layers the character collides with (applied next ExtendedUpdate).
+        DrawPhysicsLayerMaskCombo("Collision Mask##CharacterControllerCollisionMask", cc.CollisionMask);
         const bool scenePlaying = Scene::Get().m_IsPlaying;
         
         ImGui::DragFloat("Radius", &cc.Radius, 0.01f, 0.05f, 10.0f);

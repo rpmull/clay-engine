@@ -1,6 +1,7 @@
 #include "editor/pipeline/ModelImportSettings.h"
 #include <fstream>
 #include <iostream>
+#include <algorithm>
 
 using json = nlohmann::json;
 
@@ -216,6 +217,53 @@ MeshMaterialPreset* ModelImportSettings::FindOrCreatePreset(const std::string& m
     return &MaterialPresets.back();
 }
 
+void ModelImportSettings::RemovePreset(const std::string& meshName, int slot)
+{
+    MaterialPresets.erase(
+        std::remove_if(MaterialPresets.begin(), MaterialPresets.end(),
+            [&](const MeshMaterialPreset& p) {
+                return p.MeshName == meshName && p.MaterialSlot == slot;
+            }),
+        MaterialPresets.end());
+}
+
+const MeshMaterialPreset* ModelImportSettings::FindSharedPreset(const std::string& materialName) const
+{
+    for (const auto& preset : SharedMaterialPresets)
+    {
+        if (preset.MeshName == materialName)
+            return &preset;
+    }
+    return nullptr;
+}
+
+MeshMaterialPreset* ModelImportSettings::FindOrCreateSharedPreset(const std::string& materialName)
+{
+    for (auto& preset : SharedMaterialPresets)
+    {
+        if (preset.MeshName == materialName)
+            return &preset;
+    }
+
+    MeshMaterialPreset newPreset;
+    newPreset.MeshName = materialName; // MeshName field stores the material name here
+    newPreset.MaterialSlot = 0;
+    SharedMaterialPresets.push_back(newPreset);
+    return &SharedMaterialPresets.back();
+}
+
+const MeshMaterialPreset* ModelImportSettings::ResolvePreset(const std::string& meshName, int slot,
+                                                             const std::string& materialName) const
+{
+    // Per-mesh override is the most specific and always wins.
+    if (const MeshMaterialPreset* perMesh = FindPreset(meshName, slot))
+        return perMesh;
+    // Fall back to the shared, material-name-keyed override.
+    if (!materialName.empty())
+        return FindSharedPreset(materialName);
+    return nullptr;
+}
+
 json ModelImportSettings::ToJson() const
 {
     json j;
@@ -231,7 +279,22 @@ json ModelImportSettings::ToJson() const
             j["materialPresets"].push_back(preset.ToJson());
         }
     }
-    
+
+    if (!SharedMaterialPresets.empty())
+    {
+        j["sharedMaterialPresets"] = json::array();
+        for (const auto& preset : SharedMaterialPresets)
+        {
+            // Reuse the per-preset serializer, but key by material name instead of
+            // the (meshName, slot) identity fields.
+            json pj = preset.ToJson();
+            pj.erase("meshName");
+            pj.erase("materialSlot");
+            pj["materialName"] = preset.MeshName;
+            j["sharedMaterialPresets"].push_back(pj);
+        }
+    }
+
     return j;
 }
 
@@ -249,7 +312,18 @@ ModelImportSettings ModelImportSettings::FromJson(const json& j)
             settings.MaterialPresets.push_back(MeshMaterialPreset::FromJson(presetJ));
         }
     }
-    
+
+    if (j.contains("sharedMaterialPresets") && j["sharedMaterialPresets"].is_array())
+    {
+        for (const auto& presetJ : j["sharedMaterialPresets"])
+        {
+            MeshMaterialPreset preset = MeshMaterialPreset::FromJson(presetJ);
+            preset.MeshName = presetJ.value("materialName", std::string());
+            preset.MaterialSlot = 0;
+            settings.SharedMaterialPresets.push_back(preset);
+        }
+    }
+
     return settings;
 }
 

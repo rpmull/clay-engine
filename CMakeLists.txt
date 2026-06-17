@@ -215,6 +215,7 @@ if(WIN32)
     target_link_libraries(ClaymoreCore PUBLIC
         ${CMAKE_SOURCE_DIR}/external/bgfx/.build/win64_vs2022/bin/bgfx$<IF:$<CONFIG:Debug>,Debug,Release>.lib
         ${CMAKE_SOURCE_DIR}/external/bgfx/.build/win64_vs2022/bin/bimg$<IF:$<CONFIG:Debug>,Debug,Release>.lib
+        ${CMAKE_SOURCE_DIR}/external/bgfx/.build/win64_vs2022/bin/bimg_decode$<IF:$<CONFIG:Debug>,Debug,Release>.lib
         ${CMAKE_SOURCE_DIR}/external/bgfx/.build/win64_vs2022/bin/bx$<IF:$<CONFIG:Debug>,Debug,Release>.lib
         user32 gdi32 imm32 shell32
     )
@@ -222,6 +223,7 @@ elseif(UNIX AND NOT APPLE)
     target_link_libraries(ClaymoreCore PUBLIC
         ${CMAKE_SOURCE_DIR}/external/bgfx/.build/linux64_gcc/bin/libbgfx$<IF:$<CONFIG:Debug>,Debug,Release>.a
         ${CMAKE_SOURCE_DIR}/external/bgfx/.build/linux64_gcc/bin/libbimg$<IF:$<CONFIG:Debug>,Debug,Release>.a
+        ${CMAKE_SOURCE_DIR}/external/bgfx/.build/linux64_gcc/bin/libbimg_decode$<IF:$<CONFIG:Debug>,Debug,Release>.a
         ${CMAKE_SOURCE_DIR}/external/bgfx/.build/linux64_gcc/bin/libbx$<IF:$<CONFIG:Debug>,Debug,Release>.a
         Threads::Threads ${CMAKE_DL_LIBS}
         X11 Xcursor Xinerama Xi Xrandr GL
@@ -365,6 +367,7 @@ set(RUNTIME_INTEROP_SOURCES
     src/managed/interop/ManagedInterop.cpp
     src/managed/interop/ModuleComponentInterop.cpp
     src/managed/interop/AnimationEventInterop.cpp
+    src/managed/interop/AnimationStateInterop.cpp
     src/managed/interop/DialogueInterop.cpp
     src/managed/interop/QuestInterop.cpp
     src/managed/interop/ResourceInterop.cpp
@@ -403,6 +406,7 @@ if(WIN32)
     target_link_libraries(ClaymoreRuntimeCore PUBLIC
         ${CMAKE_SOURCE_DIR}/external/bgfx/.build/win64_vs2022/bin/bgfx$<IF:$<CONFIG:Debug>,Debug,Release>.lib
         ${CMAKE_SOURCE_DIR}/external/bgfx/.build/win64_vs2022/bin/bimg$<IF:$<CONFIG:Debug>,Debug,Release>.lib
+        ${CMAKE_SOURCE_DIR}/external/bgfx/.build/win64_vs2022/bin/bimg_decode$<IF:$<CONFIG:Debug>,Debug,Release>.lib
         ${CMAKE_SOURCE_DIR}/external/bgfx/.build/win64_vs2022/bin/bx$<IF:$<CONFIG:Debug>,Debug,Release>.lib
         user32 gdi32 imm32 shell32
     )
@@ -410,6 +414,7 @@ elseif(UNIX AND NOT APPLE)
     target_link_libraries(ClaymoreRuntimeCore PUBLIC
         ${CMAKE_SOURCE_DIR}/external/bgfx/.build/linux64_gcc/bin/libbgfx$<IF:$<CONFIG:Debug>,Debug,Release>.a
         ${CMAKE_SOURCE_DIR}/external/bgfx/.build/linux64_gcc/bin/libbimg$<IF:$<CONFIG:Debug>,Debug,Release>.a
+        ${CMAKE_SOURCE_DIR}/external/bgfx/.build/linux64_gcc/bin/libbimg_decode$<IF:$<CONFIG:Debug>,Debug,Release>.a
         ${CMAKE_SOURCE_DIR}/external/bgfx/.build/linux64_gcc/bin/libbx$<IF:$<CONFIG:Debug>,Debug,Release>.a
         Threads::Threads ${CMAKE_DL_LIBS}
         X11 Xcursor Xinerama Xi Xrandr GL
@@ -566,6 +571,8 @@ set(MANAGED_RUNTIME_VERSION 10.0.5)
 set(PRIVATE_DOTNET_STAGE_SCRIPT ${CMAKE_SOURCE_DIR}/scripts/stage_private_dotnet_runtime.ps1)
 
 file(GLOB_RECURSE MANAGED_CS_SOURCES CONFIGURE_DEPENDS ${MANAGED_PROJECT_DIR}/*.cs)
+list(FILTER MANAGED_CS_SOURCES EXCLUDE REGEX ".*/bin/.*")
+list(FILTER MANAGED_CS_SOURCES EXCLUDE REGEX ".*/obj/.*")
 
 set(MANAGED_DEBUG_DIR ${MANAGED_PROJECT_DIR}/bin/Debug/net10.0)
 set(MANAGED_RELEASE_DIR ${MANAGED_PROJECT_DIR}/bin/Release/net10.0)

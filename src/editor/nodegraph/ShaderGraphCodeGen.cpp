@@ -85,6 +85,18 @@ ShaderCompileResult ShaderGraphCodeGen::Compile() {
         }
     }
     
+    // bgfx requires every fragment-shader input varying to also be written by
+    // the vertex shader, otherwise createProgram() fails to link. Graphs that
+    // need no interpolated data (e.g. a constant Color -> Unlit Master) leave
+    // m_RequiredVaryings empty, yet GenerateFragmentShader() still emits a
+    // fallback "$input v_texcoord0" so the stage has at least one varying. If
+    // the vertex stage doesn't also emit v_texcoord0 the program silently fails
+    // to load and the material falls back to the default PBR shader (black
+    // preview). Guarantee both stages agree on the fallback varying.
+    if (m_RequiredVaryings.empty()) {
+        RequireVarying("v_texcoord0");
+    }
+
     // Generate shader sources
     m_Result.vertexShaderSource = GenerateVertexShader();
     m_Result.fragmentShaderSource = GenerateFragmentShader();

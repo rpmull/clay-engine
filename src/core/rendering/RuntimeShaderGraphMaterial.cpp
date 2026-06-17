@@ -1,6 +1,8 @@
 #include "RuntimeShaderGraphMaterial.h"
 #include "MaterialCache.h"
+#include "TextureSamplerFlags.h"
 #include "TextureLoader.h"
+#include "core/ecs/Scene.h"
 #include <iostream>
 #include <cmath>
 #include <cctype>
@@ -169,6 +171,8 @@ void RuntimeShaderGraphMaterial::BindUniforms() const {
     
     // Bind all parameters
     int textureUnit = 0;
+    const uint32_t samplerFlags =
+        cm::rendering::GetTextureSamplerFlags(Scene::Get().GetEnvironment());
     for (const auto& param : m_Parameters) {
         if (param.type == RuntimeShaderValueType::Texture2D) {
             if (!bgfx::isValid(param.uniformHandle)) {
@@ -180,7 +184,7 @@ void RuntimeShaderGraphMaterial::BindUniforms() const {
                 ? param.textureHandle
                 : GetFallbackTextureForParameter(param.name);
             if (bgfx::isValid(texture)) {
-                bgfx::setTexture(slot, param.uniformHandle, texture);
+                bgfx::setTexture(slot, param.uniformHandle, texture, samplerFlags);
             }
         } else {
             // Uniform binding

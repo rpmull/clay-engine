@@ -7,6 +7,8 @@
 #include "core/ecs/Scene.h"
 #include "core/ecs/ScenePostProcessing.h"
 #include "core/serialization/Serializer.h"
+#include "core/rendering/MaterialAssetCache.h"
+#include "core/animation/AnimationAssetCache.h"
 #include "core/animation/AnimationSerializer.h"
 #include "core/animation/AnimatorController.h"
 #include "core/animation/AnimatorControllerIO.h"
@@ -620,8 +622,25 @@ bool BinaryAssetCache::RebuildBinary(const std::string& sourcePath) {
     }
     
     if (success) {
-        if (type == AssetType::Prefab) {
-            runtime::RuntimePrefabInstantiator::ResetRuntimeCaches();
+        switch (type) {
+            case AssetType::Material:
+                MaterialAssetCache::Invalidate(sourcePath);
+                MaterialAssetCache::Invalidate(binaryPath);
+                break;
+            case AssetType::Prefab:
+                runtime::RuntimePrefabInstantiator::InvalidateCache(sourcePath);
+                runtime::RuntimePrefabInstantiator::InvalidateCache(binaryPath);
+                break;
+            case AssetType::Animation:
+                cm::animation::InvalidateAnimationAssetCache(sourcePath);
+                cm::animation::InvalidateAnimationAssetCache(binaryPath);
+                break;
+            case AssetType::AnimatorController:
+                cm::animation::InvalidateAnimatorControllerCache(sourcePath);
+                cm::animation::InvalidateAnimatorControllerCache(binaryPath);
+                break;
+            default:
+                break;
         }
         // Update manifest
         std::lock_guard<std::mutex> lock(m_Mutex);
@@ -642,39 +661,73 @@ bool BinaryAssetCache::RebuildBinary(const std::string& sourcePath) {
 }
 
 void BinaryAssetCache::Invalidate(const std::string& sourcePath) {
-    std::lock_guard<std::mutex> lock(m_Mutex);
-    
-    std::string key = MakeCacheKey(sourcePath);
-    auto it = m_Manifest.find(key);
-    if (it != m_Manifest.end()) {
-        // Delete binary file
-        std::error_code ec;
-        fs::remove(it->second.binaryPath, ec);
-        m_Manifest.erase(it);
-        SaveManifest();
+    const AssetType type = GetAssetType(sourcePath);
+    std::string binaryPath = GetBinaryPath(sourcePath);
+
+    {
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        std::string key = MakeCacheKey(sourcePath);
+        auto it = m_Manifest.find(key);
+        if (it != m_Manifest.end()) {
+            std::error_code ec;
+            if (!it->second.binaryPath.empty()) {
+                binaryPath = it->second.binaryPath;
+            }
+            fs::remove(it->second.binaryPath, ec);
+            m_Manifest.erase(it);
+            SaveManifest();
+        }
+    }
+
+    switch (type) {
+        case AssetType::Material:
+            MaterialAssetCache::Invalidate(sourcePath);
+            MaterialAssetCache::Invalidate(binaryPath);
+            break;
+        case AssetType::Prefab:
+            runtime::RuntimePrefabInstantiator::InvalidateCache(sourcePath);
+            runtime::RuntimePrefabInstantiator::InvalidateCache(binaryPath);
+            break;
+        case AssetType::Animation:
+            cm::animation::InvalidateAnimationAssetCache(sourcePath);
+            cm::animation::InvalidateAnimationAssetCache(binaryPath);
+            break;
+        case AssetType::AnimatorController:
+            cm::animation::InvalidateAnimatorControllerCache(sourcePath);
+            cm::animation::InvalidateAnimatorControllerCache(binaryPath);
+            break;
+        default:
+            break;
     }
 }
 
 void BinaryAssetCache::InvalidateAll() {
-    std::lock_guard<std::mutex> lock(m_Mutex);
-    
-    // Delete all cached binaries
-    std::error_code ec;
-    fs::remove_all(m_CacheRoot / "scenes", ec);
-    fs::remove_all(m_CacheRoot / "materials", ec);
-    fs::remove_all(m_CacheRoot / "prefabs", ec);
-    fs::remove_all(m_CacheRoot / "animations", ec);
-    fs::remove_all(m_CacheRoot / "animators", ec);
-    
-    // Recreate directories
-    fs::create_directories(m_CacheRoot / "scenes", ec);
-    fs::create_directories(m_CacheRoot / "materials", ec);
-    fs::create_directories(m_CacheRoot / "prefabs", ec);
-    fs::create_directories(m_CacheRoot / "animations", ec);
-    fs::create_directories(m_CacheRoot / "animators", ec);
-    
-    m_Manifest.clear();
-    SaveManifest();
+    {
+        std::lock_guard<std::mutex> lock(m_Mutex);
+
+        // Delete all cached binaries.
+        std::error_code ec;
+        fs::remove_all(m_CacheRoot / "scenes", ec);
+        fs::remove_all(m_CacheRoot / "materials", ec);
+        fs::remove_all(m_CacheRoot / "prefabs", ec);
+        fs::remove_all(m_CacheRoot / "animations", ec);
+        fs::remove_all(m_CacheRoot / "animators", ec);
+
+        // Recreate directories.
+        fs::create_directories(m_CacheRoot / "scenes", ec);
+        fs::create_directories(m_CacheRoot / "materials", ec);
+        fs::create_directories(m_CacheRoot / "prefabs", ec);
+        fs::create_directories(m_CacheRoot / "animations", ec);
+        fs::create_directories(m_CacheRoot / "animators", ec);
+
+        m_Manifest.clear();
+        SaveManifest();
+    }
+
+    MaterialAssetCache::Clear();
+    runtime::RuntimePrefabInstantiator::ResetRuntimeCaches();
+    cm::animation::ClearAnimationAssetCache();
+    cm::animation::ClearAnimatorControllerCache();
 }
 
 void BinaryAssetCache::RebuildAll() {
@@ -1369,12 +1422,26 @@ void BinaryAssetCache::LoadManifest() {
         json j;
         in >> j;
         
+        bool migratedPaths = false;
         for (auto& [key, value] : j.items()) {
             CacheEntry entry;
             entry.binaryPath = value.value("binary", "");
             entry.sourceModTime = value.value("sourceModTime", 0ull);
             entry.binaryModTime = value.value("binaryModTime", 0ull);
+
+            const AssetType type = GetAssetType(key);
+            if (type != AssetType::Unknown) {
+                const fs::path expectedBinaryPath = SourceToCache(key, type);
+                if (!expectedBinaryPath.empty() && entry.binaryPath != expectedBinaryPath.string()) {
+                    entry.binaryPath = expectedBinaryPath.string();
+                    migratedPaths = true;
+                }
+            }
+
             m_Manifest[key] = entry;
+        }
+        if (migratedPaths) {
+            SaveManifest();
         }
     } catch (const std::exception& e) {
         std::cerr << "[BinaryAssetCache] Failed to load manifest: " << e.what() << std::endl;
@@ -1421,13 +1488,13 @@ std::string EditorAssetResolver::ResolvePath(const std::string& virtualPath) con
             }
 
             std::string binaryPath = GetBinaryPath(virtualPath);
-            if (binaryPath.empty() || !std::filesystem::exists(binaryPath)) {
-                BinaryAssetCache::Instance().EnsureBinary(virtualPath);
-                binaryPath = GetBinaryPath(virtualPath);
-            }
-            if (binaryPath.empty() || !std::filesystem::exists(binaryPath)) {
+            const bool binaryReady =
+                !binaryPath.empty() &&
+                std::filesystem::exists(binaryPath) &&
+                BinaryAssetCache::Instance().IsCurrent(virtualPath);
+            if (!binaryReady) {
                 if (m_PlayModeBinaryOnly) {
-                    std::cerr << "[EditorAssetResolver] Missing binary file for: " << virtualPath
+                    std::cerr << "[EditorAssetResolver] Missing or stale binary file for: " << virtualPath
                               << " (expected " << binaryPath << ")" << std::endl;
                     return binaryPath;
                 }
@@ -1452,12 +1519,6 @@ bool EditorAssetResolver::AllowSourceFallback() const {
 }
 
 std::string EditorAssetResolver::GetBinaryPath(const std::string& sourcePath) const {
-    if (m_Mode == AssetLoadMode::PlayMode) {
-        BinaryAssetCache::AssetType type = BinaryAssetCache::GetAssetType(sourcePath);
-        if (type != BinaryAssetCache::AssetType::Unknown) {
-            BinaryAssetCache::Instance().EnsureBinary(sourcePath);
-        }
-    }
     return BinaryAssetCache::Instance().GetBinaryPath(sourcePath);
 }
 

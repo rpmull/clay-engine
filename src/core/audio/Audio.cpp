@@ -16,6 +16,122 @@
 #include <queue>
 #include <condition_variable>
 #include <algorithm>
+#include <cstring>
+#include <vector>
+
+//------------------------------------------------------------------------------
+// VFS bridge for miniaudio
+//
+// All assets in the engine are addressed through the project VFS so that the
+// exported runtime can serve them from the PAK. miniaudio normally opens files
+// straight off disk relative to the process working directory, which fails for
+// project-relative virtual paths (and would never work from a PAK). This custom
+// ma_vfs routes every audio file open through FileSystem::ReadFile, which reads
+// from loose files in the editor and from the mounted PAK at runtime. It is
+// installed on the engine via ma_engine_config::pResourceManagerVFS, so every
+// audio load (Play, Play3D, preload, streaming) goes through it automatically.
+//------------------------------------------------------------------------------
+namespace {
+
+struct ClaymoreVfsFile {
+    std::vector<uint8_t> data;
+    size_t cursor = 0;
+};
+
+struct ClaymoreVfs {
+    ma_vfs_callbacks cb;
+};
+
+ma_result Claymore_vfs_onOpen(ma_vfs* /*pVFS*/, const char* pFilePath, ma_uint32 openMode, ma_vfs_file* pFile) {
+    if (pFile == nullptr) return MA_INVALID_ARGS;
+    *pFile = nullptr;
+    if ((openMode & MA_OPEN_MODE_READ) == 0) return MA_INVALID_OPERATION; // read-only VFS
+    if (pFilePath == nullptr) return MA_INVALID_ARGS;
+
+    auto file = std::make_unique<ClaymoreVfsFile>();
+    if (!FileSystem::Instance().ReadFile(pFilePath, file->data) || file->data.empty()) {
+        return MA_DOES_NOT_EXIST;
+    }
+    *pFile = reinterpret_cast<ma_vfs_file>(file.release());
+    return MA_SUCCESS;
+}
+
+ma_result Claymore_vfs_onOpenW(ma_vfs* pVFS, const wchar_t* pFilePath, ma_uint32 openMode, ma_vfs_file* pFile) {
+    if (pFile) *pFile = nullptr;
+    if (pFilePath == nullptr) return MA_INVALID_ARGS;
+    // Asset paths are ASCII/UTF-8; do a narrow conversion and delegate.
+    std::string narrow;
+    for (const wchar_t* p = pFilePath; *p; ++p) narrow.push_back(static_cast<char>(*p));
+    return Claymore_vfs_onOpen(pVFS, narrow.c_str(), openMode, pFile);
+}
+
+ma_result Claymore_vfs_onClose(ma_vfs* /*pVFS*/, ma_vfs_file file) {
+    delete reinterpret_cast<ClaymoreVfsFile*>(file);
+    return MA_SUCCESS;
+}
+
+ma_result Claymore_vfs_onRead(ma_vfs* /*pVFS*/, ma_vfs_file file, void* pDst, size_t sizeInBytes, size_t* pBytesRead) {
+    auto* f = reinterpret_cast<ClaymoreVfsFile*>(file);
+    if (f == nullptr || pDst == nullptr) return MA_INVALID_ARGS;
+    const size_t remaining = (f->cursor <= f->data.size()) ? (f->data.size() - f->cursor) : 0;
+    const size_t toRead = std::min(sizeInBytes, remaining);
+    if (toRead > 0) {
+        std::memcpy(pDst, f->data.data() + f->cursor, toRead);
+        f->cursor += toRead;
+    }
+    if (pBytesRead) *pBytesRead = toRead;
+    if (toRead == 0 && sizeInBytes > 0) return MA_AT_END;
+    return MA_SUCCESS;
+}
+
+ma_result Claymore_vfs_onWrite(ma_vfs* /*pVFS*/, ma_vfs_file /*file*/, const void* /*pSrc*/, size_t /*sizeInBytes*/, size_t* pBytesWritten) {
+    if (pBytesWritten) *pBytesWritten = 0;
+    return MA_NOT_IMPLEMENTED; // read-only
+}
+
+ma_result Claymore_vfs_onSeek(ma_vfs* /*pVFS*/, ma_vfs_file file, ma_int64 offset, ma_seek_origin origin) {
+    auto* f = reinterpret_cast<ClaymoreVfsFile*>(file);
+    if (f == nullptr) return MA_INVALID_ARGS;
+    ma_int64 base = 0;
+    if (origin == ma_seek_origin_current)      base = static_cast<ma_int64>(f->cursor);
+    else if (origin == ma_seek_origin_end)     base = static_cast<ma_int64>(f->data.size());
+    else /* ma_seek_origin_start */            base = 0;
+    ma_int64 newPos = base + offset;
+    if (newPos < 0) newPos = 0;
+    if (newPos > static_cast<ma_int64>(f->data.size())) newPos = static_cast<ma_int64>(f->data.size());
+    f->cursor = static_cast<size_t>(newPos);
+    return MA_SUCCESS;
+}
+
+ma_result Claymore_vfs_onTell(ma_vfs* /*pVFS*/, ma_vfs_file file, ma_int64* pCursor) {
+    auto* f = reinterpret_cast<ClaymoreVfsFile*>(file);
+    if (f == nullptr || pCursor == nullptr) return MA_INVALID_ARGS;
+    *pCursor = static_cast<ma_int64>(f->cursor);
+    return MA_SUCCESS;
+}
+
+ma_result Claymore_vfs_onInfo(ma_vfs* /*pVFS*/, ma_vfs_file file, ma_file_info* pInfo) {
+    auto* f = reinterpret_cast<ClaymoreVfsFile*>(file);
+    if (f == nullptr || pInfo == nullptr) return MA_INVALID_ARGS;
+    pInfo->sizeInBytes = static_cast<ma_uint64>(f->data.size());
+    return MA_SUCCESS;
+}
+
+ClaymoreVfs g_ClaymoreVfs{};
+
+ma_vfs* GetClaymoreVfs() {
+    g_ClaymoreVfs.cb.onOpen  = Claymore_vfs_onOpen;
+    g_ClaymoreVfs.cb.onOpenW = Claymore_vfs_onOpenW;
+    g_ClaymoreVfs.cb.onClose = Claymore_vfs_onClose;
+    g_ClaymoreVfs.cb.onRead  = Claymore_vfs_onRead;
+    g_ClaymoreVfs.cb.onWrite = Claymore_vfs_onWrite;
+    g_ClaymoreVfs.cb.onSeek  = Claymore_vfs_onSeek;
+    g_ClaymoreVfs.cb.onTell  = Claymore_vfs_onTell;
+    g_ClaymoreVfs.cb.onInfo  = Claymore_vfs_onInfo;
+    return reinterpret_cast<ma_vfs*>(&g_ClaymoreVfs);
+}
+
+} // namespace
 
 //------------------------------------------------------------------------------
 // Audio Thread - Background loading and processing
@@ -239,6 +355,10 @@ void Audio::Init() {
     engineConfig.channels = 2;
     engineConfig.sampleRate = 48000;
     engineConfig.listenerCount = 1;
+    // Route all audio file loads through the project VFS (loose files in the
+    // editor, PAK in the exported runtime). Leaving pResourceManager NULL lets
+    // the engine create its resource manager using this VFS.
+    engineConfig.pResourceManagerVFS = GetClaymoreVfs();
 
     ma_result result = ma_engine_init(&engineConfig, s_Engine);
     if (result != MA_SUCCESS) {

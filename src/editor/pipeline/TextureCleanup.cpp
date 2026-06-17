@@ -1805,6 +1805,16 @@ static bool ApplyTextureMappingToMeta(json& meta,
                                                                     sourceHint ? sourceHint->albedo : std::string{},
                                                                     displacementHintContext);
         }
+        // Shared, material-name-keyed presets: remap their texture paths when
+        // textures are relocated/renamed so the shared atlas reference stays valid.
+        for (auto& preset : settings.SharedMaterialPresets) {
+            if (preset.OverrideAlbedo) settingsChanged |= RemapTexturePath(preset.AlbedoPath, mapping, projectDir);
+            if (preset.OverrideNormal) settingsChanged |= RemapTexturePath(preset.NormalPath, mapping, projectDir);
+            if (preset.OverrideMetallicRoughness) settingsChanged |= RemapTexturePath(preset.MetallicRoughnessPath, mapping, projectDir);
+            if (preset.OverrideAO) settingsChanged |= RemapTexturePath(preset.AOPath, mapping, projectDir);
+            if (preset.OverrideEmission) settingsChanged |= RemapTexturePath(preset.EmissionPath, mapping, projectDir);
+            if (preset.OverrideDisplacement) settingsChanged |= RemapTexturePath(preset.DisplacementPath, mapping, projectDir);
+        }
         if (settingsChanged) {
             meta["importSettings"] = settings.ToJson();
             changed = true;
@@ -1855,6 +1865,14 @@ static void CollectTexturePathsFromMeta(const json& meta,
     if (meta.contains("importSettings") && meta["importSettings"].is_object()) {
         ModelImportSettings settings = ModelImportSettings::FromJson(meta["importSettings"]);
         for (const auto& preset : settings.MaterialPresets) {
+            if (preset.OverrideAlbedo) addPath(preset.AlbedoPath);
+            if (preset.OverrideNormal) addPath(preset.NormalPath);
+            if (preset.OverrideMetallicRoughness) addPath(preset.MetallicRoughnessPath);
+            if (preset.OverrideAO) addPath(preset.AOPath);
+            if (preset.OverrideEmission) addPath(preset.EmissionPath);
+            if (preset.OverrideDisplacement) addPath(preset.DisplacementPath);
+        }
+        for (const auto& preset : settings.SharedMaterialPresets) {
             if (preset.OverrideAlbedo) addPath(preset.AlbedoPath);
             if (preset.OverrideNormal) addPath(preset.NormalPath);
             if (preset.OverrideMetallicRoughness) addPath(preset.MetallicRoughnessPath);

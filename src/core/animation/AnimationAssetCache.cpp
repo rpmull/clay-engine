@@ -1,16 +1,21 @@
 #include "core/animation/AnimationAssetCache.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <mutex>
 #include <unordered_set>
 #include <unordered_map>
+#include <vector>
 
 #include "core/animation/AnimationAsset.h"
 #include "core/animation/AnimationSerializer.h"
 #include "core/jobs/Jobs.h"
 #include "editor/Project.h"
+#ifdef CLAYMORE_EDITOR
+#include "editor/pipeline/BinaryAssetCache.h"
+#endif
 
 namespace cm {
 namespace animation {
@@ -26,6 +31,7 @@ struct CacheEntry {
 };
 std::unordered_map<std::string, CacheEntry> g_assetCache;
 std::unordered_set<std::string> g_pendingLoads;
+std::atomic<uint64_t> g_cacheGeneration{1};
 CacheClock::time_point g_lastPurge = CacheClock::now();
 
 // Normalize paths so callers can use either absolute or project-relative strings.
@@ -48,6 +54,47 @@ static std::string NormalizeKey(const std::string& rawPath)
         std::filesystem::path fallback(rawPath);
         return fallback.generic_string();
     }
+}
+
+static void AppendUnique(std::vector<std::string>& out, const std::string& candidate)
+{
+    if (candidate.empty()) return;
+    if (std::find(out.begin(), out.end(), candidate) != out.end()) return;
+    out.push_back(candidate);
+}
+
+static std::vector<std::string> BuildAnimationPathCandidates(const std::string& path)
+{
+    std::vector<std::string> candidates;
+    AppendUnique(candidates, NormalizeKey(path));
+
+    try {
+        std::filesystem::path p(path);
+        if (p.is_relative()) {
+            const auto& projectRoot = Project::GetProjectDirectory();
+            if (!projectRoot.empty()) {
+                AppendUnique(candidates, NormalizeKey((projectRoot / p).string()));
+            }
+        }
+
+        std::string normalized = p.generic_string();
+        size_t assetsPos = normalized.find("/assets/");
+        if (assetsPos != std::string::npos) {
+            AppendUnique(candidates, NormalizeKey(normalized.substr(assetsPos + 1)));
+        }
+        assetsPos = normalized.find("assets/");
+        if (assetsPos == 0) {
+            AppendUnique(candidates, NormalizeKey(normalized));
+        }
+
+#ifdef CLAYMORE_EDITOR
+        const std::string binaryPath = BinaryAssetCache::Instance().GetBinaryPath(path);
+        AppendUnique(candidates, NormalizeKey(binaryPath));
+#endif
+    } catch (...) {
+    }
+
+    return candidates;
 }
 
 // Prune expired weak_ptr entries periodically to keep the map compact.
@@ -176,8 +223,14 @@ void RequestAnimationAssetPreload(const std::string& path, bool allowLegacyFallb
     }
 
     const std::string loadPath = path;
-    auto loadTask = [key, loadPath, allowLegacyFallback]() {
+    const uint64_t generation = g_cacheGeneration.load(std::memory_order_acquire);
+    auto loadTask = [key, loadPath, allowLegacyFallback, generation]() {
         auto loaded = LoadAnimationAssetShared(loadPath, allowLegacyFallback);
+        if (generation != g_cacheGeneration.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lock(g_cacheMutex);
+            g_pendingLoads.erase(key);
+            return;
+        }
         {
             std::lock_guard<std::mutex> lock(g_cacheMutex);
             PurgeExpiredEntriesLocked();
@@ -201,15 +254,19 @@ void RequestAnimationAssetPreload(const std::string& path, bool allowLegacyFallb
 
 void InvalidateAnimationAssetCache(const std::string& path)
 {
-    const std::string key = NormalizeKey(path);
-    if (key.empty()) return;
+    const std::vector<std::string> keys = BuildAnimationPathCandidates(path);
+    if (keys.empty()) return;
+    g_cacheGeneration.fetch_add(1, std::memory_order_acq_rel);
     std::lock_guard<std::mutex> lock(g_cacheMutex);
-    g_assetCache.erase(key);
-    g_pendingLoads.erase(key);
+    for (const std::string& key : keys) {
+        g_assetCache.erase(key);
+        g_pendingLoads.erase(key);
+    }
 }
 
 void ClearAnimationAssetCache()
 {
+    g_cacheGeneration.fetch_add(1, std::memory_order_acq_rel);
     std::lock_guard<std::mutex> lock(g_cacheMutex);
     g_assetCache.clear();
     g_pendingLoads.clear();

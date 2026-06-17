@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -83,6 +84,7 @@ namespace nav
         uint64_t m_LastObservedSceneRevision = 0;
         std::unordered_map<EntityID, uint64_t> m_ObservedStreamRevisions;
         uint64_t m_CachedEntityRevision = 0;
+        size_t m_CachedEntityCount = 0;
         std::vector<EntityID> m_CachedNavAgentEntities;
         std::vector<EntityID> m_CachedNavMeshEntities;
         std::deque<PendingPathRequest> m_PendingPathRequests;

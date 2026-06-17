@@ -96,6 +96,11 @@ namespace ClaymoreEngine
                 useRootAsModelRoot);
         }
 
+        public bool Preload()
+        {
+            return Preload(this);
+        }
+
         public Task<Entity> InstantiateAsync(Entity root, Vector3? position = null, bool useRootAsModelRoot = false)
         {
             return InstantiateAsync(this, root, position, useRootAsModelRoot);
@@ -124,6 +129,19 @@ namespace ClaymoreEngine
             if (position.HasValue)
                 EntityInterop.SetPosition(id, position.Value);
             return e;
+        }
+
+        /// <summary>
+        /// Loads the compiled prefab resource into the runtime cache without
+        /// creating entities. A later Instantiate() can then construct the
+        /// prefab synchronously from prepared state.
+        /// </summary>
+        public static bool Preload(Prefab p)
+        {
+            if (!TryParseGuid(p.Guid, out ulong hi, out ulong lo))
+                return false;
+
+            return PrefabInterop.Preload?.Invoke(hi, lo) != 0;
         }
 
         /// <summary>
